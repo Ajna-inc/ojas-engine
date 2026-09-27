@@ -226,7 +226,14 @@ fn production_graphs_need_no_lowering() {
         return;
     };
     for (file, width) in [("yolo11n.onnx", None), ("plate-v9t-384.onnx", None), ("awiros_rec.onnx", Some(320))] {
-        let m = ojas_formats::onnx::load(models.join(file).to_str().unwrap()).unwrap();
+        // `models/` is committed but the weights in it are not, so a clean
+        // checkout has the directory and none of the graphs.
+        let path = models.join(file);
+        if !path.is_file() {
+            eprintln!("skipped {file}: not present");
+            continue;
+        }
+        let m = ojas_formats::onnx::load(path.to_str().unwrap()).unwrap();
         let mut binds = std::collections::HashMap::new();
         for vi in &m.graph.inputs {
             for (i, d) in vi.dims.iter().enumerate() {
