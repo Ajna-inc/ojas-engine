@@ -86,3 +86,19 @@ required-features = ["cuda"]
 [[example]]
 name = "passenger_residual_eval"
 required-features = ["cuda"]
+
+[[example]]
+name = "error_report"
+required-features = ["cuda"]
+
+[[example]]
+name = "fusion_oracle"
+required-features = ["cuda"]
+
+[[example]]
+name = "oracle_bounds"
+required-features = ["cuda"]
+
+[[example]]
+name = "static_fp"
+required-features = ["cuda"]
