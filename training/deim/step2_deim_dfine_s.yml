@@ -1,0 +1,58 @@
+# Step 2 — the main run.
+# DEIM-D-FINE-S tuned from the Objects365→COCO D-FINE-S weights, on UVH-26 train (ST labels, 17,387 images)
+# + BMD-45 train de-leaked of every UVH val/train frame (27,358 images): 44,745 images, 516,566 boxes, 14 classes.
+# DEIM's 72-epoch schedule (flat-cosine, Mosaic/mixup off after epoch 40, all augs off for the last 8).
+# Batch 12 is what the 3060 holds; LR, EMA and warm-up follow DEIM's linear-scaling note (12/32 = 0.375 of batch 32).
+__include__: ['../deim_dfine/deim_hgnetv2_s_coco.yml']
+output_dir: /data/dev-cache/train/out/step2_deim_dfine_s
+
+num_classes: 15              # UVH ids 1..14
+remap_mscoco_category: False
+checkpoint_freq: 1           # last.pth every epoch → resumable
+
+HGNetv2:
+  pretrained: False          # every weight comes from --tuning (dfine_s_obj2coco.pth); nothing downloaded
+DFINETransformer:
+  activation: relu           # DEIM's base switches these to silu; the Objects365 D-FINE weights were trained with
+  mlp_act: relu              # relu, and loading them into a silu decoder produced invalid boxes at iteration 0
+
+epoches: 72
+flat_epoch: 40               # 4 + 72 // 2
+no_aug_epoch: 8
+warmup_iter: 5300            # 2000 / 0.375
+
+optimizer:
+  type: AdamW
+  params:
+    - params: '^(?=.*backbone)(?!.*bn).*$'
+      lr: 0.000075             # 0.0002 × 0.375
+    - params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.00015                  # 0.0004 × 0.375
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+ema:
+  type: ModelEMA
+  decay: 0.99996               # 1 − (1 − 0.9999) × 0.375
+  warmups: 2700
+  start: 0
+
+train_dataloader:
+  dataset:
+    img_folder: /data/dev-cache/train/data/images/
+    ann_file: /data/dev-cache/train/data/annotations/step2_train_uvhst_bmdclean.json
+    transforms:
+      policy:
+        epoch: [4, 40, 64]
+  collate_fn:
+    mixup_epochs: [4, 40]
+    stop_epoch: 64
+  total_batch_size: 12
+  num_workers: 8
+val_dataloader:
+  dataset:
+    img_folder: /data/dev-cache/train/data/images/
+    ann_file: /data/dev-cache/train/data/annotations/uvh_val_st.json
+  total_batch_size: 16
+  num_workers: 4

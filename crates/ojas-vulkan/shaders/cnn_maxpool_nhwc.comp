@@ -1,0 +1,23 @@
+// precisions: f16
+// Max pool on padded NHWC (CUDA cnn_maxpool_nhwc): window over the logical
+// image, strictly greater wins, NaN always wins.
+layout(push_constant) uniform P { Buf x; Buf y; int n; int ch; int h; int w; int ipad; int iwp; int iimg; int oh; int ow;
+                                  int opad; int owp; int oimg; int kh; int kw; int sh; int sw; int pt; int pl; int ics; int ocs; } p;
+void main() {
+    int i = GID;
+    if (i >= p.n) return;
+    int c = i % p.ch, t = i / p.ch, ox = t % p.ow;
+    t /= p.ow;
+    int oy = t % p.oh, im = t / p.oh;
+    int hs = oy * p.sh - p.pt, ws = ox * p.sw - p.pl;
+    float m = -CNN_INF;
+    for (int yy = hs; yy < hs + p.kh; yy++) {
+        if (yy < 0 || yy >= p.h) continue;
+        for (int xx = ws; xx < ws + p.kw; xx++) {
+            if (xx < 0 || xx >= p.w) continue;
+            float v = LD(p.x, im * p.iimg + ((yy + p.ipad) * p.iwp + xx + p.ipad) * p.ics + c);
+            if (v > m || isnan(v)) m = v;
+        }
+    }
+    ST(p.y, im * p.oimg + ((oy + p.opad) * p.owp + ox + p.opad) * p.ocs + c, m);
+}

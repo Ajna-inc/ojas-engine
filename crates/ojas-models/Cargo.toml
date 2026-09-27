@@ -1,0 +1,36 @@
+[package]
+name = "ojas-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+ojas-core = { path = "../ojas-core" }
+# `device` so the decoder type-checks off macOS; see ojas-metal/src/lib.rs.
+ojas-metal = { path = "../ojas-metal", features = ["device"] }
+ojas-formats = { path = "../ojas-formats" }
+# The one backend-neutral model description, shared with the CUDA side.
+ojas-arch = { path = "../ojas-arch" }
+anyhow = "1"
+half = "2"
+libc = "0.2"
+
+# The `metal` crate's DEFAULT features enable `link`, which asks rustc to link Apple frameworks
+# and is a hard error on any other target. Without it the crate still provides every type and
+# signature, so off macOS the decoder can be TYPE-CHECKED even though it can never run there.
+# That matters more than it sounds: until this split, `cargo check -p ojas-models` was impossible
+# on the box doing the CUDA port, so every edit to the model layer was unverifiable there.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.32"
+objc = "0.2"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+metal = { version = "0.32", default-features = false }
+objc = "0.2"
+
+[dev-dependencies]
+ojas-cpu = { path = "../ojas-cpu" }   # CPU decoders used as the oracle in examples/moe_iq_gate
+ojas-tokenize = { path = "../ojas-tokenize" }   # examples/run turns text into ids and back
+ojas-infer = { path = "../ojas-infer" }        # examples/run drives the real generate_with path
+

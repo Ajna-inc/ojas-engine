@@ -1,0 +1,14 @@
+// precisions: f16
+// Batched matmul, contiguous (CUDA cnn_matmul): C[b] = A[b] (m x k) . B[b or 0]
+// (k x n), float accumulation in k order; one invocation per output element.
+layout(push_constant) uniform P { Buf a; Buf bm; Buf y; int total; int m; int k; int nn; int b_batched; } p;
+void main() {
+    int i = GID;
+    if (i >= p.total) return;
+    int col = i % p.nn, t = i / p.nn, row = t % p.m, bb = t / p.m;
+    int ar = (bb * p.m + row) * p.k;
+    int bc = (p.b_batched != 0 ? bb * p.k * p.nn : 0) + col;
+    float acc = 0.0;
+    for (int kk = 0; kk < p.k; kk++) acc = fma(LD(p.a, ar + kk), LD(p.bm, bc + kk * p.nn), acc);
+    ST(p.y, i, acc);
+}

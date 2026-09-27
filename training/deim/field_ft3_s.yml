@@ -1,0 +1,31 @@
+# Field fine-tune 3 of the 10 M model (rented GPU): the same rebalancing pass as field_ft3_local.yml —
+# from fine-tune 2, on train_bal.json (original day cameras 40 %, night ×2 40 %, new cameras ½ 20 %),
+# 10 epochs, lr halved, mosaic/mixup for the first 3 epochs only.
+__include__: ['field_ft2_s.yml']
+output_dir: /workspace/out/field_ft3_s
+
+epoches: 10
+flat_epoch: 5
+no_aug_epoch: 4
+warmup_iter: 200
+
+optimizer:
+  type: AdamW
+  params:
+    - params: '^(?=.*backbone)(?!.*bn).*$'
+      lr: 0.000025
+    - params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.00005
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+train_dataloader:
+  dataset:
+    ann_file: /root/field/field_train/train_bal.json
+    transforms:
+      policy:
+        epoch: [0, 3, 6]
+  collate_fn:
+    mixup_epochs: [0, 3]
+    stop_epoch: 10

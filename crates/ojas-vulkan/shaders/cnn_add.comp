@@ -1,0 +1,8 @@
+// precisions: f32 f16
+// Same-shape a + b: float add, round once (CUDA cnn_add).
+layout(push_constant) uniform P { Buf a; Buf b; Buf y; int n; } p;
+void main() {
+    int i = GID;
+    if (i >= p.n) return;
+    ST(p.y, i, LD(p.a, i) + LD(p.b, i));
+}

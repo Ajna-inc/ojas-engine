@@ -1,0 +1,64 @@
+# Step 3b training run: the P3 model (step3b_ojas_n32_p3.yml) fine-tuned from the grown Step-3
+# checkpoint (grow_p3.py), trained multi-scale so one model serves 640 for throughput and 800–960
+# for 1080p/1440p cameras. A model trained only at 640 falls from 0.547 to 0.513 at 800 and
+# 0.417 at 960 (measured), so the scales have to be in training.
+#
+# - images resized to 800, then the collate function picks one size per batch from 576..992
+#   (DEIM generate_scales(800, 3)); kept on to the last epoch (stop_epoch = epoches), so the
+#   stage-2 EMA restart does not trigger and the best checkpoint is best_stg1.pth
+# - 30 epochs: augmentation (mosaic 0.5 + mixup 0.5) from epoch 0 to 16 — the weights are already
+#   trained — full augmentation to 24, none for the last 6; flat lr to 16, cosine to half
+# - batch 16 (the 992-px batches on a 24 GB RTX PRO 4000), lr scaled linearly from Step 3's 48:
+#   2e-4 / 1e-4
+__include__: ['step3b_ojas_n32_p3.yml']
+output_dir: /workspace/out/step3b_ojas_n32_p3
+
+epoches: 30
+flat_epoch: 16
+no_aug_epoch: 6
+lr_gamma: 0.5
+warmup_iter: 750
+
+optimizer:
+  type: AdamW
+  params:
+    - params: '^(?=.*backbone)(?!.*bn).*$'
+      lr: 0.0001
+    - params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.0002
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+ema:
+  type: ModelEMA
+  decay: 0.9999
+  warmups: 750
+  start: 0
+
+train_dataloader:
+  dataset:
+    transforms:
+      ops:
+        - {type: Mosaic, output_size: 400, rotation_range: 10, translation_range: [0.1, 0.1], scaling_range: [0.5, 1.5],
+           probability: 1.0, fill_value: 0, use_cache: False, max_cached_images: 50, random_pop: True}
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 0}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [800, 800], }
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        epoch: [0, 16, 24]
+  collate_fn:
+    base_size: 800
+    base_size_repeat: 3
+    mixup_epochs: [0, 16]
+    stop_epoch: 30
+  total_batch_size: 16
+  num_workers: 12             # the RTX PRO 4000 pod caps the container at 31 GB RAM; 32 workers were OOM-killed
+val_dataloader:
+  num_workers: 8

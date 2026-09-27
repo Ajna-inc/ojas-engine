@@ -1,0 +1,45 @@
+[
+  {
+    "label": "surya2-peshwa21-t1024",
+    "mode": "ocr",
+    "model": "~/.cache/huggingface/hub/models--datalab-to--surya-ocr-2-gguf/snapshots/6a3a4c30e5e74446d4f8b6afd05b2f2da970f470/surya-2.gguf",
+    "prompt": "/tmp/ojas-ocr-pages/surya-fullpage-prompt.txt",
+    "image": "/tmp/ojas-ocr-pages/p300-021.png",
+    "tokens": 2048,
+    "reps": 3,
+    "timeout": 3600,
+    "env": {"OJAS_IMAGE_MAX_TOKENS": "1024"},
+    "note": "Per-page OCR throughput. total_s is encode + prefill + decode for ONE page, which is the shape of the 32.4 s/page median in; prefill alone is ttft_s - encode_s. tokens=2048 because a surya page is 2100-3200 output tokens, so a 32-token sample would not be a page. The encode runs once up front (metadata encode_s) and once inside every repetition, so this case is reps+2 = 5 CPU-ViT passes."
+  },
+  {
+    "label": "surya2-peshwa21-t2048",
+    "mode": "ocr",
+    "model": "~/.cache/huggingface/hub/models--datalab-to--surya-ocr-2-gguf/snapshots/6a3a4c30e5e74446d4f8b6afd05b2f2da970f470/surya-2.gguf",
+    "prompt": "/tmp/ojas-ocr-pages/surya-fullpage-prompt.txt",
+    "image": "/tmp/ojas-ocr-pages/p300-021.png",
+    "tokens": 2048,
+    "reps": 1,
+    "timeout": 7200,
+    "env": {"OJAS_IMAGE_MAX_TOKENS": "2048"},
+    "note": "Halving the merged-token budget quarters the ViT's dense attention term, which is 78% of its 12.7 TFLOP at the full budget. reps=1 because one CPU-ViT pass at this budget is minutes; determinism is still gated, because serving_bench compares every run against the unprinted warmup."
+  },
+  {
+    "label": "surya2-peshwa21-t4096",
+    "mode": "ocr",
+    "model": "~/.cache/huggingface/hub/models--datalab-to--surya-ocr-2-gguf/snapshots/6a3a4c30e5e74446d4f8b6afd05b2f2da970f470/surya-2.gguf",
+    "prompt": "/tmp/ojas-ocr-pages/surya-fullpage-prompt.txt",
+    "image": "/tmp/ojas-ocr-pages/p300-021.png",
+    "tokens": 2048,
+    "reps": 1,
+    "timeout": 21600,
+    "env": {"OJAS_IMAGE_MAX_TOKENS": "4096"},
+    "note": "The budget surya actually runs at: 4096 merged tokens, 16384 patches, a ~4220-token prompt. NOT RUNNABLE IN A RELEASE WINDOW ON THE CPU ViT - three passes at ~25-30 min each. This case exists so the number has a defined shape the moment the Metal encoder lands; until then use `ojas ocr` directly for the single full-page run and take the cost from its `encoded in` line.",
+    "fixtures": [
+      "mkdir -p /tmp/ojas-ocr-pages",
+      "pdftoppm -f 21 -l 21 -r 300 -png ~/Desktop/sci/dharmashastra-lab/tools/peshwa1909.pdf /tmp/ojas-ocr-pages/p300   # writes p300-021.png",
+      "printf 'OCR this image to HTML. Each block is a div with data-label and data-bbox (x0 y0 x1 y1, normalized 0-1000).' > /tmp/ojas-ocr-pages/surya-fullpage-prompt.txt",
+      "cargo build --release --example serving_bench",
+      "python3 scripts/release/run_serving_bench.py --manifest scripts/release/ocr_page_bench.json --binary target/release/examples/serving_bench --work /tmp/ocr-bench --output /tmp/ocr-bench/results.json"
+    ]
+  }
+]

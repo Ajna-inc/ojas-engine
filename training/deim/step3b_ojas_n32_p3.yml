@@ -1,0 +1,18 @@
+# Step 3b — the production model with the stride-8 level (P3) that IISc RT-DETRv2-S and our 10 M
+# model both have. Step 3 lost to IISc S almost entirely on small and medium objects (AR_small 0.580
+# vs 0.625, AP_medium 0.433 vs 0.462, Two-wheeler 0.727 vs 0.771); D-FINE-N sees only strides 16
+# and 32. Everything else is Step 3 (merged by __include__).
+__include__: ['step3_ojas_n32.yml']
+output_dir: /workspace/out/step3b_ojas_n32_p3
+
+HGNetv2:
+  return_idx: [1, 2, 3]
+HybridEncoder:
+  in_channels: [256, 512, 1024]
+  feat_strides: [8, 16, 32]
+  use_encoder_idx: [2]
+DFINETransformer:
+  feat_channels: [96, 96, 96]
+  feat_strides: [8, 16, 32]
+  num_levels: 3
+  num_points: [3, 6, 3]

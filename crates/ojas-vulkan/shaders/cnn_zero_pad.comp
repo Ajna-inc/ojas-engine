@@ -1,0 +1,30 @@
+// precisions: f16
+// Zero the never-written cells of padded NHWC buffers in a shared arena (CUDA
+// cnn_zero_pad_f16): borders, spare columns, channel slack [c, cs). 32
+// invocations per contiguous run; blockIdx.y = buffer; tab[9*y..] = (element
+// offset, n, hp, wp, cs, pad, h, w, c). grid = (blocks, buffers), block = 256.
+layout(push_constant) uniform P { Buf y; UBuf tab; } p;
+void main() {
+    int row = int(gl_WorkGroupID.y);
+    int n = int(p.tab.v[9 * row + 1]), hp = int(p.tab.v[9 * row + 2]), wp = int(p.tab.v[9 * row + 3]), cs = int(p.tab.v[9 * row + 4]);
+    int pad = int(p.tab.v[9 * row + 5]), h = int(p.tab.v[9 * row + 6]), w = int(p.tab.v[9 * row + 7]), c = int(p.tab.v[9 * row + 8]);
+    int64_t base = int64_t(p.tab.v[9 * row]);
+    int64_t isz = int64_t(hp) * wp * cs;
+    int64_t nseg = h + 1, nsl = c < cs ? int64_t(h) * w : 0, per = nseg + nsl;
+    int lane = int(gl_LocalInvocationID.x) & 31;
+    for (int64_t r = (int64_t(gl_WorkGroupID.x) * 256 + gl_LocalInvocationID.x) >> 5; r < int64_t(n) * per; r += int64_t(gl_NumWorkGroups.x) * 8) {
+        int64_t im = r / per, k = r % per, start, len;
+        if (k == 0) {
+            start = 0; len = (int64_t(pad) * wp + pad) * cs;
+        } else if (k < h) {
+            start = (int64_t(pad + k - 1) * wp + pad + w) * cs; len = int64_t(wp - w) * cs;
+        } else if (k == h) {
+            start = (int64_t(pad + h - 1) * wp + pad + w) * cs; len = isz - start;
+        } else {
+            int64_t q = k - nseg;
+            start = (int64_t(pad + q / w) * wp + pad + q % w) * cs + c; len = cs - c;
+        }
+        int64_t s = base + im * isz + start;
+        for (int64_t j = lane; j < len; j += 32) p.y.v[uint(s + j)] = T(0.0);
+    }
+}

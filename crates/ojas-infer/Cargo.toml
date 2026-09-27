@@ -1,0 +1,17 @@
+[package]
+name = "ojas-infer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+anyhow = "1"
+ojas-core = { path = "../ojas-core" }
+
+# Only the examples use the Metal backend.
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+ojas-formats = { path = "../ojas-formats" }
+ojas-metal = { path = "../ojas-metal" }
+ojas-models = { path = "../ojas-models" }

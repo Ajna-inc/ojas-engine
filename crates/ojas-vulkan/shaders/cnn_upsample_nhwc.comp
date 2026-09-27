@@ -1,0 +1,13 @@
+// precisions: f16
+// Nearest upsample by integer factors on padded NHWC (CUDA cnn_upsample_nhwc).
+layout(push_constant) uniform P { Buf x; Buf y; int n; int ch; int h; int w; int ipad; int iwp; int iimg; int oh; int ow;
+                                  int opad; int owp; int oimg; int sh; int sw; int ics; int ocs; } p;
+void main() {
+    int i = GID;
+    if (i >= p.n) return;
+    int c = i % p.ch, t = i / p.ch, ox = t % p.ow;
+    t /= p.ow;
+    int oy = t % p.oh, im = t / p.oh;
+    p.y.v[im * p.oimg + ((oy + p.opad) * p.owp + ox + p.opad) * p.ocs + c] =
+        p.x.v[im * p.iimg + ((oy / p.sh + p.ipad) * p.iwp + ox / p.sw + p.ipad) * p.ics + c];
+}

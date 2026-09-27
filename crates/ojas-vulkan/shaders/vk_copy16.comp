@@ -1,0 +1,8 @@
+// precisions: f16
+// Test kernel: 16 bytes per invocation (bandwidth ceiling of vector access).
+layout(push_constant) uniform P { U4Buf x; U4Buf y; int n; } p;
+void main() {
+    int i = GID;
+    if (i >= p.n) return;
+    p.y.v[i] = p.x.v[i];
+}

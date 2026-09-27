@@ -1,0 +1,41 @@
+# Vehicle + person mix 1 of the 3.39 M production model (P3, 800 px), local RTX 3060. The same data as
+# field_mix1_s.yml (person_mix1/train_local.json: all Field training frames with vehicles and people,
+# every 2nd UVH-26 train image with the person class unlabelled). From Field fine-tune 3 with a fresh
+# person row (no COCO head matches hidden 96: add_person_class.py … fresh). 10 epochs, lr a little above
+# fine-tune 3's so the new class is learned; mosaic/mixup for 4, none for the last 3.
+__include__: ['field_ft2_local.yml']
+output_dir: /data/dev-cache/train/out/field_mix1_local
+
+num_classes: 16
+
+epoches: 10
+flat_epoch: 5
+no_aug_epoch: 3
+warmup_iter: 500
+
+optimizer:
+  type: AdamW
+  params:
+    - params: '^(?=.*backbone)(?!.*bn).*$'
+      lr: 0.000015
+    - params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.00005
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+train_dataloader:
+  dataset:
+    img_folder: /data/dev-cache/
+    ann_file: /data/dev-cache/field-dataset/person_mix1/train_local.json
+    transforms:
+      policy:
+        epoch: [0, 4, 7]
+  collate_fn:
+    mixup_epochs: [0, 4]
+    stop_epoch: 10
+  num_workers: 10
+val_dataloader:
+  dataset:
+    img_folder: /data/dev-cache/field-dataset/
+    ann_file: /data/dev-cache/train/out/field_person1_s/init/val_with_persons.json

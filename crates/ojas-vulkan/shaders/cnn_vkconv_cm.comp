@@ -1,0 +1,139 @@
+// precisions: f16
+// Convolution as an implicit GEMM on matrix units (VK_KHR_cooperative_matrix,
+// fp16 16x16x16 with fp32 accumulation): NVIDIA tensor cores, RDNA3 WMMA,
+// Intel XMX. Same contract and arguments as cnn_vkconv_f16. Needs 32-wide
+// subgroups (workgroup = 128 invocations = 4 subgroups).
+//
+// Tile 128 pixels x 64 output channels; subgroup (sy, sx) owns rows
+// sy*64..+64 and channels sx*32..+32 (4x2 fragments). K in chunks of 32: the
+// next chunk's global loads go to registers while the current one
+// multiplies. Loads are 16-byte vectors (the input when channels come in
+// groups of 8, else per element). Epilogue through a per-subgroup 16x16
+// scratch: sum rounded to f16, + bias (rounded), then the activation.
+//
+// Written without arrays of matrices or registers and without loops over
+// them: the SPIR-V is not optimized (glslang without SPIRV-Tools) and drivers
+// then keep such arrays in local memory — measured 5.6x slower on the 3060.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#define BM 128
+#define BN 64
+#define BK 32
+#define LDS 40
+shared float16_t As[BM * LDS];
+shared float16_t Bs[BN * LDS];
+shared float Cs[4 * 256];
+shared int obase[BM];
+shared float sbias[BN];
+layout(push_constant) uniform P { RoBuf x; RoBuf w; Buf y; RoUBuf xoff; RoUBuf yoff; RoUBuf toff; RoBuf bias;
+                                  int m_total; int cout; int k_total; int kpad; int opix; int in_img; int out_img; int cin; int act; int has_bias;
+                                  int vec_a; } p;
+
+#define ACC coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>
+#define MA coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA>
+#define MB coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB>
+
+#define PUT8(dst, at, q) { \
+    f16vec2 h0_ = unpackFloat2x16((q).x), h1_ = unpackFloat2x16((q).y), h2_ = unpackFloat2x16((q).z), h3_ = unpackFloat2x16((q).w); \
+    dst[(at)] = h0_.x; dst[(at) + 1] = h0_.y; dst[(at) + 2] = h1_.x; dst[(at) + 3] = h1_.y; \
+    dst[(at) + 4] = h2_.x; dst[(at) + 5] = h2_.y; dst[(at) + 6] = h3_.x; dst[(at) + 7] = h3_.y; }
+
+// 8 input halves of the row with base `rb` (-1: no row) at k
+uvec4 load_a(int rb, int k) {
+    if (rb < 0 || k >= p.k_total) return uvec4(0);
+    if (p.vec_a != 0) {
+        int tap = k / p.cin, ic = k - tap * p.cin;
+        return RoU4Buf(uint64_t(p.x) + uint64_t(rb + int(p.toff.v[tap]) + ic) * 2).v[0];
+    }
+    uint u0 = 0u, u1 = 0u, u2 = 0u, u3 = 0u;
+    for (int j = 0; j < 8; j++) {
+        int kk = k + j;
+        if (kk >= p.k_total) break;
+        int tap = kk / p.cin, ic = kk - tap * p.cin;
+        uint h = packFloat2x16(f16vec2(p.x.v[rb + int(p.toff.v[tap]) + ic], float16_t(0.0))) << ((j & 1) * 16);
+        if (j < 2) u0 |= h; else if (j < 4) u1 |= h; else if (j < 6) u2 |= h; else u3 |= h;
+    }
+    return uvec4(u0, u1, u2, u3);
+}
+
+uvec4 load_b(int oc, int k) {
+    return oc < p.cout ? RoU4Buf(uint64_t(p.w) + uint64_t(oc * p.kpad + k) * 2).v[0] : uvec4(0);
+}
+
+int row_base(int m) {
+    if (m >= p.m_total) return -1;
+    int im = m / p.opix;
+    return im * p.in_img + int(p.xoff.v[m - im * p.opix]);
+}
+
+// epilogue of fragment (i, j) of this subgroup
+#define EPI(c, i, j) { \
+    coopMatStore(c, Cs, sg * 256, 16, gl_CooperativeMatrixLayoutRowMajor); \
+    subgroupMemoryBarrierShared(); subgroupBarrier(); \
+    for (int e = lane; e < 256; e += 32) { \
+        int r = sy * 64 + (i) * 16 + e / 16, cc = sx * 32 + (j) * 16 + e % 16; \
+        int ob = obase[r], oc = n0 + cc; \
+        if (ob >= 0 && oc < p.cout) { \
+            float v = RND(Cs[sg * 256 + e]); \
+            if (p.has_bias != 0) v = RND(v + sbias[cc]); \
+            if (p.act != 0) v = cnn_act_f(v, p.act); \
+            ST(p.y, ob + oc, v); \
+        } \
+    } \
+    subgroupBarrier(); }
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x);
+    int sg = int(gl_SubgroupID), lane = int(gl_SubgroupInvocationID);
+    int sy = sg / 2, sx = sg % 2;
+    int m0 = int(gl_WorkGroupID.x) * BM, n0 = int(gl_WorkGroupID.y) * BN;
+    // this invocation loads A rows tid/4 + {0,32,64,96} and B rows tid/4 + {0,32}, 8 halves at column q*8
+    int q = tid % 4, r0 = tid / 4;
+    int rb0 = row_base(m0 + r0), rb1 = row_base(m0 + r0 + 32), rb2 = row_base(m0 + r0 + 64), rb3 = row_base(m0 + r0 + 96);
+    obase[tid] = -1;
+    {
+        int m = m0 + tid;
+        if (m < p.m_total) {
+            int im = m / p.opix;
+            obase[tid] = im * p.out_img + int(p.yoff.v[m - im * p.opix]);
+        }
+    }
+    if (tid < BN) sbias[tid] = (p.has_bias != 0 && n0 + tid < p.cout) ? LD(p.bias, n0 + tid) : 0.0;
+
+    ACC c00 = ACC(0.0), c01 = ACC(0.0), c10 = ACC(0.0), c11 = ACC(0.0);
+    ACC c20 = ACC(0.0), c21 = ACC(0.0), c30 = ACC(0.0), c31 = ACC(0.0);
+    uvec4 ra0 = load_a(rb0, q * 8), ra1 = load_a(rb1, q * 8), ra2 = load_a(rb2, q * 8), ra3 = load_a(rb3, q * 8);
+    uvec4 rw0 = load_b(n0 + r0, q * 8), rw1 = load_b(n0 + r0 + 32, q * 8);
+    for (int k0 = 0; k0 < p.k_total; k0 += BK) {
+        PUT8(As, (r0) * LDS + q * 8, ra0)
+        PUT8(As, (r0 + 32) * LDS + q * 8, ra1)
+        PUT8(As, (r0 + 64) * LDS + q * 8, ra2)
+        PUT8(As, (r0 + 96) * LDS + q * 8, ra3)
+        PUT8(Bs, (r0) * LDS + q * 8, rw0)
+        PUT8(Bs, (r0 + 32) * LDS + q * 8, rw1)
+        barrier();
+        int k1 = k0 + BK;
+        if (k1 < p.k_total) {
+            ra0 = load_a(rb0, k1 + q * 8); ra1 = load_a(rb1, k1 + q * 8); ra2 = load_a(rb2, k1 + q * 8); ra3 = load_a(rb3, k1 + q * 8);
+            rw0 = load_b(n0 + r0, k1 + q * 8); rw1 = load_b(n0 + r0 + 32, k1 + q * 8);
+        }
+        for (int kk = 0; kk < BK; kk += 16) {
+            MA a0, a1, a2, a3;
+            MB b0, b1;
+            coopMatLoad(b0, Bs, (sx * 32) * LDS + kk, LDS, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(b1, Bs, (sx * 32 + 16) * LDS + kk, LDS, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(a0, As, (sy * 64) * LDS + kk, LDS, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a1, As, (sy * 64 + 16) * LDS + kk, LDS, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a2, As, (sy * 64 + 32) * LDS + kk, LDS, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a3, As, (sy * 64 + 48) * LDS + kk, LDS, gl_CooperativeMatrixLayoutRowMajor);
+            c00 = coopMatMulAdd(a0, b0, c00); c01 = coopMatMulAdd(a0, b1, c01);
+            c10 = coopMatMulAdd(a1, b0, c10); c11 = coopMatMulAdd(a1, b1, c11);
+            c20 = coopMatMulAdd(a2, b0, c20); c21 = coopMatMulAdd(a2, b1, c21);
+            c30 = coopMatMulAdd(a3, b0, c30); c31 = coopMatMulAdd(a3, b1, c31);
+        }
+        barrier();
+    }
+    EPI(c00, 0, 0) EPI(c01, 0, 1) EPI(c10, 1, 0) EPI(c11, 1, 1)
+    EPI(c20, 2, 0) EPI(c21, 2, 1) EPI(c30, 3, 0) EPI(c31, 3, 1)
+}

@@ -1,0 +1,30 @@
+# Rust build output (includes .future-incompat-report.json, incremental cache, etc.)
+/target
+
+# macOS
+.DS_Store
+
+# Editor scratch
+*.swp
+*.rs.bk
+
+
+# Local models and credentials
+*.gguf
+*.safetensors
+*.onnx
+*.pt
+/models/*
+!/models/MANIFEST.md
+!/models/*_dict.txt
+!/models/*.classes.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+

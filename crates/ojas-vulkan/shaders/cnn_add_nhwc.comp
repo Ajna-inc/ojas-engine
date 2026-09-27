@@ -1,0 +1,13 @@
+// precisions: f16
+// a + b on padded-NHWC channel slices, interior only (CUDA cnn_add_nhwc).
+layout(push_constant) uniform P { Buf a; Buf b; Buf y; int n; int ch; int h; int w; int pad; int wp; int acs; int aimg;
+                                  int bcs; int bimg; int ycs; int yimg; } p;
+void main() {
+    int i = GID;
+    if (i >= p.n) return;
+    int c = i % p.ch, t = i / p.ch, xx = t % p.w;
+    t /= p.w;
+    int yy = t % p.h, im = t / p.h;
+    int pix = (yy + p.pad) * p.wp + xx + p.pad;
+    ST(p.y, im * p.yimg + pix * p.ycs + c, LD(p.a, im * p.aimg + pix * p.acs + c) + LD(p.b, im * p.bimg + pix * p.bcs + c));
+}

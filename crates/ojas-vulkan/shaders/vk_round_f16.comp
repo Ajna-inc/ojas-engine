@@ -1,0 +1,10 @@
+// precisions: f16
+// Test kernel: y[i] = binary16 of x[i] through the prelude's rounding (the
+// conformance test compares it with IEEE round-to-nearest-even on the host).
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer F32Buf { float v[]; };
+layout(push_constant) uniform P { F32Buf x; Buf y; int n; } p;
+void main() {
+    int i = GID;
+    if (i >= p.n) return;
+    ST(p.y, i, p.x.v[i]);
+}

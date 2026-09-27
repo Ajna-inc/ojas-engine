@@ -1,0 +1,21 @@
+# Field fine-tune 2 of the 10 M model (DEIM-D-FINE-S) on a rented GPU: continues from the first Field
+# fine-tune (field_ft_s best_stg1) on the grown set — rounds 2–5, 16,548 frames, 205,572 boxes,
+# 33 camera views — validated on day + night + new-camera day (852). 16 epochs at 640 px, batch 16;
+# mosaic/mixup to 8, full augmentation to 12. Data on the pod's container disk (/root/field).
+__include__: ['field_ft_s.yml']
+output_dir: /workspace/out/field_ft2_s
+
+epoches: 16
+flat_epoch: 8
+no_aug_epoch: 4
+warmup_iter: 300
+
+train_dataloader:
+  dataset:
+    transforms:
+      policy:
+        epoch: [0, 8, 12]
+  collate_fn:
+    mixup_epochs: [0, 8]
+    stop_epoch: 16
+  num_workers: 16            # the RTX PRO 4500 pod has 62 GB RAM

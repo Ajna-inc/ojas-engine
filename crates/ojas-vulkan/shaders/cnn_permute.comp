@@ -1,0 +1,15 @@
+// precisions: f16
+// Permute on contiguous tensors, rank <= 6 (CUDA cnn_permute): out dims
+// d0..d5, s0..s5 = input strides of the axis landing at each output position.
+layout(push_constant) uniform P { Buf x; Buf y; int n; int d1; int d2; int d3; int d4; int d5; int s0; int s1; int s2; int s3; int s4; int s5; } p;
+void main() {
+    int i = GID;
+    if (i >= p.n) return;
+    int t = i;
+    int i5 = t % p.d5; t /= p.d5;
+    int i4 = t % p.d4; t /= p.d4;
+    int i3 = t % p.d3; t /= p.d3;
+    int i2 = t % p.d2; t /= p.d2;
+    int i1 = t % p.d1, i0 = t / p.d1;
+    p.y.v[i] = p.x.v[i0 * p.s0 + i1 * p.s1 + i2 * p.s2 + i3 * p.s3 + i4 * p.s4 + i5 * p.s5];
+}

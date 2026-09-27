@@ -1,0 +1,15 @@
+// precisions: f16
+// NHWC conv epilogue over the unpadded interior (CUDA cnn_bias_act_nhwc): the
+// sum rounds to storage, then the activation runs in float.
+layout(push_constant) uniform P { Buf x; Buf bias; int n; int oh; int ow; int pad; int wp; int ch; int img; int act; int has_bias; int cs; } p;
+void main() {
+    int i = GID;
+    if (i >= p.n) return;
+    int c = i % p.ch, t = i / p.ch, opix = p.oh * p.ow;
+    int q = t % opix;
+    int o = (t / opix) * p.img + ((q / p.ow + p.pad) * p.wp + q % p.ow + p.pad) * p.cs + c;
+    float v = LD(p.x, o);
+    if (p.has_bias != 0) v = RND(v + LD(p.bias, c));
+    if (p.act != 0) v = cnn_act_f(v, p.act);
+    ST(p.x, o, v);
+}

@@ -1,0 +1,18 @@
+// precisions: f32 f16
+// Softmax over `dim` with stride `inner`, one invocation per (outer, inner)
+// slice (CUDA cnn_softmax / ATen cunn_SpatialSoftMaxForward serial branch):
+// serial max, serial sum of exp(x-max) in d order, then exp(x-max)/sum.
+layout(push_constant) uniform P { Buf x; Buf y; int n; int dim; int inner; } p;
+void main() {
+    int s = GID;
+    if (s >= p.n) return;
+    int off = (s / p.inner) * p.inner * p.dim + s % p.inner;
+    float mx = -CNN_FLT_MAX;
+    for (int d = 0; d < p.dim; d++) {
+        float v = LD(p.x, off + d * p.inner);
+        mx = mx < v ? v : mx;
+    }
+    float sum = 0.0;
+    for (int d = 0; d < p.dim; d++) sum += exp(LD(p.x, off + d * p.inner) - mx);
+    for (int d = 0; d < p.dim; d++) ST(p.y, off + d * p.inner, exp(LD(p.x, off + d * p.inner) - mx) / sum);
+}

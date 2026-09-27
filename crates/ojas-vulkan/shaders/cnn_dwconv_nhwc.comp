@@ -1,0 +1,31 @@
+// precisions: f16
+// NHWC depthwise k x k conv, any padding/stride (CUDA cnn_dwconv_nhwc): taps
+// outside the logical image are skipped; float accumulation kH-then-kW.
+// grid = (N*out_h, ceil(out_w*ch/256)), block = 256.
+shared float sW[2304];
+layout(push_constant) uniform P { Buf x; Buf weight; Buf y; int nimg; int ch; int h; int w; int ipad; int wp; int img;
+                                  int out_h; int out_w; int k; int sh; int sw; int pt; int pl; int opad; int owp; int oimg; int ics; int ocs; } p;
+void main() {
+    int n = int(gl_WorkGroupID.x) / p.out_h, oy = int(gl_WorkGroupID.x) % p.out_h;
+    int tid = int(gl_LocalInvocationID.x);
+    int e = int(gl_WorkGroupID.y) * 256 + tid;
+    int kk = p.k * p.k;
+    int wc = min(kk * p.ch, 2304);
+    for (int idx = tid; idx < wc; idx += 256) sW[idx] = LD(p.weight, idx);
+    barrier();
+    if (n >= p.nimg || e >= p.out_w * p.ch) return;
+    int ox = e / p.ch, c = e % p.ch;
+    int xb = n * p.img + c;
+    float v = 0.0;
+    for (int ky = 0; ky < p.k; ky++) {
+        int iy = oy * p.sh - p.pt + ky;
+        if (iy < 0 || iy >= p.h) continue;
+        for (int kx = 0; kx < p.k; kx++) {
+            int ix = ox * p.sw - p.pl + kx;
+            if (ix < 0 || ix >= p.w) continue;
+            float wv = (c + 1) * kk <= wc ? sW[c * kk + ky * p.k + kx] : LD(p.weight, c * kk + ky * p.k + kx);
+            v = fma(wv, LD(p.x, xb + ((iy + p.ipad) * p.wp + ix + p.ipad) * p.ics), v);
+        }
+    }
+    ST(p.y, n * p.oimg + ((oy + p.opad) * p.owp + ox + p.opad) * p.ocs + c, v);
+}

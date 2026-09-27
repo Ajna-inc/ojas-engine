@@ -1,0 +1,73 @@
+# Field fine-tune: the Step-3b model (3.39 M, P3, multi-scale) tuned on the reviewed Field
+# frames only — no UVH/BMD images, deliberately; the UVH-trained weights are the starting point.
+#
+# Data (training/field, review_* tools): 10,021 frames, 114,169
+# boxes, 25 camera views, day (cam01/05/09, 07–09 h) and night (22 grid views). Two-model agreement
+# plus a by-eye review of every disagreement, relabelled to UVH-26's own conventions
+# (uvh_conventions.tsv); unsure and unreviewed low-score regions greyed out; nothing within 15 s of
+# a test frame. Val = 261 day gold + 371 night frames (unsure regions as crowd → ignored).
+#
+# Data lives on the pod's container disk (/root/field): 8 parallel tar streams upload ~8x faster
+# than rsync into the network volume (one ssh stream is latency-bound at ~0.45 MB/s). A pod
+# restart loses it — re-upload before resuming.
+#
+# Recipe = Step 3b's, shortened for a fine-tune of already-trained weights on a 10 k set:
+# 24 epochs, mosaic/mixup to 12, full augmentation to 19, none for the last 5; lr halved (the
+# weights are converged on UVH and the set is small); multi-scale 576–992 kept to the end.
+__include__: ['step3b_ojas_n32_p3.yml']
+output_dir: /workspace/out/field_ft
+
+epoches: 24
+flat_epoch: 12
+no_aug_epoch: 5
+lr_gamma: 0.5
+warmup_iter: 300
+
+optimizer:
+  type: AdamW
+  params:
+    - params: '^(?=.*backbone)(?!.*bn).*$'
+      lr: 0.00005
+    - params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.0001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+ema:
+  type: ModelEMA
+  decay: 0.9998
+  warmups: 300
+  start: 0
+
+train_dataloader:
+  dataset:
+    img_folder: /root/field/
+    ann_file: /root/field/field_train/train.json
+    transforms:
+      ops:
+        - {type: Mosaic, output_size: 400, rotation_range: 10, translation_range: [0.1, 0.1], scaling_range: [0.5, 1.5],
+           probability: 1.0, fill_value: 0, use_cache: False, max_cached_images: 50, random_pop: True}
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 0}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [800, 800], }
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        epoch: [0, 12, 19]
+  collate_fn:
+    base_size: 800
+    base_size_repeat: 3
+    mixup_epochs: [0, 12]
+    stop_epoch: 24
+  total_batch_size: 16
+  num_workers: 12             # the RTX PRO 4000 pod caps the container at 31 GB RAM
+val_dataloader:
+  dataset:
+    img_folder: /root/field/
+    ann_file: /root/field/field_train/val.json
+  num_workers: 8

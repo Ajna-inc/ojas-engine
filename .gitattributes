@@ -1,0 +1,2 @@
+# Unified patches contain space-prefixed blank context lines.
+scripts/release/*.patch -whitespace

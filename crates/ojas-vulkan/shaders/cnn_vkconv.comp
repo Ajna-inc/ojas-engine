@@ -1,0 +1,114 @@
+// precisions: f16
+// Convolution as a tiled implicit GEMM on the plain ALUs (any Vulkan GPU).
+// Rows = output pixels m of all images, cols = output channels, K = taps*cin
+// with k = tap*cin + ic (the CUDA igemm order): A[m][k] = x[img*in_img +
+// xoff[pix] + toff[tap] + ic], B[k][oc] = w[oc*kpad + k] (zero-padded f16).
+//
+// Workgroup of 256: tile 128 pixels x 64 channels, 8x4 outputs per
+// invocation; K in chunks of 32 through shared memory, stored k-major in
+// fp32 so each step reads 8 consecutive pixels and 4 consecutive channels as
+// three vec4 loads for 32 FMAs; the next chunk's global loads prefetched into
+// registers; 16-byte global loads (the input when channels come in groups of
+// 8). Float accumulation in k order. Epilogue: sum rounded to f16, + bias
+// (rounded), then the activation.
+//
+// No arrays in the hot loop: the SPIR-V is unoptimized and drivers keep
+// indexed arrays in local memory (see cnn_vkconv_cm).
+#define BM 128
+#define BN 64
+#define BK 32
+shared vec4 As4[BK * (BM / 4)];   // [k][m/4]
+shared vec4 Bs4[BK * (BN / 4)];   // [k][n/4]
+shared int obase[BM];
+shared float sbias[BN];
+layout(push_constant) uniform P { RoBuf x; RoBuf w; Buf y; RoUBuf xoff; RoUBuf yoff; RoUBuf toff; RoBuf bias;
+                                  int m_total; int cout; int k_total; int kpad; int opix; int in_img; int out_img; int cin; int act; int has_bias;
+                                  int vec_a; } p;
+
+// 8 consecutive k (one uvec4 of halves) of row `row` into a k-major vec4
+// tile with `cols4` vec4s per k row
+#define PUT8T(dst, cols4, k0_, row, q) { \
+    f16vec2 h0_ = unpackFloat2x16((q).x), h1_ = unpackFloat2x16((q).y), h2_ = unpackFloat2x16((q).z), h3_ = unpackFloat2x16((q).w); \
+    int c_ = (row) / 4, e_ = (row) % 4; \
+    dst[((k0_) + 0) * (cols4) + c_][e_] = float(h0_.x); dst[((k0_) + 1) * (cols4) + c_][e_] = float(h0_.y); \
+    dst[((k0_) + 2) * (cols4) + c_][e_] = float(h1_.x); dst[((k0_) + 3) * (cols4) + c_][e_] = float(h1_.y); \
+    dst[((k0_) + 4) * (cols4) + c_][e_] = float(h2_.x); dst[((k0_) + 5) * (cols4) + c_][e_] = float(h2_.y); \
+    dst[((k0_) + 6) * (cols4) + c_][e_] = float(h3_.x); dst[((k0_) + 7) * (cols4) + c_][e_] = float(h3_.y); }
+
+uvec4 load_a(int rb, int k) {
+    if (rb < 0 || k >= p.k_total) return uvec4(0);
+    if (p.vec_a != 0) {
+        int tap = k / p.cin, ic = k - tap * p.cin;
+        return RoU4Buf(uint64_t(p.x) + uint64_t(rb + int(p.toff.v[tap]) + ic) * 2).v[0];
+    }
+    uint u0 = 0u, u1 = 0u, u2 = 0u, u3 = 0u;
+    for (int j = 0; j < 8; j++) {
+        int kk = k + j;
+        if (kk >= p.k_total) break;
+        int tap = kk / p.cin, ic = kk - tap * p.cin;
+        uint h = packFloat2x16(f16vec2(p.x.v[rb + int(p.toff.v[tap]) + ic], float16_t(0.0))) << ((j & 1) * 16);
+        if (j < 2) u0 |= h; else if (j < 4) u1 |= h; else if (j < 6) u2 |= h; else u3 |= h;
+    }
+    return uvec4(u0, u1, u2, u3);
+}
+
+uvec4 load_b(int oc, int k) {
+    return oc < p.cout ? RoU4Buf(uint64_t(p.w) + uint64_t(oc * p.kpad + k) * 2).v[0] : uvec4(0);
+}
+
+int row_base(int m) {
+    if (m >= p.m_total) return -1;
+    int im = m / p.opix;
+    return im * p.in_img + int(p.xoff.v[m - im * p.opix]);
+}
+
+#define EPI1(ob, val, j) { \
+    int cc = tx * 4 + (j), oc = n0 + cc; \
+    if (oc < p.cout) { \
+        float v = RND(val); \
+        if (p.has_bias != 0) v = RND(v + sbias[cc]); \
+        if (p.act != 0) v = cnn_act_f(v, p.act); \
+        ST(p.y, (ob) + oc, v); \
+    } }
+#define EPI_ROW(acc, i) { \
+    int ob = obase[ty * 8 + (i)]; \
+    if (ob >= 0) { EPI1(ob, acc.x, 0) EPI1(ob, acc.y, 1) EPI1(ob, acc.z, 2) EPI1(ob, acc.w, 3) } }
+
+void main() {
+    int tid = int(gl_LocalInvocationID.x);
+    int tx = tid % 16, ty = tid / 16;
+    int m0 = int(gl_WorkGroupID.x) * BM, n0 = int(gl_WorkGroupID.y) * BN;
+    // loads: A rows tid/4 and tid/4 + 64, B row tid/4, 8 halves at column q*8
+    int q = tid % 4, r0 = tid / 4;
+    int rb0 = row_base(m0 + r0), rb1 = row_base(m0 + r0 + 64);
+    if (tid < BM) {
+        int m = m0 + tid;
+        obase[tid] = -1;
+        if (m < p.m_total) {
+            int im = m / p.opix;
+            obase[tid] = im * p.out_img + int(p.yoff.v[m - im * p.opix]);
+        }
+    }
+    if (tid < BN) sbias[tid] = (p.has_bias != 0 && n0 + tid < p.cout) ? LD(p.bias, n0 + tid) : 0.0;
+    vec4 c0 = vec4(0.0), c1 = vec4(0.0), c2 = vec4(0.0), c3 = vec4(0.0), c4 = vec4(0.0), c5 = vec4(0.0), c6 = vec4(0.0), c7 = vec4(0.0);
+    uvec4 ra0 = load_a(rb0, q * 8), ra1 = load_a(rb1, q * 8), rw0 = load_b(n0 + r0, q * 8);
+    for (int k0 = 0; k0 < p.k_total; k0 += BK) {
+        PUT8T(As4, BM / 4, q * 8, r0, ra0)
+        PUT8T(As4, BM / 4, q * 8, r0 + 64, ra1)
+        PUT8T(Bs4, BN / 4, q * 8, r0, rw0)
+        barrier();
+        int k1 = k0 + BK;
+        if (k1 < p.k_total) {
+            ra0 = load_a(rb0, k1 + q * 8); ra1 = load_a(rb1, k1 + q * 8); rw0 = load_b(n0 + r0, k1 + q * 8);
+        }
+        for (int kk = 0; kk < BK; kk++) {
+            vec4 bv = Bs4[kk * (BN / 4) + tx];
+            vec4 a0 = As4[kk * (BM / 4) + ty * 2], a1 = As4[kk * (BM / 4) + ty * 2 + 1];
+            c0 = fma(vec4(a0.x), bv, c0); c1 = fma(vec4(a0.y), bv, c1); c2 = fma(vec4(a0.z), bv, c2); c3 = fma(vec4(a0.w), bv, c3);
+            c4 = fma(vec4(a1.x), bv, c4); c5 = fma(vec4(a1.y), bv, c5); c6 = fma(vec4(a1.z), bv, c6); c7 = fma(vec4(a1.w), bv, c7);
+        }
+        barrier();
+    }
+    EPI_ROW(c0, 0) EPI_ROW(c1, 1) EPI_ROW(c2, 2) EPI_ROW(c3, 3)
+    EPI_ROW(c4, 4) EPI_ROW(c5, 5) EPI_ROW(c6, 6) EPI_ROW(c7, 7)
+}

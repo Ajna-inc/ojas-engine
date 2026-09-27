@@ -1,0 +1,61 @@
+# Step 3 — the production-size model. Same data, same recipe, same evaluation as Step 2; only the
+# size changes, so the accuracy-per-compute comparison against yolo11n and IISc's YOLO11-S is clean.
+# DEIM-D-FINE-N is 4 M parameters / 7 GFLOPs — yolo11n's class (2.6 M / 6.5 GFLOPs) — and Apache-2.0,
+# which yolo11n (AGPL-3.0) is not.
+# Tuned from the COCO D-FINE-N weights (no Objects365 checkpoint is published for N), on UVH-26 train (ST labels, 17,387 images)
+# + BMD-45 train de-leaked of every UVH val/train frame (27,358 images): 44,745 images, 516,566 boxes, 14 classes.
+# DEIM's 72-epoch schedule (flat-cosine, Mosaic/mixup off after epoch 40, all augs off for the last 8).
+# Batch 16; LR, EMA and warm-up follow DEIM's linear-scaling note (16/32 = 0.5 of batch 32).
+__include__: ['../deim_dfine/deim_hgnetv2_n_coco.yml']
+output_dir: /data/dev-cache/train/out/step3_deim_dfine_n
+
+num_classes: 15              # UVH ids 1..14
+remap_mscoco_category: False
+checkpoint_freq: 1           # last.pth every epoch → resumable
+
+HGNetv2:
+  pretrained: False          # every weight comes from --tuning (dfine_s_obj2coco.pth); nothing downloaded
+DFINETransformer:
+  activation: relu           # DEIM's base switches these to silu; the Objects365 D-FINE weights were trained with
+  mlp_act: relu              # relu, and loading them into a silu decoder produced invalid boxes at iteration 0
+
+epoches: 72
+flat_epoch: 40               # 4 + 72 // 2
+no_aug_epoch: 8
+warmup_iter: 4000            # 2000 / 0.5
+
+optimizer:
+  type: AdamW
+  params:
+    - params: '^(?=.*backbone)(?!.*bn).*$'
+      lr: 0.0001               # 0.0002 × 0.5
+    - params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.0002                   # 0.0004 × 0.5
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+ema:
+  type: ModelEMA
+  decay: 0.99995               # 1 − (1 − 0.9999) × 0.5
+  warmups: 2000
+  start: 0
+
+train_dataloader:
+  dataset:
+    img_folder: /data/dev-cache/train/data/images/
+    ann_file: /data/dev-cache/train/data/annotations/step2_train_uvhst_bmdclean.json
+    transforms:
+      policy:
+        epoch: [4, 40, 64]
+  collate_fn:
+    mixup_epochs: [4, 40]
+    stop_epoch: 64
+  total_batch_size: 16
+  num_workers: 8
+val_dataloader:
+  dataset:
+    img_folder: /data/dev-cache/train/data/images/
+    ann_file: /data/dev-cache/train/data/annotations/uvh_val_st.json
+  total_batch_size: 16
+  num_workers: 4

@@ -1,0 +1,22 @@
+// precisions: f16
+// Detector score filter on a channels-first head [N, 4+nc, A] (CUDA
+// cnn_det_filter_f16): an anchor survives when its best allowed class score
+// (strict >, from -1) is >= conf; survivors are appended per image (atomic
+// slot): anchor index + its 4+nc column. Grid = (ceil(A/256), N).
+layout(push_constant) uniform P { Buf head; UBuf cmask; UBuf count; UBuf idx; Buf cols; int rows; int anchors; int cap; float conf; } p;
+void main() {
+    int a = GID, n = int(gl_WorkGroupID.y);
+    if (a >= p.anchors) return;
+    int h = n * p.rows * p.anchors + a;
+    float best = -1.0;
+    for (int c = 0; c < p.rows - 4; c++) {
+        float v = LD(p.head, h + (4 + c) * p.anchors);
+        if (v > best && ((p.cmask.v[c >> 5] >> (c & 31)) & 1u) != 0u) best = v;
+    }
+    if (best < p.conf) return;
+    uint slot = atomicAdd(p.count.v[n], 1u);
+    if (slot >= uint(p.cap)) return;
+    p.idx.v[n * p.cap + int(slot)] = uint(a);
+    int o = (n * p.cap + int(slot)) * p.rows;
+    for (int r = 0; r < p.rows; r++) p.cols.v[o + r] = p.head.v[h + r * p.anchors];
+}

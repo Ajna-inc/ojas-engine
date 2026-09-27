@@ -1,0 +1,48 @@
+# Field fine-tune 2 of the 3.39 M production model, on the local RTX 3060 (12 GB): continues from
+# the first Field fine-tune (cloud_field_ft best_stg1) on the grown set — rounds 2–5, 16,548
+# frames, 205,572 boxes, 33 camera views — and validates on day + night + new-camera day (852).
+# Same recipe as field_ft.yml, batch 16 → 8 to fit 12 GB at 992 px (lr halved, linear scaling),
+# 16 epochs since the weights already know Field: mosaic/mixup to 8, full augmentation to 12.
+__include__: ['field_ft.yml']
+output_dir: /data/dev-cache/train/out/field_ft2_local
+
+epoches: 16
+flat_epoch: 8
+no_aug_epoch: 4
+warmup_iter: 500
+
+optimizer:
+  type: AdamW
+  params:
+    - params: '^(?=.*backbone)(?!.*bn).*$'
+      lr: 0.000025
+    - params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.00005
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+ema:
+  type: ModelEMA
+  decay: 0.9998
+  warmups: 500
+  start: 0
+
+train_dataloader:
+  dataset:
+    img_folder: /data/dev-cache/field-dataset/
+    ann_file: /data/dev-cache/field-dataset/field_train/train.json
+    transforms:
+      policy:
+        epoch: [0, 8, 12]
+  collate_fn:
+    mixup_epochs: [0, 8]
+    stop_epoch: 16
+  total_batch_size: 8
+  num_workers: 6
+val_dataloader:
+  dataset:
+    img_folder: /data/dev-cache/field-dataset/
+    ann_file: /data/dev-cache/field-dataset/field_train/val.json
+  total_batch_size: 8
+  num_workers: 4

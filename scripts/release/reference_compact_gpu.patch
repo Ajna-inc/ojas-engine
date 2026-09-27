@@ -1,0 +1,16 @@
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index a71b1aa..8e78781 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1701,7 +1701,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
+ 
+         std::vector<ggml_backend_buffer_ptr> bufs;
+-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
++        // Local reference diagnostic: compact GPU allocations exclude CPU-only
++        // tensors between mapped ranges. This changes allocation, not graph math.
++        const bool compact_gpu = std::getenv("OJAS_REFERENCE_COMPACT_GPU") && props.type == GGML_BACKEND_DEVICE_TYPE_GPU;
++        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !compact_gpu) {
+             GGML_ASSERT(!ml.no_alloc);
+             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                 // only the mmap region containing the tensors in the model is mapped to the backend buffer

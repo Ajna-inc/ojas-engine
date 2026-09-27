@@ -1,0 +1,15 @@
+// precisions: f32 f16
+// Nearest upsample, legacy source index src = min(floor(dst*scale), in-1)
+// (CUDA cnn_upsample_nearest; scale = (float)(1/scale_factor) from the host).
+layout(push_constant) uniform P { Buf x; Buf y; int n; int h1; int w1; int h2; int w2; float hs; float ws; } p;
+void main() {
+    int i = GID;
+    if (i >= p.n) return;
+    int ow = i % p.w2;
+    int t = i / p.w2;
+    int oh = t % p.h2;
+    int nc = t / p.h2;
+    int ih = p.h1 == p.h2 ? oh : min(int(floor(float(oh) * p.hs)), p.h1 - 1);
+    int iw = p.w1 == p.w2 ? ow : min(int(floor(float(ow) * p.ws)), p.w1 - 1);
+    p.y.v[i] = p.x.v[(nc * p.h1 + ih) * p.w1 + iw];
+}

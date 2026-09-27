@@ -1,0 +1,12 @@
+// precisions: f16
+// Contiguous NCHW -> padded NHWC interior (border untouched). `ch` logical
+// channels, `cs` stored channels (the extra ones stay zero). CUDA cnn_nchw_to_nhwc.
+layout(push_constant) uniform P { Buf x; Buf y; int n; int ch; int h; int w; int pad; int wp; int img; int cs; } p;
+void main() {
+    int i = GID;
+    if (i >= p.n) return;
+    int xx = i % p.w, t = i / p.w, yy = t % p.h;
+    t /= p.h;
+    int c = t % p.ch, b = t / p.ch;
+    p.y.v[b * p.img + ((yy + p.pad) * p.wp + xx + p.pad) * p.cs + c] = p.x.v[i];
+}

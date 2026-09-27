@@ -1,0 +1,72 @@
+# Step 3 — the production-size model. Same data, same recipe, same evaluation as Step 2; only the
+# size changes, so the accuracy-per-compute comparison against yolo11n and IISc's YOLO11-S is clean.
+# Sized to the production budget: **3.20 M parameters** at our 15 classes, against yolo11n's 2.6 M —
+# and Apache-2.0, which yolo11n (AGPL-3.0) is not. Published D-FINE-N is 3.74 M here, so the encoder
+# and decoder are narrowed from 128 to 96 and the decoder given a fourth layer: measured on the
+# parameter count, depth is the better use of the budget than width for a DETR decoder.
+# The backbone is 1.85 M of the 3.20 M and still loads its COCO weights; the narrowed encoder and
+# decoder cannot, which is what the distillation stage (Step 4) is for.
+# Tuned from the COCO D-FINE-N weights (no Objects365 checkpoint is published for N), on UVH-26 train (ST labels, 17,387 images)
+# + BMD-45 train de-leaked of every UVH val/train frame (27,358 images): 44,745 images, 516,566 boxes, 14 classes.
+# DEIM's 72-epoch schedule (flat-cosine, Mosaic/mixup off after epoch 40, all augs off for the last 8).
+# Batch 16; LR, EMA and warm-up follow DEIM's linear-scaling note (16/32 = 0.5 of batch 32).
+__include__: ['../deim_dfine/deim_hgnetv2_n_coco.yml']
+output_dir: /data/dev-cache/train/out/step3_ojas_n32
+
+num_classes: 15              # UVH ids 1..14
+remap_mscoco_category: False
+checkpoint_freq: 1           # last.pth every epoch → resumable
+
+HGNetv2:
+  pretrained: False          # every weight comes from --tuning (dfine_s_obj2coco.pth); nothing downloaded
+HybridEncoder:
+  hidden_dim: 96
+  dim_feedforward: 384
+DFINETransformer:
+  hidden_dim: 96
+  dim_feedforward: 384
+  feat_channels: [96, 96]
+  num_layers: 4              # deeper and narrower: +0.21 M for a layer, against +0.30 M for 16 more channels
+  activation: relu           # DEIM's base switches these to silu; the D-FINE weights were trained with relu,
+  mlp_act: relu              # and loading them into a silu decoder produced invalid boxes at iteration 0
+
+epoches: 72
+flat_epoch: 40               # 4 + 72 // 2
+no_aug_epoch: 8
+warmup_iter: 4000            # 2000 / 0.5
+
+optimizer:
+  type: AdamW
+  params:
+    - params: '^(?=.*backbone)(?!.*bn).*$'
+      lr: 0.0001               # 0.0002 × 0.5
+    - params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.0002                   # 0.0004 × 0.5
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+ema:
+  type: ModelEMA
+  decay: 0.99995               # 1 − (1 − 0.9999) × 0.5
+  warmups: 2000
+  start: 0
+
+train_dataloader:
+  dataset:
+    img_folder: /data/dev-cache/train/data/images/
+    ann_file: /data/dev-cache/train/data/annotations/step2_train_uvhst_bmdclean.json
+    transforms:
+      policy:
+        epoch: [4, 40, 64]
+  collate_fn:
+    mixup_epochs: [4, 40]
+    stop_epoch: 64
+  total_batch_size: 16
+  num_workers: 8
+val_dataloader:
+  dataset:
+    img_folder: /data/dev-cache/train/data/images/
+    ann_file: /data/dev-cache/train/data/annotations/uvh_val_st.json
+  total_batch_size: 16
+  num_workers: 4

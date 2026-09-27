@@ -1,0 +1,32 @@
+# Vehicle + person mix 2 of the 10 M model (a rented RTX PRO 4500): a short, low-lr continuation of mix 1
+# on the same data (person_mix1/train_pod.json). Mix 1 ended still improving (val 0.687 → 0.710 over 10
+# epochs) with Field vehicles ~4 points under fine-tune 3; a lower-lr pass is what recovered vehicles in
+# fine-tune 3. From mix 1 best_stg1, 8 epochs, lr halved (head 5e-5, backbone 1.25e-5), mosaic/mixup for the
+# first 2 epochs only, no augmentation for the last 3.
+__include__: ['field_mix1_s.yml']
+output_dir: /workspace/out/field_mix2_s
+
+epoches: 8
+flat_epoch: 4
+no_aug_epoch: 3
+warmup_iter: 200
+
+optimizer:
+  type: AdamW
+  params:
+    - params: '^(?=.*backbone)(?!.*bn).*$'
+      lr: 0.0000125
+    - params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.00005
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+train_dataloader:
+  dataset:
+    transforms:
+      policy:
+        epoch: [0, 2, 5]
+  collate_fn:
+    mixup_epochs: [0, 2]
+    stop_epoch: 8

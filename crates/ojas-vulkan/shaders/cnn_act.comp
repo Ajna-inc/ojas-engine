@@ -1,0 +1,8 @@
+// precisions: f32 f16
+// Elementwise activation (CUDA cnn_act).
+layout(push_constant) uniform P { Buf x; Buf y; int n; int act; } p;
+void main() {
+    int i = GID;
+    if (i >= p.n) return;
+    ST(p.y, i, cnn_act_f(LD(p.x, i), p.act));
+}

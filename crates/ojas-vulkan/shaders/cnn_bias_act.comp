@@ -1,0 +1,14 @@
+// precisions: f32 f16
+// Conv epilogue: x += bias[c], then the activation, in place (CUDA cnn_bias_act:
+// the add rounds to storage before the activation reads it back).
+// n = N*C*plane.
+layout(push_constant) uniform P { Buf x; Buf bias; int n; int plane; int ch; int act; } p;
+void main() {
+    int i = GID;
+    if (i >= p.n) return;
+    int c = (i / p.plane) % p.ch;
+    // upstream stores the sum as T, then the activation reads it back: the
+    // activation must see the rounded sum (RND, see the prelude)
+    float sum = RND(LD(p.x, i) + LD(p.bias, c));
+    ST(p.x, i, p.act != 0 ? cnn_act_f(sum, p.act) : sum);
+}

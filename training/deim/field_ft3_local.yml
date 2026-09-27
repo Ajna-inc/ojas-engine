@@ -1,0 +1,33 @@
+# Field fine-tune 3 of the 3.39 M model (local RTX 3060): a short rebalancing pass from fine-tune 2.
+# Fine-tune 2 gained on the 11 new cameras but lost ~1.7 on the original day cameras and night, because
+# round 5 (new-camera daylight) was 40 % of the set. The mix here (train_bal.json, 16,620 frames):
+# rounds 2–3 (original day cameras) ×1 = 40 %, round 4 (night) ×2 = 40 %, round 5 every 2nd frame = 20 %.
+# 10 epochs, lr halved again, mosaic/mixup only for the first 3 epochs, no augmentation for the last 4.
+__include__: ['field_ft2_local.yml']
+output_dir: /data/dev-cache/train/out/field_ft3_local
+
+epoches: 10
+flat_epoch: 5
+no_aug_epoch: 4
+warmup_iter: 300
+
+optimizer:
+  type: AdamW
+  params:
+    - params: '^(?=.*backbone)(?!.*bn).*$'
+      lr: 0.0000125
+    - params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.000025
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+train_dataloader:
+  dataset:
+    ann_file: /data/dev-cache/field-dataset/field_train/train_bal.json
+    transforms:
+      policy:
+        epoch: [0, 3, 6]
+  collate_fn:
+    mixup_epochs: [0, 3]
+    stop_epoch: 10

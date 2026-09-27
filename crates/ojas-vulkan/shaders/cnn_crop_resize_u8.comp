@@ -1,0 +1,100 @@
+// precisions: f16
+// name: cnn_crop_resize_u8
+// Crops of u8 frames (RGB8 or NV12), cv2-exact bilinear resize, placed into a
+// model's padded-NHWC f16 input (CUDA cnn_crop_resize_u8): 11-bit
+// coefficients, cv2's vertical fixed point, coordinate math without
+// contraction (`precise`), v/div or v*scale+shift. desc[i*14..]: frame
+// address lo, hi, pitch, fmt, uv_off, roi x0, y0, w, h, resized w, h, left,
+// top, 0. grid = (ceil(tw*th/256), items).
+// per-channel normalisation: u/div (div > 0) or u·s + b; the fill is already normalised
+layout(push_constant) uniform P { UBuf desc; Buf y; int tw; int th; int pad; int wp; int img; int cs; float div_; float s0; float s1; float s2; float b0; float b1; float b2; float f0; float f1; float f2; int swap_rb; } p;
+
+void tap_rgb(U8Buf base, int pitch, int fmt, int uv_off, int x, int y, out int rgb[3]) {
+    if (fmt == 0) {
+        int o = y * pitch + x * 3;
+        rgb[0] = int(base.v[o]); rgb[1] = int(base.v[o + 1]); rgb[2] = int(base.v[o + 2]);
+        return;
+    }
+    int yy = int(base.v[y * pitch + x]);
+    int uvo = uv_off + (y >> 1) * pitch + (x & ~1);
+    int u = int(base.v[uvo]) - 128, v = int(base.v[uvo + 1]) - 128;
+    int yv = max(yy - 16, 0) * 1220542;
+    int r = (yv + (1 << 19) + 1673527 * v) >> 20;
+    int g = (yv + (1 << 19) - 852492 * v - 409993 * u) >> 20;
+    int b = (yv + (1 << 19) + 2116026 * u) >> 20;
+    rgb[0] = clamp(r, 0, 255); rgb[1] = clamp(g, 0, 255); rgb[2] = clamp(b, 0, 255);
+}
+
+// roundf: halves away from zero (GLSL round() leaves them to the driver); v >= 0 here
+float round_half_up(precise float v) {
+    precise float f = floor(v);
+    return (v - f >= 0.5) ? f + 1.0 : f;
+}
+
+// correctly rounded a / b (GLSL division is only 2.5 ULP): one Newton-style
+// correction of the quotient with an exact remainder (fma)
+float div_rn(float a, float b) {
+    precise float q = a / b;
+    precise float r = fma(-q, b, a);
+    return fma(r, 1.0 / b, q);
+}
+
+void main() {
+    int item = int(gl_WorkGroupID.y);
+    int px = GID;
+    if (px >= p.tw * p.th) return;
+    int dx = px % p.tw, dy = px / p.tw;
+    int d = item * 14;
+    U8Buf base = U8Buf(uint64_t(p.desc.v[d]) | (uint64_t(p.desc.v[d + 1]) << 32));
+    int pitch = int(p.desc.v[d + 2]), fmt = int(p.desc.v[d + 3]), uv_off = int(p.desc.v[d + 4]);
+    int rx0 = int(p.desc.v[d + 5]), ry0 = int(p.desc.v[d + 6]), rw = int(p.desc.v[d + 7]), rh = int(p.desc.v[d + 8]);
+    int nw = int(p.desc.v[d + 9]), nh = int(p.desc.v[d + 10]), left = int(p.desc.v[d + 11]), top = int(p.desc.v[d + 12]);
+    int out0 = item * p.img + ((dy + p.pad) * p.wp + dx + p.pad) * p.cs;
+    int ox = dx - left, oy = dy - top;
+    if (ox < 0 || ox >= nw || oy < 0 || oy >= nh) {
+        float fill[3] = float[3](p.f0, p.f1, p.f2);
+        for (int c = 0; c < 3; c++) ST(p.y, out0 + (p.swap_rb != 0 ? 2 - c : c), fill[c]);
+        return;
+    }
+    int u[3];
+    if (rw == nw && rh == nh) {
+        tap_rgb(base, pitch, fmt, uv_off, rx0 + ox, ry0 + oy, u);
+    } else {
+        precise float scx = float(rw) / float(nw);
+        precise float fx = (float(ox) + 0.5) * scx - 0.5;
+        int sx = int(floor(fx));
+        fx = fx - float(sx);
+        if (sx < 0) { sx = 0; fx = 0.0; }
+        if (sx >= rw - 1) { sx = rw - 2; fx = 1.0; }
+        if (sx < 0) sx = 0;
+        int a1 = int(round_half_up(fx * 2048.0)), a0 = 2048 - a1;
+        int sx1 = min(sx + 1, rw - 1);
+        precise float scy = float(rh) / float(nh);
+        precise float fy = (float(oy) + 0.5) * scy - 0.5;
+        int sy = int(floor(fy));
+        fy = fy - float(sy);
+        if (sy < 0) { sy = 0; fy = 0.0; }
+        if (sy >= rh - 1) { sy = rh - 2; fy = 1.0; }
+        if (sy < 0) sy = 0;
+        int b1 = int(round_half_up(fy * 2048.0)), b0 = 2048 - b1;
+        int sy1 = min(sy + 1, rh - 1);
+        int t00[3], t01[3], t10[3], t11[3];
+        tap_rgb(base, pitch, fmt, uv_off, rx0 + sx, ry0 + sy, t00);
+        tap_rgb(base, pitch, fmt, uv_off, rx0 + sx1, ry0 + sy, t01);
+        tap_rgb(base, pitch, fmt, uv_off, rx0 + sx, ry0 + sy1, t10);
+        tap_rgb(base, pitch, fmt, uv_off, rx0 + sx1, ry0 + sy1, t11);
+        for (int c = 0; c < 3; c++) {
+            int h0 = a0 * t00[c] + a1 * t01[c];
+            int h1 = a0 * t10[c] + a1 * t11[c];
+            int v = ((b0 * (h0 >> 4)) >> 16) + ((b1 * (h1 >> 4)) >> 16);
+            u[c] = clamp((v + 2) >> 2, 0, 255);
+        }
+    }
+    float scale[3] = float[3](p.s0, p.s1, p.s2), shift[3] = float[3](p.b0, p.b1, p.b2);
+    for (int c = 0; c < 3; c++) {
+        precise float f;
+        if (p.div_ > 0.0) f = div_rn(float(u[c]), p.div_);
+        else { precise float m = float(u[c]) * scale[c]; f = m + shift[c]; }
+        ST(p.y, out0 + (p.swap_rb != 0 ? 2 - c : c), f);
+    }
+}

@@ -1,0 +1,8 @@
+// precisions: f16
+// Test kernel: y[i] = x[i], no index math (bandwidth ceiling of 2-byte elements).
+layout(push_constant) uniform P { Buf x; Buf y; int n; } p;
+void main() {
+    int i = GID;
+    if (i >= p.n) return;
+    p.y.v[i] = p.x.v[i];
+}

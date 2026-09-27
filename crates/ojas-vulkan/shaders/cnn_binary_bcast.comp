@@ -1,0 +1,16 @@
+// precisions: f16
+// Rank-4 broadcast binary op on contiguous tensors (CUDA cnn_binary_bcast):
+// per-operand strides (0 on broadcast axes); op 0 add 1 sub 2 mul 3 div; float, round once.
+layout(push_constant) uniform P { Buf a; Buf b; Buf y; int n; int d1; int d2; int d3; int a0; int a1; int a2; int a3;
+                                  int b0; int b1; int b2; int b3; int op; } p;
+void main() {
+    int i = GID;
+    if (i >= p.n) return;
+    int i3 = i % p.d3, t = i / p.d3, i2 = t % p.d2;
+    t /= p.d2;
+    int i1 = t % p.d1, i0 = t / p.d1;
+    float va = LD(p.a, i0 * p.a0 + i1 * p.a1 + i2 * p.a2 + i3 * p.a3);
+    float vb = LD(p.b, i0 * p.b0 + i1 * p.b1 + i2 * p.b2 + i3 * p.b3);
+    float r = p.op == 0 ? va + vb : p.op == 1 ? va - vb : p.op == 2 ? va * vb : va / vb;
+    ST(p.y, i, r);
+}

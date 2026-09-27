@@ -1,0 +1,80 @@
+[package]
+name = "ojas-vision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ONNX CNN runtime for detection and plate OCR. CPU first; device backends follow."
+repository.workspace = true
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+ojas-core = { path = "../ojas-core" }
+ojas-formats = { path = "../ojas-formats" }
+# CPU operators + preprocessing live in ojas-cpu (the oracle crate). This
+# dependency is one-way: ojas-cpu must never depend back on ojas-vision.
+ojas-cpu = { path = "../ojas-cpu" }
+# CUDA executor (fp16 tensor-core convs); builds everywhere, runs where a driver is.
+ojas-cuda = { path = "../ojas-cuda", optional = true }
+ojas-vulkan = { path = "../ojas-vulkan", optional = true }
+half = { version = "2", optional = true }
+
+[dev-dependencies]
+half = "2"
+# contact sheets in the survey / probe examples
+image = { workspace = true }
+
+[features]
+cuda = ["dep:ojas-cuda", "dep:half"]
+# vendor-neutral GPU backend (any Vulkan 1.3 driver: NVIDIA, AMD RADV, Intel ANV, NVK, llvmpipe)
+vulkan = ["dep:ojas-vulkan", "dep:half"]
+
+[[example]]
+name = "gpu_gate"
+required-features = ["cuda"]
+
+[[example]]
+name = "gpu_latency"
+required-features = ["cuda"]
+
+[[example]]
+name = "gpu_pre_gate"
+required-features = ["cuda"]
+
+[[example]]
+name = "pipeline_gate"
+required-features = ["cuda"]
+
+[[example]]
+name = "pipeline_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "device_parity"
+
+[[example]]
+name = "frame_rgb_gate"
+required-features = ["cuda"]
+
+[[example]]
+name = "plan_mem"
+required-features = ["cuda"]
+
+[[example]]
+name = "camera_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "graph_bisect"
+required-features = ["cuda"]
+
+[[example]]
+name = "exec_profile"
+required-features = ["cuda"]
+
+[[example]]
+name = "person_pipeline_gate"
+required-features = ["cuda"]

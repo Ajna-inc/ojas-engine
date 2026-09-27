@@ -1,0 +1,14 @@
+// precisions: f32 f16
+// Strided copy along one axis — Concat and Split (CUDA cnn_axis_copy). Raw
+// storage copy, no conversion: bit-exact.
+//   dst[((o*dst_axis) + dst_off + a)*inner + k] = src[((o*src_axis) + src_off + a)*inner + k]
+layout(push_constant) uniform P { Buf src; Buf dst; int n; int len; int inner; int src_axis; int src_off; int dst_axis; int dst_off; } p;
+void main() {
+    int i = GID;
+    if (i >= p.n) return;
+    int k = i % p.inner;
+    int t = i / p.inner;
+    int a = t % p.len;
+    int o = t / p.len;
+    p.dst.v[(o * p.dst_axis + p.dst_off + a) * p.inner + k] = p.src.v[(o * p.src_axis + p.src_off + a) * p.inner + k];
+}

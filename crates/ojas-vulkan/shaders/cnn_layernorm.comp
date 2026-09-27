@@ -1,0 +1,21 @@
+// precisions: f16
+// Last-axis LayerNorm (CUDA cnn_layernorm): mean, population variance, eps
+// inside the sqrt; float accumulation; one invocation per row.
+layout(push_constant) uniform P { Buf x; Buf w; Buf b; Buf y; int rows; int d; float eps; int has_bias; } p;
+void main() {
+    int r = GID;
+    if (r >= p.rows) return;
+    int o = r * p.d;
+    float mean = 0.0;
+    for (int i = 0; i < p.d; i++) mean += LD(p.x, o + i);
+    mean /= float(p.d);
+    float var = 0.0;
+    for (int i = 0; i < p.d; i++) { float t = LD(p.x, o + i) - mean; var += t * t; }
+    var /= float(p.d);
+    float inv = 1.0 / sqrt(var + p.eps);
+    for (int i = 0; i < p.d; i++) {
+        float v = (LD(p.x, o + i) - mean) * inv * LD(p.w, i);
+        if (p.has_bias != 0) v += LD(p.b, i);
+        ST(p.y, o + i, v);
+    }
+}

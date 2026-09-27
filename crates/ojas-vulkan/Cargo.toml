@@ -1,0 +1,19 @@
+[package]
+name = "ojas-vulkan"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Vulkan compute backend (vendor-neutral: NVIDIA, AMD, Intel, Mesa llvmpipe)"
+
+[dependencies]
+anyhow = "1"
+half = "2"
+ash = "0.38"
+ojas-core = { path = "../ojas-core" }
+
+[build-dependencies]
+glslang = "0.8"
+
+[dev-dependencies]
+serde_json = { workspace = true }

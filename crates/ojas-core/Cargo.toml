@@ -1,0 +1,16 @@
+[package]
+name = "ojas-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[features]
+default = ["subscriber"]
+# Pulls in tracing-subscriber and enables `logging::init()` (the default stderr
+# sink). A host that installs its own tracing subscriber can disable this.
+subscriber = ["dep:tracing-subscriber"]

@@ -1,0 +1,35 @@
+// precisions: f32 f16
+// NCHW depthwise conv (CUDA cnn_dwconv / ATen conv_depthwise2d_forward_kernel):
+// float accumulator seeded with the bias, kH-then-kW order, out-of-bounds
+// taps skipped. n = N*outC*oh*ow; has_bias == 0 ignores `bias`.
+layout(push_constant) uniform P { Buf input_; Buf weight; Buf bias; Buf output_; int n; int out_ch; int mult; int in_w; int in_h;
+                                  int out_w; int out_h; int kw; int kh; int stride_w; int stride_h; int pad_w; int pad_h;
+                                  int dil_w; int dil_h; int has_bias; } p;
+void main() {
+    int li = GID;
+    if (li >= p.n) return;
+    int t1 = li / p.out_w;
+    int w = li - t1 * p.out_w;
+    int t2 = t1 / p.out_h;
+    int h = t1 - t2 * p.out_h;
+    t1 = t2;
+    t2 = t1 / p.out_ch;
+    int c = t1 - t2 * p.out_ch;
+    int nn = t2;
+    int in_c = c, in_chs = p.out_ch;
+    if (p.mult != 1) { in_c /= p.mult; in_chs /= p.mult; }
+    int woff = c * p.kh * p.kw;
+    float value = p.has_bias != 0 ? LD(p.bias, c) : 0.0;
+    int off0 = (nn * in_chs + in_c) * p.in_h * p.in_w;
+    for (int y = 0; y < p.kh; ++y) {
+        for (int z = 0; z < p.kw; ++z) {
+            int hi = -p.pad_h + h * p.stride_h + y * p.dil_h;
+            int wi = -p.pad_w + w * p.stride_w + z * p.dil_w;
+            if ((hi >= 0) && (hi < p.in_h) && (wi >= 0) && (wi < p.in_w)) {
+                // fused like nvcc's default contraction of value += w * x (the torch reference)
+                value = fma(LD(p.weight, woff + y * p.kw + z), LD(p.input_, off0 + hi * p.in_w + wi), value);
+            }
+        }
+    }
+    ST(p.output_, li, value);
+}

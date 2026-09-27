@@ -1,0 +1,89 @@
+diff --git a/engine/data/dataloader.py b/engine/data/dataloader.py
+index 20b6a0a..7f0f165 100644
+--- a/engine/data/dataloader.py
++++ b/engine/data/dataloader.py
+@@ -154,6 +154,9 @@ class BatchImageCollateFunction(BaseCollateFunction):
+                 updated_targets[i]['boxes'] = torch.cat([targets[i]['boxes'], shifted_targets[i]['boxes']], dim=0)
+                 updated_targets[i]['labels'] = torch.cat([targets[i]['labels'], shifted_targets[i]['labels']], dim=0)
+                 updated_targets[i]['area'] = torch.cat([targets[i]['area'], shifted_targets[i]['area']], dim=0)
++                # ojas: a class unlabelled in either blended frame is unlabelled in the blend
++                if 'unlabelled' in targets[i]:
++                    updated_targets[i]['unlabelled'] = torch.cat([targets[i]['unlabelled'], shifted_targets[i]['unlabelled']]).unique()
+ 
+                 # Add mixup ratio to targets
+                 updated_targets[i]['mixup'] = torch.tensor(
+diff --git a/engine/data/dataset/coco_dataset.py b/engine/data/dataset/coco_dataset.py
+index 83202e7..61d36b6 100644
+--- a/engine/data/dataset/coco_dataset.py
++++ b/engine/data/dataset/coco_dataset.py
+@@ -55,6 +55,9 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
+             image, target = self.prepare(image, target)
+ 
+         target['idx'] = torch.tensor([idx])
++        # ojas: class ids this frame does not label (image field `unlabelled_cats`, written by
++        # coco_person_mix); the criterion drops those classes' classification terms for it
++        target['unlabelled'] = torch.tensor(self.coco.imgs[image_id].get('unlabelled_cats', []), dtype=torch.int64)
+ 
+         if 'boxes' in target:
+             target['boxes'] = convert_to_tv_tensor(target['boxes'], key='boxes', spatial_size=image.size[::-1])
+diff --git a/engine/deim/deim_criterion.py b/engine/deim/deim_criterion.py
+index 814364f..9ded04c 100644
+--- a/engine/deim/deim_criterion.py
++++ b/engine/deim/deim_criterion.py
+@@ -65,6 +65,26 @@ class DEIMCriterion(nn.Module):
+         self.mal_alpha = mal_alpha
+         self.use_uni_set = use_uni_set
+ 
++    @staticmethod
++    def _labelled_mask(targets, logits):
++        """ojas: [B, 1, C] with 0 on the classes a frame does not label (target['unlabelled'], from the
++        image field `unlabelled_cats`), else None. A person in a frame that never labels people is
++        then neither a positive nor a negative for the person class; every other class learns from
++        the frame as usual. Skipped for class-agnostic heads (C == 1)."""
++        C = logits.shape[-1]
++        if C <= 1:
++            return None
++        m = None
++        for b, t in enumerate(targets):
++            u = t.get('unlabelled')
++            if u is None or u.numel() == 0:
++                continue
++            u = u[(u >= 0) & (u < C)]
++            if m is None:
++                m = torch.ones(logits.shape[0], 1, C, device=logits.device, dtype=logits.dtype)
++            m[b, 0, u] = 0
++        return m
++
+     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
+         assert 'pred_logits' in outputs
+         src_logits = outputs['pred_logits']
+@@ -75,6 +95,9 @@ class DEIMCriterion(nn.Module):
+         target_classes[idx] = target_classes_o
+         target = F.one_hot(target_classes, num_classes=self.num_classes+1)[..., :-1]
+         loss = torchvision.ops.sigmoid_focal_loss(src_logits, target, self.alpha, self.gamma, reduction='none')
++        m = self._labelled_mask(targets, src_logits)
++        if m is not None:
++            loss = loss * m
+         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
+ 
+         return {'loss_focal': loss}
+@@ -104,6 +127,9 @@ class DEIMCriterion(nn.Module):
+         pred_score = F.sigmoid(src_logits).detach()
+         weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
+ 
++        m = self._labelled_mask(targets, src_logits)
++        if m is not None:
++            weight = weight * m
+         loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction='none')
+         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
+         return {'loss_vfl': loss}
+@@ -138,6 +164,9 @@ class DEIMCriterion(nn.Module):
+             weight = pred_score.pow(self.gamma) * (1 - target) + target
+ 
+         # print(" ### DEIM-gamma{}-alpha{} ### ".format(self.gamma, self.mal_alpha))
++        m = self._labelled_mask(targets, src_logits)
++        if m is not None:
++            weight = weight * m
+         loss = F.binary_cross_entropy_with_logits(src_logits, target_score, weight=weight, reduction='none')
+         loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
+         return {'loss_mal': loss}

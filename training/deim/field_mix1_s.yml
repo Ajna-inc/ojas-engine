@@ -1,0 +1,69 @@
+# Vehicle + person mix 1 of the 10 M model (DEIM-D-FINE-S), a rented RTX PRO 4500. One model, 16 classes
+# (UVH ids 1..14, person = 15), from Field fine-tune 3 with the person row taken from COCO D-FINE-S
+# (add_person_class.py → out/field_person1_s/init/ft3_s_plus_person.pth).
+# Data (person_mix1/train_pod.json, coco_person_mix): every Field training frame in fine-tune 3's
+# balance (train_bal) with its reviewed vehicles AND reviewed people (person rounds R1 + R2 cover all
+# 16,546 frames), plus every 2nd UVH-26 train image (replay, so Bengaluru is not forgotten). UVH never
+# labels people: its frames carry unlabelled_cats [15] and the patched criterion
+# (patches/unlabelled_cats.patch) drops the person terms there instead of teaching people as background.
+# 800 px multi-scale (small people), 10 epochs, mosaic/mixup for 4, none for the last 3.
+# Validation: the 852 gold frames with vehicle and person gold (val_with_persons.json).
+__include__: ['field_ft_s.yml']
+output_dir: /workspace/out/field_mix1_s
+
+num_classes: 16
+
+epoches: 10
+flat_epoch: 5
+no_aug_epoch: 3
+warmup_iter: 500
+
+optimizer:
+  type: AdamW
+  params:
+    - params: '^(?=.*backbone)(?!.*bn).*$'
+      lr: 0.000025
+    - params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.0001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+ema:
+  type: ModelEMA
+  decay: 0.9998
+  warmups: 500
+  start: 0
+
+train_dataloader:
+  dataset:
+    img_folder: /
+    ann_file: /root/field/person_mix1/train_pod.json
+    transforms:
+      ops:
+        - {type: Mosaic, output_size: 400, rotation_range: 10, translation_range: [0.1, 0.1], scaling_range: [0.5, 1.5],
+           probability: 1.0, fill_value: 0, use_cache: False, max_cached_images: 50, random_pop: True}
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 0}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [800, 800], }
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        epoch: [0, 4, 7]
+  collate_fn:
+    base_size: 800
+    base_size_repeat: 3
+    mixup_epochs: [0, 4]
+    stop_epoch: 10
+  total_batch_size: 12
+  num_workers: 16
+val_dataloader:
+  dataset:
+    img_folder: /root/field/
+    ann_file: /root/field/person_mix1/val_with_persons.json
+  total_batch_size: 12
+  num_workers: 8

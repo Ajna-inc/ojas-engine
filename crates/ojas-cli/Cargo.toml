@@ -1,0 +1,42 @@
+[package]
+name = "ojas-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ojas"
+path = "src/main.rs"
+
+# Portable core. These four crates are the ones CI builds on Linux, and they are
+# enough to load a GGUF, tokenize it and decode on the CPU — so `ojas run`,
+# `chat`, `serve` and `bench` all exist on every platform.
+[dependencies]
+ojas-core = { path = "../ojas-core" }
+ojas-formats = { path = "../ojas-formats" }
+ojas-tokenize = { path = "../ojas-tokenize" }
+ojas-infer = { path = "../ojas-infer" }
+ojas-cpu = { path = "../ojas-cpu" }
+ojas-vision = { path = "../ojas-vision" }
+tracing = { workspace = true }
+anyhow = "1"
+serde_json = { workspace = true }
+# The CUDA decoders (`--device cuda`, and `auto` on an NVIDIA box): built with `--features cuda`.
+ojas-cuda = { path = "../ojas-cuda", optional = true }
+
+# Metal-only. `ojas-models` (the Flash/qwen4exp decoder) and `ojas-swarm` both
+# depend unconditionally on `ojas-metal`, which needs the macOS-only `metal` and
+# `objc` crates. Gating them here is what keeps the `ojas` binary buildable on
+# Linux and Windows at all; before this, the whole binary was macOS-only because
+# of the swarm dependency alone.
+[target.'cfg(target_os = "macos")'.dependencies]
+ojas-models = { path = "../ojas-models" }
+ojas-metal = { path = "../ojas-metal" }
+ojas-swarm = { path = "../ojas-swarm" }
+
+[features]
+# `vision-serve` on an NVIDIA GPU, and the CUDA text/vision decoders (qwen35 / surya-2)
+cuda = ["ojas-vision/cuda", "dep:ojas-cuda"]

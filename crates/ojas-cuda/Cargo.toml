@@ -1,0 +1,36 @@
+[package]
+name = "ojas-cuda"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+half = "2"
+libloading = "0.8"
+ojas-core = { path = "../ojas-core" }
+# The qwen35 (surya-2) model runner: GGUF loading, and the CPU ViT's pure index helpers
+# (patch fold, 2x2 merge permutation, position-embedding resize, vision M-RoPE positions),
+# shared so the two towers cannot disagree about layout.
+ojas-formats = { path = "../ojas-formats" }
+ojas-cpu = { path = "../ojas-cpu" }
+tracing = { workspace = true }
+cudarc = { version = "0.16", default-features = false, features = [
+    "std", "driver", "nvrtc", "dynamic-loading", "cuda-12040",
+] }
+
+[dev-dependencies]
+ojas-core = { path = "../ojas-core" }
+ojas-formats = { path = "../ojas-formats" }
+# The one backend-neutral description of a model; see its crate docs for why it is not in
+# ojas-models.
+ojas-arch = { path = "../ojas-arch" }
+serde_json = { workspace = true }
+ojas-cpu = { path = "../ojas-cpu" }
+# surya_runner / surya_page_gate: prompt ids for the surya-2 parity runs
+ojas-tokenize = { path = "../ojas-tokenize" }
+
+# The cross-backend parity audit. ojas-metal's `kernels` module builds on every platform (its
+# device half is macOS-gated), so this is no longer target-scoped and the audit runs anywhere.
+ojas-metal = { path = "../ojas-metal" }

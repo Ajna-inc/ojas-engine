@@ -1,0 +1,28 @@
+name: Rust checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  portable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.98.0 --profile minimal --no-self-update
+      - run: cargo test --locked -p ojas-core -p ojas-formats -p ojas-tokenize -p ojas-cpu -p ojas-vision
+      # The `ojas` binary must build and pass its tests without a Metal backend,
+      # or the CLI silently becomes macOS-only again — which is exactly what the
+      # ojas-swarm dependency did before it was gated.
+      - run: cargo test --locked -p ojas-cli
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.98.0 --profile minimal --no-self-update
+      # Hosted runners are not a GPU correctness gate. Compile GPU tests, but
+      # execute numerical dispatch tests separately on a Metal-capable host.
+      - run: cargo test --locked --workspace --no-run
+      - run: cargo test --locked --workspace --lib --bins
+      - run: cargo test --locked --workspace --doc
+      - run: cargo check --locked -p ojas-models --example run

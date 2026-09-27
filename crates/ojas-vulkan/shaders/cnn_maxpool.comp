@@ -1,0 +1,28 @@
+// precisions: f32 f16
+// NCHW max pool (CUDA cnn_maxpool / ATen max_pool_forward_nchw): first
+// strictly-greater element wins; NaN always wins.
+layout(push_constant) uniform P { Buf x; Buf y; int n; int channels; int height; int width; int pooled_h; int pooled_w;
+                                  int kernel_h; int kernel_w; int stride_h; int stride_w; int pad_h; int pad_w; int dilation_h; int dilation_w; } p;
+void main() {
+    int index = GID;
+    if (index >= p.n) return;
+    int pw = index % p.pooled_w;
+    int ph = (index / p.pooled_w) % p.pooled_h;
+    int c = (index / p.pooled_w / p.pooled_h) % p.channels;
+    int nn = index / p.pooled_w / p.pooled_h / p.channels;
+    int hstart = ph * p.stride_h - p.pad_h;
+    int wstart = pw * p.stride_w - p.pad_w;
+    int hend = min(hstart + (p.kernel_h - 1) * p.dilation_h + 1, p.height);
+    int wend = min(wstart + (p.kernel_w - 1) * p.dilation_w + 1, p.width);
+    while (hstart < 0) hstart += p.dilation_h;
+    while (wstart < 0) wstart += p.dilation_w;
+    float maxval = -CNN_INF;
+    int base = (nn * p.channels + c) * p.height * p.width;
+    for (int h = hstart; h < hend; h += p.dilation_h) {
+        for (int w = wstart; w < wend; w += p.dilation_w) {
+            float val = LD(p.x, base + h * p.width + w);
+            if ((val > maxval) || isnan(val)) maxval = val;
+        }
+    }
+    ST(p.y, index, maxval);
+}

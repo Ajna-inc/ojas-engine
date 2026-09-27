@@ -1,0 +1,12 @@
+[package]
+name = "ojas-arch"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Backend-neutral model architecture description, read from GGUF metadata."
+
+[dependencies]
+anyhow = "1"
+tracing = { workspace = true }
+ojas-formats = { path = "../ojas-formats" }

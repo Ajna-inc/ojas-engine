@@ -1,0 +1,88 @@
+[package]
+name = "ojas-learn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Training for ojas models: a define-by-run tape over backend primitives (CPU reference, CUDA, Metal)."
+repository.workspace = true
+
+[dependencies]
+anyhow = "1"
+ojas-core = { path = "../ojas-core" }
+ojas-formats = { path = "../ojas-formats" }
+image = { workspace = true }
+serde_json = "1"
+sha2 = "0.10"
+# CUDA backend (f32 `learn` kernel family); builds everywhere, runs where a driver is.
+ojas-cuda = { path = "../ojas-cuda", optional = true }
+
+# Metal backend (`cnn_train` kernel family). `ojas-metal` needs the macOS-only
+# `metal`/`objc` crates (same reason ojas-cli gates it), so it is both an
+# optional dep AND target-scoped -- `cargo build --features metal` off macOS
+# fails to resolve rather than pulling in a crate that cannot compile there.
+[target.'cfg(target_os = "macos")'.dependencies]
+ojas-metal = { path = "../ojas-metal", optional = true }
+
+[features]
+cuda = ["dep:ojas-cuda"]
+metal = ["dep:ojas-metal"]
+
+[[example]]
+name = "backbone_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "gemm_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "rtdetr_parity"
+required-features = ["cuda"]
+
+[[example]]
+name = "rtdetr_train_parity"
+required-features = ["cuda"]
+
+[[example]]
+name = "rtdetr_eval"
+required-features = ["cuda"]
+
+[[example]]
+name = "rtdetr_determinism"
+required-features = ["cuda"]
+
+[[example]]
+name = "rtdetr_train"
+required-features = ["cuda"]
+
+[[example]]
+name = "loader_bench"
+
+[[example]]
+name = "brain_ablate"
+required-features = ["cuda"]
+
+[[example]]
+name = "passenger_train"
+required-features = ["cuda"]
+
+[[example]]
+name = "passenger_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "passenger_eval"
+required-features = ["cuda"]
+
+[[example]]
+name = "passenger_crop_bench"
+required-features = ["cuda"]
+
+[[example]]
+name = "passenger_residual_train"
+required-features = ["cuda"]
+
+[[example]]
+name = "passenger_residual_eval"
+required-features = ["cuda"]

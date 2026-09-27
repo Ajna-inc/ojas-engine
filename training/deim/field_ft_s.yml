@@ -1,0 +1,54 @@
+# Field fine-tune of the 10 M model (Step 2, DEIM-D-FINE-S, 10.19 M): the same data and recipe as
+# field_ft.yml (the 3.39 M production model), at this model's native 640 px — it was trained
+# single-size and is the review rounds' labeller (model A), so a better Field 10 M means better
+# pre-labels for the next round.
+#
+# Caveat for its scores: the Field test labels were built from this model's own detections (plus
+# IISc-X's, plus the review), so its test mAP is favoured.
+#
+# Data on the pod's container disk (/root/field), as in field_ft.yml. 24 epochs, mosaic/mixup
+# to 12, full augmentation to 19, none for the last 5; lr halved from Step 2 and scaled to batch 16.
+__include__: ['step2_deim_dfine_s.yml']
+output_dir: /workspace/out/field_ft_s
+
+epoches: 24
+flat_epoch: 12
+no_aug_epoch: 5
+lr_gamma: 0.5
+warmup_iter: 300
+
+optimizer:
+  type: AdamW
+  params:
+    - params: '^(?=.*backbone)(?!.*bn).*$'
+      lr: 0.00005
+    - params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+  lr: 0.0001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+ema:
+  type: ModelEMA
+  decay: 0.9998
+  warmups: 300
+  start: 0
+
+train_dataloader:
+  dataset:
+    img_folder: /root/field/
+    ann_file: /root/field/field_train/train.json
+    transforms:
+      policy:
+        epoch: [0, 12, 19]
+  collate_fn:
+    mixup_epochs: [0, 12]
+    stop_epoch: 24
+  total_batch_size: 16
+  num_workers: 12             # the RTX PRO 4000 pod caps the container at 31 GB RAM
+val_dataloader:
+  dataset:
+    img_folder: /root/field/
+    ann_file: /root/field/field_train/val.json
+  total_batch_size: 16
+  num_workers: 8

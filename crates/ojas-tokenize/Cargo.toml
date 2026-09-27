@@ -1,0 +1,13 @@
+[package]
+name = "ojas-tokenize"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+ojas-core = { path = "../ojas-core" }
+ojas-formats = { path = "../ojas-formats" }
+
+[dev-dependencies]

@@ -1,0 +1,15 @@
+[package]
+name = "ojas-formats"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# For `iq_tables`, which lives in core so both GPU backends can render the same codebooks.
+ojas-core = { path = "../ojas-core" }
+tracing = { workspace = true }
+anyhow = "1"
+half = "2"
+serde_json = "1"
+
+[dev-dependencies]

@@ -1,0 +1,38 @@
+[package]
+name = "ojas-metal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ojas-core = { path = "../ojas-core" }
+anyhow = "1"
+half = "2"
+
+# `metal`'s default features enable `link`, which asks rustc to link Apple frameworks and is
+# a hard error on any other target. Off macOS the crate is taken without that feature: every
+# type and signature is still there, so `device` type-checks and `ojas-models` can be checked
+# on a Linux box, while nothing tries to link a framework that does not exist.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.32"
+objc = "0.2"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+metal = { version = "0.32", default-features = false }
+objc = "0.2"
+
+[features]
+default = []
+# Compile the device half off macOS, for type-checking only. `ojas-models` turns it on so
+# `cargo check -p ojas-models` works on a Linux box; linking a binary with it on fails on
+# undefined Apple framework symbols, which is correct — there is no Metal there. Consumers
+# that only need the kernel source table (the parity audit, the CUDA tests) leave it off and
+# link cleanly.
+device = []
+
+# Tests only. `tests/vision_kernels.rs` gates the ViT kernels against the CPU oracle
+# (`cpu_math::layernorm`/`gelu`, `cpu_vit::patchify`) rather than a hand-written
+# expectation, the convention `examples/moe_iq_gate.rs:58` established. ojas-cpu does not
+# depend on ojas-metal, so this is not a cycle.
+[dev-dependencies]
+ojas-cpu = { path = "../ojas-cpu" }

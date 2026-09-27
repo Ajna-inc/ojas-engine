@@ -1,0 +1,6 @@
+# from	to	any-of (note contains)	none-of — UVH-26 conventions checked with class_sheet on uvh_train_st, 2026-09-25
+Three-wheeler	LCV	cargo|loader|chhakda|garbage|municipal|on duty|goods|crate|tipper|amc|atul|loaded	passenger
+SUV	unsure_car	thar|tuv	
+SUV	MUV	bolero|scorpio|sumo	pickup
+not_vehicle	unsure	handcart|hand cart|pushcart|push cart|food cart|fruit cart|vendor|cart with|wire-cage|cage cart|tricycle|rickshaw| cart	cargo auto
+Bus	Mini-bus	school|minibus|mini-bus|mini bus	
