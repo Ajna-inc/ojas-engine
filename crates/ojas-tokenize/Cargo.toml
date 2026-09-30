@@ -9,5 +9,7 @@ license.workspace = true
 anyhow = "1"
 ojas-core = { path = "../ojas-core" }
 ojas-formats = { path = "../ojas-formats" }
+# `\p{L}`/`\p{N}`/`\p{M}` for the pre-tokenizer patterns (`PreSplit`).
+unicode-general-category = "1.1"
 
 [dev-dependencies]
