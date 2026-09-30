@@ -1,6 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 use super::*;
-use ojas_formats::gguf::Gguf;
+use ojas_formats::gguf::{Gguf, Meta};
 use ojas_metal::MetalGpu;
 use anyhow::Result;
 use metal::MTLResourceOptions;
@@ -207,6 +207,93 @@ impl VisionConfig {
             d, layers, n_head, hd, ffn, patch, channels, pos_side, merge, proj_dim, mm_hidden,
             eps, rope_base: 10000.0, max_patches,
         })
+    }
+}
+
+impl TextEncoderConfig {
+    /// The `modern-bert.*` keys (llama.cpp's names for the architecture) and the
+    /// `laya.head.*` keys, both as `scripts/laya_convert.py` writes them. Shapes are checked against the tensors
+    /// here, so a truncated or foreign file fails with a key name rather than inside
+    /// graph construction.
+    fn from_gguf(g: &Gguf) -> Result<TextEncoderConfig> {
+        let arch = g.arch();
+        let mu = |k: &str| g.meta_u32(&format!("{arch}.{k}"));
+        let (d, layers, n_head, ffn) = (mu("embedding_length").unwrap_or(0), mu("block_count").unwrap_or(0),
+            mu("attention.head_count").unwrap_or(0), mu("feed_forward_length").unwrap_or(0));
+        anyhow::ensure!(d > 0 && layers > 0 && n_head > 0 && ffn > 0 && d % n_head == 0,
+            "{arch}: incomplete encoder metadata (embd={d} blocks={layers} heads={n_head} ffn={ffn})");
+        let hd = d / n_head;
+        // The bidirectional attention kernels keep a head in 16 accumulators per lane
+        // across a 32-lane simdgroup: hd % 32 == 0 and hd <= 512.
+        anyhow::ensure!(hd % 32 == 0 && hd <= 512,
+            "{arch}: head_dim {hd} is not supported by the bidirectional attention kernels");
+        let act = match g.meta.get(&format!("{arch}.hidden_activation")) {
+            Some(Meta::Str(s)) => s.clone(),
+            _ => "gelu".to_string(),
+        };
+        anyhow::ensure!(act == "gelu", "{arch}: hidden_activation {act:?} is not implemented (only \"gelu\", the erf form)");
+        let eps = g.meta_f32(&format!("{arch}.attention.layer_norm_epsilon")).unwrap_or(1e-5);
+        let rope_base = g.meta_f32(&format!("{arch}.rope.freq_base")).unwrap_or(160000.0);
+        let rope_base_local = g.meta_f32(&format!("{arch}.rope.freq_base_swa")).unwrap_or(rope_base);
+        let sliding = mu("attention.sliding_window").unwrap_or(0);
+        let swa_pattern = if sliding > 0 { mu("attention.sliding_window_pattern").unwrap_or(3) } else { 0 };
+        let max_positions = mu("context_length").unwrap_or(8192);
+        for (name, want) in [("blk.0.attn_qkv.weight", [d as u64, 3 * d as u64]),
+                             ("blk.0.ffn_up.weight", [d as u64, 2 * ffn as u64]),
+                             ("blk.0.ffn_down.weight", [ffn as u64, d as u64])] {
+            let t = g.tensors.get(name).ok_or_else(|| anyhow::anyhow!("{arch}: missing {name}"))?;
+            anyhow::ensure!(t.dims == want, "{arch}: {name} is {:?}, expected {want:?}", t.dims);
+        }
+        let laya = match g.meta_u32("laya.head.block_count") {
+            None => None,
+            Some(blocks) => {
+                anyhow::ensure!(blocks >= 1, "laya head: laya.head.block_count is 0");
+                let head = LayaHeadConfig {
+                    blocks,
+                    n_head: g.meta_u32("laya.head.head_count").unwrap_or(n_head),
+                    ffn: g.meta_u32("laya.head.feed_forward_length").unwrap_or(4 * d),
+                    eps: g.meta_f32("laya.head.layer_norm_epsilon").unwrap_or(1e-5),
+                };
+                anyhow::ensure!(head.n_head > 0 && d % head.n_head == 0 && d / head.n_head == hd,
+                    "laya head: {} heads over d={d} gives a head_dim other than the encoder's {hd}", head.n_head);
+                for i in 0..blocks {
+                    let name = format!("laya.blk.{i}.ffn_up.weight");
+                    let t = g.tensors.get(&name).ok_or_else(|| anyhow::anyhow!("laya head: missing {name}"))?;
+                    anyhow::ensure!(t.dims == [d as u64, head.ffn as u64], "laya head: {name} is {:?}", t.dims);
+                }
+                Some(head)
+            }
+        };
+        Ok(TextEncoderConfig {
+            d, layers, n_head, hd, ffn, eps, rope_base, rope_base_local,
+            window: sliding / 2, swa_pattern, max_positions, laya,
+        })
+    }
+
+    /// Every tensor the GPU reads, in upload order.
+    fn gpu_tensors(&self, g: &Gguf) -> Vec<String> {
+        let mut names: Vec<String> = vec!["token_embd.weight".into(), "token_embd_norm.weight".into(),
+                                          "output_norm.weight".into()];
+        for i in 0..self.layers {
+            if g.tensors.contains_key(&format!("blk.{i}.attn_norm.weight")) {
+                names.push(format!("blk.{i}.attn_norm.weight"));
+            }
+            for s in ["attn_qkv.weight", "attn_output.weight", "ffn_norm.weight", "ffn_up.weight", "ffn_down.weight"] {
+                names.push(format!("blk.{i}.{s}"));
+            }
+        }
+        if let Some(h) = &self.laya {
+            for i in 0..h.blocks {
+                for s in ["attn_norm", "attn_qkv", "attn_output", "ffn_norm", "ffn_up", "ffn_down"] {
+                    for kind in ["weight", "bias"] { names.push(format!("laya.blk.{i}.{s}.{kind}")); }
+                }
+            }
+            for s in ["laya.type_emb.weight", "laya.scorer_norm.weight", "laya.scorer_norm.bias",
+                      "laya.scorer_fc.weight", "laya.scorer_fc.bias"] {
+                names.push(s.into());
+            }
+        }
+        names
     }
 }
 
@@ -458,7 +545,9 @@ impl<'a> DecoderGpu<'a> {
         let embed_scale = spec.embed_scale;
         tracing::info!(target: "arch", "{arch}: d={d} L={n_layers} heads={n_head}/{n_kv} hd={hd} ffn={ffn} \
                    | qkv_bias={qkv_bias} qk_norm={qk_norm} tied_lm_head={tied_embed} sandwich={sandwich} gelu={is_gemma}");
-        if !matches!(arch.as_str(), "qwen2" | "qwen3" | "llama" | "gemma3") {
+        // The note is about decoders. `modern-bert` is an encoder, gated by
+        // `examples/laya_gate.rs`.
+        if !matches!(arch.as_str(), "qwen2" | "qwen3" | "llama" | "gemma3" | "modern-bert") {
             tracing::warn!(target: "arch", "NOTE: arch '{arch}' partially supported; validation is model-, quantization-, and execution-path-specific");
         }
 
@@ -485,6 +574,11 @@ impl<'a> DecoderGpu<'a> {
         // Geometry first, allocation later: a malformed mmproj must fail with a key
         // name here, not with an unwrap inside graph construction.
         let vision: Option<VisionConfig> = if has_vision { Some(VisionConfig::from_gguf(g)?) } else { None };
+        // Text encoder: LayerNorm and the QKV preparation (split, rotation, half K/V)
+        // come from the same encoder family as the ViT tower.
+        let text_encoder: Option<TextEncoderConfig> =
+            if arch == "modern-bert" { Some(TextEncoderConfig::from_gguf(g)?) } else { None };
+        if text_encoder.is_some() && !has_vision { fams.push("vision"); }
         if let Some(v) = &vision {
             tracing::info!(target: "vision", "vit d={} L={} heads={} hd={} ffn={} patch={} c={} \
                 pos_grid={}x{} merge={} proj={} mm_hidden={} eps={:e} | arena {} patches",
@@ -544,6 +638,16 @@ impl<'a> DecoderGpu<'a> {
                 p.insert(name.clone(), gpu.pipeline(&ojas_metal::kernels::attn::attn_mma_bidir_src(hdv), &name)?);
                 let dqn = format!("attention_m_mma_dq_bidir_{hdv}");
                 p.insert(dqn.clone(), gpu.pipeline(&ojas_metal::kernels::attn::attn_mma_dq_bidir_src(hdv), &dqn)?);
+            }
+        }
+        if let Some(te) = &text_encoder {
+            let name = ojas_metal::kernels::attn::ATTN_BIDIR_SPAN;
+            p.insert(name.to_string(), gpu.pipeline(&ojas_metal::kernels::attn::attn_bidir_span_src(), name)?);
+            // The tiled twin needs simdgroup matrices; without them the text encoder
+            // runs the per-query kernel above.
+            if gpu.native_reduce {
+                let name = ojas_metal::kernels::attn::attn_mma_span_name(te.hd);
+                p.insert(name.clone(), gpu.pipeline(&ojas_metal::kernels::attn::attn_mma_span_src(te.hd), &name)?);
             }
         }
 
@@ -724,7 +828,9 @@ impl<'a> DecoderGpu<'a> {
         let split_kvb = g.tensors.contains_key("blk.0.attn_k_b.weight")
             && !g.tensors.contains_key("blk.0.attn_kv_b.weight");
         if !tied_embed { names.push("output.weight".into()); }
-        if arch == "qwen35" || arch == "qwen35moe" {
+        if let Some(te) = &text_encoder {
+            names = te.gpu_tensors(g);
+        } else if arch == "qwen35" || arch == "qwen35moe" {
             // Gated-DeltaNet hybrid: SSM layers vs attention layers have different tensors.
             let interval = g.meta_u32(&format!("{arch}.full_attention_interval")).unwrap_or(4);
             let moe_arch = arch == "qwen35moe";
@@ -1795,7 +1901,7 @@ impl<'a> DecoderGpu<'a> {
             (
                 (v.channels * v.patch * v.patch) as usize * p as usize, // vimg: pixels of `p` patches
                 rows * k,                                              // vrows
-                rows * dv,                                             // vx / vh / vq / vk / vv
+                rows * dv,                                             // vx / vh / vq
                 rows * 3 * dv,                                         // vqkv
                 ((rows + 32) * dv + 1) / 2,                            // vkh / vvh: half + 32 pad rows
                 (rows * v.ffn as usize).max(mmrows * v.mm_hidden as usize), // vffn, also mm.0's output
@@ -1951,6 +2057,7 @@ impl<'a> DecoderGpu<'a> {
                 rope_local, swa_pattern,
                 v_rmsnorm: arch == "gemma4", gpt_oss: arch == "gpt-oss", out_scale, ssm, moe, mla: mla_cfg, qwen4exp,
                 vision,
+                text_encoder,
                 sparse_budget,
             },
             ms: MoeScratch {
@@ -2047,7 +2154,7 @@ impl<'a> DecoderGpu<'a> {
                 // load covers every image size.
                 vimg: buf(gpu, n_vimg), vrows: buf(gpu, n_vrows),
                 vx: buf(gpu, n_vd), vh: buf(gpu, n_vd), vqkv: buf(gpu, n_vqkv),
-                vq: buf(gpu, n_vd), vk: buf(gpu, n_vd), vv: buf(gpu, n_vd),
+                vq: buf(gpu, n_vd),
                 vkh: buf_zeroed(gpu, n_vhalf), vvh: buf_zeroed(gpu, n_vhalf),
                 vffn: buf(gpu, n_vffn), vpe: buf(gpu, n_vpe), vmpos: buf(gpu, n_vmpos),
                 vout: buf(gpu, n_vout),
@@ -2057,6 +2164,7 @@ impl<'a> DecoderGpu<'a> {
             gpu_s: std::cell::Cell::new(0.0),
             want_topk: std::cell::Cell::new(false),
             cur_slot: std::cell::Cell::new(0),
+            text_arena: std::cell::RefCell::new(None),
             tune: Tune { max_tg, gemv_plan: HashMap::new(), xv_plan: HashMap::new(), q4l_tg: HashMap::new() },
         };
         // OJAS_EXPERT_PRUNE=<saliency.bin>:<pct>: REAP-style prune×IQ2 sub-100GB sim
@@ -2151,7 +2259,9 @@ impl<'a> DecoderGpu<'a> {
                 }
             }
         }
-        if quant || q4mode {
+        // Autotune picks decoder GEMV plans by decoder tensor name; an encoder runs
+        // only the batched GEMM.
+        if (quant || q4mode) && model.arch.text_encoder.is_none() {
             model.autotune();
         }
         if stream && is_qwen4exp && !ecfg.flash_expert_pool {

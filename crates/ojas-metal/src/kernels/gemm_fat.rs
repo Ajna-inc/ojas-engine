@@ -34,6 +34,22 @@
 //! Compiled fallibly like the async-copy family: `#pragma METAL internals` is
 //! semi-internal, so a toolchain that rejects it degrades to the staged GEMM.
 
+/// Split-K partitions for `gemm_mm_f16_fat` at an M x N x K product: enough to bring
+/// the 64x64 tile grid to about a thousand threadgroups (the target the Q4L split-K
+/// path measured), at most 8, each partition at least 64 deep, and the partials
+/// (`splits * m * n` floats) within `scratch_floats`. 1 means no split.
+///
+/// Only narrow outputs split. On an M2 Max (`examples/gemm_f16_bench.rs`, best of five)
+/// splitting the N = 1024 projections measured 14-30% faster at 115 and at 731 rows,
+/// while the 3072- and 5248-wide ones gained nothing or lost.
+pub fn f16_fat_splits(m: u32, n: u32, k: u32, scratch_floats: u32) -> u32 {
+    if n > 2048 { return 1; }
+    let tiles = m.div_ceil(64) * (n / 64);
+    let mut s = (1024 / tiles.max(1)).clamp(1, 8);
+    while s > 1 && (k / s < 64 || (s as u64) * (m as u64) * (n as u64) > scratch_floats as u64) { s -= 1; }
+    s
+}
+
 pub const GEMM_FAT_KERNELS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -192,6 +208,115 @@ kernel void gemm_mm_q4l_fat(device const float* x [[buffer(0)]], device const uc
         for (short r = 0; r < 4; r++) {
             uint2 origin = uint2(uint(r)*8u, t0 + tok0 + uint(t)*8u);
             if (accum != 0u) {
+                simdgroup_matrix_storage<float> prev;
+                prev.load(ybase, N, origin);
+                *(c[t][r].thread_elements()) += *(prev.thread_elements());
+            }
+            c[t][r].store(ybase, N, origin);
+        }
+    }
+}
+
+
+
+
+
+
+// f16-weight GEMM, the encoders' projection (`projm` at f16): y[tok][row] =
+// x[tok][k] . w16[row][k], w16 raw half [N][K] row-major.
+//
+// The Q4L split-K fat kernel's structure with a copy in place of its dequant: 64x64
+// tile, four simdgroups of 16 register fragments, the weight tile double-buffered
+// in threadgroup memory (one barrier per K slab), and activation fragments loaded
+// straight from device, where the slab stays L2-resident across N-tiles. Each lane's
+// token row is clamped to M-1, so a partial tile reads valid rows whose results the
+// store guard discards, and `x` needs no row padding.
+//
+// Split-K on grid.z (`nsplit` > 1, 32-aligned partitions): plain fp32 partials at
+// y + z*M*N, reduced by `splitk_accum`, which owns `accum`. It supplies threadgroups
+// a short request cannot: at M=115, N=1024 the tile grid is 32 threadgroups for 38
+// cores. N % 64 == 0, K % 32 == 0.
+kernel void gemm_mm_f16_fat(device const float* x [[buffer(0)]], device const half* w16 [[buffer(1)]],
+    device float* y [[buffer(2)]], constant uint& K [[buffer(3)]], constant uint& N [[buffer(4)]],
+    constant uint& accum [[buffer(6)]], constant uint& M [[buffer(7)]],
+    constant uint& nsplit [[buffer(9)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sa[2][32*72];
+    const uint r0 = tgpig.y*64u;   // output rows
+    const uint t0 = tgpig.x*64u;   // tokens
+    uint kper = ((K / nsplit) / 32u) * 32u;
+    uint kbeg = tgpig.z * kper;
+    uint kend = (tgpig.z + 1u == nsplit) ? K : kbeg + kper;
+    device float* yz = y + (ulong)tgpig.z * (ulong)M * (ulong)N;
+    // Weight fill: 128 threads, a thread pair per weight row, 16 k each.
+    uint lr = tiitg/2u;
+    uint il = tiitg%2u;
+    device const half* arow = w16 + (ulong)(r0+lr)*(ulong)K;
+
+    ushort2 mo = morton_order(lane);
+    uint row0 = (uint(sgitg) % 2u) * 32u;
+    uint tok0 = (uint(sgitg) / 2u) * 32u;
+    // Per-lane activation rows for the four token fragments, clamped into [0, M).
+    device const float* xr[4];
+#pragma clang loop unroll(full)
+    for (short t = 0; t < 4; t++) {
+        uint tok = min(t0 + tok0 + uint(t)*8u + uint(mo.y), M - 1u);
+        xr[t] = x + (ulong)tok*(ulong)K + mo.x;
+    }
+
+    simdgroup_matrix_storage<float> c[4][4];
+#pragma clang loop unroll(full)
+    for (short t = 0; t < 4; t++) {
+#pragma clang loop unroll(full)
+        for (short r = 0; r < 4; r++) { c[t][r] = simdgroup_matrix_storage<float>(float2(0)); }
+    }
+
+#define F16FAT_FILL(BUF, LK) { \
+            device const half4* ap = (device const half4*)(arow + (LK)) + il*4u; \
+            threadgroup half* dst = (BUF) + il*16u*72u + lr; \
+            for (short q = 0; q < 4; q++) { \
+                half4 a = ap[q]; \
+                dst[(q*4+0)*72] = a.x; dst[(q*4+1)*72] = a.y; \
+                dst[(q*4+2)*72] = a.z; dst[(q*4+3)*72] = a.w; } }
+
+    F16FAT_FILL(sa[0], kbeg)
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint lk = kbeg; lk < kend; lk += 32u) {
+        uint cur = ((lk - kbeg)/32u) & 1u;
+        if (lk + 32u < kend) { F16FAT_FILL(sa[1u-cur], lk + 32u) }
+        const threadgroup half* sa_m = simdgroup_matrix_storage<half>::apply_offset(sa[cur], 72, ushort2(mo.x, mo.y));
+#pragma clang loop unroll(full)
+        for (short ko = 0; ko < 4; ko++) {
+            simdgroup_matrix_storage<half> af[4];
+            simdgroup_matrix_storage<half> bf[4];
+#pragma clang loop unroll(full)
+            for (short t = 0; t < 4; t++) {
+                *(af[t].thread_elements()) = half2(*(device const float2*)(xr[t] + lk + uint(ko)*8u));
+            }
+#pragma clang loop unroll(full)
+            for (short r = 0; r < 4; r++) { bf[r].load(sa_m, 72, ushort2(ushort(row0) + r*8, ko*8)); }
+#pragma clang loop unroll(full)
+            for (short t = 0; t < 4; t++) {
+#pragma clang loop unroll(full)
+                for (short r = 0; r < 4; r++) { c[t][r].multiply(af[t], bf[r]); }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+#undef F16FAT_FILL
+    bool add = accum != 0u && nsplit == 1u;
+    device float* ybase = simdgroup_matrix_storage<float>::apply_offset(yz, N, uint2(r0 + row0 + mo.x, mo.y));
+#pragma clang loop unroll(full)
+    for (short t = 0; t < 4; t++) {
+        uint tok = t0 + tok0 + uint(t)*8u + uint(mo.y);
+        if (tok >= M) { continue; }
+#pragma clang loop unroll(full)
+        for (short r = 0; r < 4; r++) {
+            uint2 origin = uint2(uint(r)*8u, t0 + tok0 + uint(t)*8u);
+            if (add) {
                 simdgroup_matrix_storage<float> prev;
                 prev.load(ybase, N, origin);
                 *(c[t][r].thread_elements()) += *(prev.thread_elements());

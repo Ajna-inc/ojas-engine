@@ -1,4 +1,6 @@
-//! HTTP server: OpenAI-compatible plus llama.cpp's native `/completion`.
+//! HTTP server: OpenAI-compatible plus llama.cpp's native `/completion`. A Laya
+//! model is served by `decide::serve` instead (`POST /v1/decide`), on the same
+//! connection loop, [`serve_http`].
 //!
 //! One slot, served on the thread that owns the model. `DecoderGpu` is `Send` but
 //! not `Sync` (it keeps interior-mutable decode state) and a single decoder has
@@ -21,10 +23,10 @@ use std::net::{TcpListener, TcpStream};
 
 const MAX_BODY: usize = 32 * 1024 * 1024;
 
-struct Request {
-    method: String,
-    path: String,
-    body: Vec<u8>,
+pub(crate) struct Request {
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) body: Vec<u8>,
 }
 
 /// Read one HTTP/1.1 request. `None` on a closed or unusable connection.
@@ -63,7 +65,7 @@ fn read_request(stream: &mut BufReader<&TcpStream>) -> Result<Option<Request>> {
     Ok(Some(Request { method, path, body }))
 }
 
-fn send(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
+pub(crate) fn send(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
          Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
@@ -74,11 +76,11 @@ fn send(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
     let _ = stream.flush();
 }
 
-fn send_json(stream: &mut TcpStream, status: &str, v: &Value) {
+pub(crate) fn send_json(stream: &mut TcpStream, status: &str, v: &Value) {
     send(stream, status, "application/json", v.to_string().as_bytes());
 }
 
-fn send_err(stream: &mut TcpStream, status: &str, msg: &str) {
+pub(crate) fn send_err(stream: &mut TcpStream, status: &str, msg: &str) {
     // OpenAI's error envelope, so clients surface the text instead of a blank failure.
     send_json(stream, status, &json!({"error": {"message": msg, "type": "invalid_request_error"}}));
 }
@@ -340,6 +342,10 @@ fn handle_completion(
 }
 
 pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if crate::decide::is_laya(model) {
+        return crate::decide::serve(model, opts);
+    }
     with_model(model, opts.device, context, opts.precision, |m, bpe, info| {
         let (primary, secondary) = stop_ids(bpe, info);
         let mut core = EngineCore::new(m);
@@ -369,45 +375,17 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
             "concurrent_slots": 1,
         });
 
-        for conn in listener.incoming() {
-            let mut stream = match conn {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("accept failed: {e}");
-                    continue;
-                }
-            };
-            let req = {
-                let mut reader = BufReader::new(&stream);
-                match read_request(&mut reader) {
-                    Ok(Some(r)) => r,
-                    Ok(None) => continue,
-                    Err(e) => {
-                        send_err(&mut stream, "400 Bad Request", &format!("{e:#}"));
-                        continue;
-                    }
-                }
-            };
-
-            if req.method == "OPTIONS" {
-                let head = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n\
-                            Access-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-                            Content-Length: 0\r\nConnection: close\r\n\r\n";
-                let _ = stream.write_all(head.as_bytes());
-                continue;
-            }
-
-            let path = req.path.split('?').next().unwrap_or("").to_string();
-            match (req.method.as_str(), path.as_str()) {
+        serve_http(&listener, |stream, req, path| {
+            match (req.method.as_str(), path) {
                 ("GET", "/health") => match ojas_core::device_fault::peek() {
                     // A process that cannot serve must not report healthy; the
                     // recovery path is a restart by the orchestrator.
-                    Some(err) => send_json(&mut stream, "503 Service Unavailable",
+                    Some(err) => send_json(stream, "503 Service Unavailable",
                         &json!({"status": "error", "error": err.to_string()})),
-                    None => send_json(&mut stream, "200 OK", &json!({"status": "ok"})),
+                    None => send_json(stream, "200 OK", &json!({"status": "ok"})),
                 },
-                ("GET", "/props") => send_json(&mut stream, "200 OK", &props),
-                ("GET", "/v1/models") => send_json(&mut stream, "200 OK", &json!({
+                ("GET", "/props") => send_json(stream, "200 OK", &props),
+                ("GET", "/v1/models") => send_json(stream, "200 OK", &json!({
                     "object": "list",
                     "data": [{"id": info.arch, "object": "model", "created": now(), "owned_by": "ojas"}]
                 })),
@@ -415,8 +393,8 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
                     let body: Value = match serde_json::from_slice(&req.body) {
                         Ok(v) => v,
                         Err(e) => {
-                            send_err(&mut stream, "400 Bad Request", &format!("invalid JSON: {e}"));
-                            continue;
+                            send_err(stream, "400 Bad Request", &format!("invalid JSON: {e}"));
+                            return;
                         }
                     };
                     let oai = p.starts_with("/v1/");
@@ -444,13 +422,48 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
                     core.banned = if ignore_eos { info.eog.clone() } else { Vec::new() };
                     core.eos = if ignore_eos { None } else { primary };
                     let stop = if ignore_eos { None } else { secondary };
-                    handle_completion(&mut stream, &core, bpe, info, opts, &body, chat, oai, stop);
+                    handle_completion(stream, &core, bpe, info, opts, &body, chat, oai, stop);
                 }
-                _ => send_err(&mut stream, "404 Not Found", &format!("no route for {} {}", req.method, path)),
+                _ => send_err(stream, "404 Not Found", &format!("no route for {} {}", req.method, path)),
             }
-        }
-        Ok(())
+        })
     })
+}
+
+/// Accept connections one at a time and hand each parsed request to `handle` with
+/// its path (query string removed). Answers CORS preflight itself, and a request that
+/// cannot be parsed with 400.
+pub(crate) fn serve_http(listener: &TcpListener, mut handle: impl FnMut(&mut TcpStream, &Request, &str)) -> Result<()> {
+    for conn in listener.incoming() {
+        let mut stream = match conn {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("accept failed: {e}");
+                continue;
+            }
+        };
+        let req = {
+            let mut reader = BufReader::new(&stream);
+            match read_request(&mut reader) {
+                Ok(Some(r)) => r,
+                Ok(None) => continue,
+                Err(e) => {
+                    send_err(&mut stream, "400 Bad Request", &format!("{e:#}"));
+                    continue;
+                }
+            }
+        };
+        if req.method == "OPTIONS" {
+            let head = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n\
+                        Access-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+                        Content-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes());
+            continue;
+        }
+        let path = req.path.split('?').next().unwrap_or("").to_string();
+        handle(&mut stream, &req, &path);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

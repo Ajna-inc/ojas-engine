@@ -143,6 +143,89 @@ pub fn attn_mma_dq_bidir_src(hd: u32) -> String {
     format!("#include <metal_stdlib>\nusing namespace metal;\n{body}")
 }
 
+/// Name of the kernel [`attn_bidir_span_src`] generates.
+pub const ATTN_BIDIR_SPAN: &str = "attention_m_bidir_span";
+
+/// `attention_m_bidir` with a per-row key range: query row `m` attends to keys
+/// `[span[m].x, span[m].y)` instead of `[0, total)`.
+///
+/// One range per row expresses both things a packed text-encoder batch needs:
+/// sequence boundaries (several independent sequences share one row buffer) and a
+/// symmetric local window (ModernBERT's sliding layers, `|i - j| <= w`), each
+/// intersected on the host. The online softmax, the simdgroup split and the store are
+/// `attention_m_bidir`'s, byte for byte; only the loop bounds move, so that kernel
+/// stays the oracle for this one. Every span must be non-empty.
+///
+/// buffers: as `attention_m_bidir`, plus 10 `span[M]` (uint2).
+pub fn attn_bidir_span_src() -> String {
+    let s = super::attn_core::BODY;
+    let start = s.find("kernel void attention_m_bidir(").expect("attention_m_bidir in attn_core");
+    let end = start + s[start..].find("\nkernel void ").expect("kernel after attention_m_bidir");
+    let mut body = s[start..end].to_string();
+    for (from, to) in [
+        ("attention_m_bidir(", "attention_m_bidir_span("),
+        ("constant uint& n_head [[buffer(9)]],",
+         "constant uint& n_head [[buffer(9)]], device const uint2* span [[buffer(10)]],"),
+        ("uint seq = total;                      // BIDIRECTIONAL: attend to every position",
+         "uint2 sp = span[m]; uint seq = sp.y; (void)total;   // keys [sp.x, sp.y) only"),
+        ("for (uint t = sgid; t < seq; t += nsg)", "for (uint t = sp.x + sgid; t < seq; t += nsg)"),
+    ] {
+        assert!(body.contains(from), "attention_m_bidir changed shape; the span rewrite of `{from}` is stale");
+        body = body.replacen(from, to, 1);
+    }
+    format!("#include <metal_stdlib>\nusing namespace metal;\n{body}")
+}
+
+/// Name of the kernel [`attn_mma_span_src`] generates for head dim `hd`.
+pub fn attn_mma_span_name(hd: u32) -> String { format!("attention_m_mma_span_{hd}") }
+
+/// MMA attention over packed sequences with per-row key spans: the tiled twin of
+/// [`attn_bidir_span_src`], generated from `attention_m_mma` so its tiling, online
+/// softmax and store path are that kernel's byte for byte.
+///
+/// Each threadgroup takes one query tile from `tiles` (slot 11), a `uint4` of
+/// `(q0, nq, klo, khi)`: up to 32 query rows starting at `q0`, all from one sequence,
+/// and the key range `[klo, khi)` covering every row's span. Rows are then masked to
+/// their own `span[row]` (slot 12, `uint2`, as the scalar kernel reads it), which is
+/// how a sliding window clips inside a tile. The grid is `(n_head, n_tiles)`.
+///
+/// Key blocks are read eight rows at a time past `khi`; those rows are masked, and the
+/// caller keeps K and V finite (zeroed) at least 64 rows past the last token so the
+/// masked products stay zero.
+pub fn attn_mma_span_src(hd: u32) -> String {
+    let s = ATTN_KERNELS;
+    let start = s.find("kernel void attention_m_mma(").expect("mma kernel in source");
+    let end = start + s[start..].find("\nkernel void ").expect("kernel after mma");
+    let sq = hd + 8;
+    let mut body = s[start..end].to_string();
+    for (from, to) in [
+        ("attention_m_mma(".to_string(), format!("{}(", attn_mma_span_name(hd))),
+        ("constant uint& mtok [[buffer(10)]],".into(),
+         "constant uint& mtok [[buffer(10)]], device const uint4* tiles [[buffer(11)]], \
+          device const uint2* span [[buffer(12)]],".into()),
+        ("constant uint& hd [[buffer(4)]]".into(), "constant uint& hd_rt [[buffer(4)]]".into()),
+        ("threadgroup half  sq[32*264];".into(), format!("threadgroup half  sq[32*{sq}];")),
+        ("const uint SQ = 264u;".into(), format!("const uint SQ = {sq}u;")),
+        ("const uint ts = 256u;".into(), format!("const uint ts = 256u; const uint hd = {hd}u; (void)hd_rt;")),
+        ("uint q0 = qt*32u;\n    uint nq = min(32u, mtok - q0);".into(),
+         "uint4 td = tiles[qt]; uint q0 = td.x; uint nq = td.y; (void)mtok;".into()),
+        ("uint maxseq = base_pos + q0 + nq;              // longest causal row in this tile".into(),
+         "uint klo = td.z; uint maxseq = td.w; (void)base_pos;   // keys [klo, maxseq) cover every row".into()),
+        ("for (uint c0 = 0u; c0 < maxseq; c0 += C) {".into(), "for (uint c0 = klo; c0 < maxseq; c0 += C) {".into()),
+        ("uint myseq = base_pos + q0 + r + 1u;   // causal bound (valid rows only)\n            \
+          bool ok0 = (r < nq) && (c0 + lane < myseq);\n            \
+          bool ok1 = (r < nq) && (c0 + lane + 32u < myseq);".into(),
+         "uint2 rsp = span[q0 + min(r, nq - 1u)];   // this row's keys [rsp.x, rsp.y)\n            \
+          bool ok0 = (r < nq) && (c0 + lane >= rsp.x) && (c0 + lane < rsp.y);\n            \
+          bool ok1 = (r < nq) && (c0 + lane + 32u >= rsp.x) && (c0 + lane + 32u < rsp.y);".into()),
+    ] {
+        assert!(body.contains(from.as_str()), "attention_m_mma changed shape; the span rewrite of `{from}` is stale");
+        body = body.replacen(from.as_str(), &to, 1);
+    }
+    assert!(!body.contains("base_pos + q0"), "a causal bound survived the span rewrite");
+    format!("#include <metal_stdlib>\nusing namespace metal;\n{body}")
+}
+
 pub const ATTN_KERNELS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;

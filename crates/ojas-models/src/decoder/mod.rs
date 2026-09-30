@@ -415,8 +415,6 @@ pub(crate) struct StateArena {
     /// `[rows * 3*d_v]` f32 — the fused `attn_qkv` output before the split.
     pub(crate) vqkv: metal::Buffer,
     pub(crate) vq: metal::Buffer,
-    pub(crate) vk: metal::Buffer,
-    pub(crate) vv: metal::Buffer,
     /// K/V as f16 for the attention kernels, which take `device const half*`.
     /// Allocated 32 rows long: `attention_m_mma_bidir_*` loads 8x8 K/V tiles at
     /// `p0 < total`, so it reads up to 7 rows past `total` and those rows must hold
@@ -757,6 +755,8 @@ pub struct DecoderGpu<'a> {
     /// Every writer restores the previous value, so the resting state is 0 and the default
     /// paths are unchanged.
     cur_slot: std::cell::Cell<usize>,
+    /// Row buffers of the text encoder, reused across requests (`text_encoder.rs`).
+    text_arena: std::cell::RefCell<Option<text_encoder::TextBuffers>>,
 }
 
 impl Drop for DecoderGpu<'_> {
@@ -858,6 +858,50 @@ pub(crate) struct VisionConfig {
     pub(crate) max_patches: u32,
 }
 
+/// A ModernBERT text encoder (`general.architecture = "modern-bert"`), read from the
+/// same GGUF keys llama.cpp reads. Carried on [`Arch`] as `vision` is: the encoder
+/// runs through its own entry (`text_encoder.rs`), not the decoder graph, because it
+/// has no KV cache, no causal mask and no LM head.
+#[derive(Clone, Debug)]
+pub(crate) struct TextEncoderConfig {
+    pub(crate) d: u32,
+    pub(crate) layers: u32,
+    pub(crate) n_head: u32,
+    pub(crate) hd: u32,
+    /// Per half of the gated MLP: `ffn_up` produces `2 * ffn` columns.
+    pub(crate) ffn: u32,
+    pub(crate) eps: f32,
+    /// RoPE base of the global-attention layers.
+    pub(crate) rope_base: f32,
+    /// RoPE base of the sliding-window layers.
+    pub(crate) rope_base_local: f32,
+    /// Keys a local layer's query sees on each side: `|i - j| <= window`.
+    /// `attention.sliding_window` is the full width (128), this is half of it.
+    pub(crate) window: u32,
+    /// Layer `l` is local when `l % swa_pattern != 0` (llama.cpp's dense-first
+    /// rule); 0 means every layer is global.
+    pub(crate) swa_pattern: u32,
+    pub(crate) max_positions: u32,
+    /// The Laya decision head, when the file carries one.
+    pub(crate) laya: Option<LayaHeadConfig>,
+}
+
+impl TextEncoderConfig {
+    pub(crate) fn is_local(&self, layer: usize) -> bool {
+        self.swa_pattern > 0 && self.window > 0 && layer as u32 % self.swa_pattern != 0
+    }
+}
+
+/// Geometry of the Laya decision head appended by `scripts/laya_convert.py`: a stack
+/// of PyTorch `nn.TransformerEncoderLayer` blocks (pre-norm, ReLU, biased, no RoPE).
+#[derive(Clone, Debug)]
+pub(crate) struct LayaHeadConfig {
+    pub(crate) blocks: u32,
+    pub(crate) n_head: u32,
+    pub(crate) ffn: u32,
+    pub(crate) eps: f32,
+}
+
 pub(crate) struct Arch {
     pub(crate) n_layers: usize,
     pub(crate) n_head: usize,
@@ -888,6 +932,8 @@ pub(crate) struct Arch {
     pub(crate) qwen4exp: Option<Qwen4ExpConfig>, // hyper-connection + sparse-indexer + n-gram embedding params
     /// qwen3vl ViT tower, when an mmproj sidecar was attached (None otherwise).
     pub(crate) vision: Option<VisionConfig>,
+    /// ModernBERT text encoder, when the file is one (None for a decoder).
+    pub(crate) text_encoder: Option<TextEncoderConfig>,
     pub(crate) sparse_budget: Option<u32>,
 }
 
@@ -1082,6 +1128,7 @@ mod audit;
 mod autotune;
 mod batch;
 pub(crate) mod dispatch;
+mod encoder;
 mod entries;
 mod graph_attn;
 mod graph_chunk;
@@ -1098,6 +1145,7 @@ mod profile;
 pub use profile::{FlashTargetTiming, FlashTraceEvent};
 mod span;
 mod spec;
+mod text_encoder;
 mod vision;
 pub(crate) use vision::VIT_PATCH_FOLD;
 
@@ -1235,7 +1283,7 @@ impl<'a> DecoderGpu<'a> {
                   // ViT tower scratch. A buffer left off this list re-faults every
                   // pass under MTLResidencySet, which is costly on a 12-layer tower
                   // over thousands of patches.
-                  &st.vimg, &st.vrows, &st.vx, &st.vh, &st.vqkv, &st.vq, &st.vk, &st.vv,
+                  &st.vimg, &st.vrows, &st.vx, &st.vh, &st.vqkv, &st.vq,
                   &st.vkh, &st.vvh, &st.vffn, &st.vpe, &st.vmpos, &st.vout]);
         for vec in [&st.kcache, &st.mla_lat, &st.vcache, &st.conv_state, &st.ssm_state, &st.pmeta] {
             v.extend(vec.iter());

@@ -10,14 +10,18 @@
 //!
 //! | entry              | CUDA buffers (in order)   | CUDA scalars (in order) | Metal slots            |
 //! |--------------------|---------------------------|-------------------------|------------------------|
-//! | vit_layernorm_m    | x, w, out, b              | d, eps                  | 0 x 1 w 2 out 5 b; 3 d 4 eps |
+//! | vit_layernorm_m    | x, w, out, b              | d, eps                  | 0 x 1 w 2 out 5 b; 3 d 4 eps 6 has_bias |
 //! | vit_gelu           | x, out                    | n                       | 0 x 1 out; 2 n         |
 //! | vit_patchify       | img, out                  | W, H, C, P, total       | 0,1; 2..6              |
-//! | vit_rope           | v, mpos                   | hd, base, R, M          | 0 v 5 mpos; 1 hd 2 base 3 R 4 M |
+//! | vit_rope           | v, mpos                   | hd, base, R, M          | 0 v 5 mpos; 1 hd 2 base 3 R 4 M 6 freq_dims |
 //! | vit_qkv_split      | qkv, q, k, v              | d, total                | 0..3; 4, 5             |
 //! | vit_merge_permute  | src, dst                  | d, pw, total            | 0, 1; 2..4             |
 //! | add_rowbias_m      | x, b                      | N, total                | 0, 1; 2, 3             |
 //! | copy_f32_half      | src, dst(half)            | n                       | 0, 1; 2                |
+//!
+//! Metal's slot-6 parameters serve its text encoder and are not implemented here yet: CUDA's
+//! `vit_layernorm_m` always adds the bias and `vit_rope` always ramps over `hd/2`, which is
+//! exactly what the ViT tower passes on Metal (`has_bias = 1`, `freq_dims = hd/2`).
 //!
 //! Grids are the Metal ones (threadgroups -> blocks): `vit_layernorm_m` is one block per row
 //! with a power-of-two block <= 256; everything else is one thread per element (or per rotated

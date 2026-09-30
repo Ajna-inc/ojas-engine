@@ -15,6 +15,7 @@ pub mod iq_grids;
 pub mod iq_tables;
 pub mod kernel;
 pub mod logging;
+pub mod math;
 pub mod quant_src;
 pub use kernel::{Caps, KernelRuntime, KernelSpec, Manifest, Tier, VariantSet};
 

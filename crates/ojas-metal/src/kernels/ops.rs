@@ -169,6 +169,37 @@ kernel void ffn_gu_split(device const float* gate [[buffer(0)]], device const fl
     if (gid < n) { out[gid] = ffn_act(gate[gid], act) * up[gid]; }
 }
 
+// Gated activation over one fused projection: row m of `x` is [gate | up], each `f`
+// wide (ModernBERT's `Wi`, whose first half is activated). `out` is [M, f].
+// buffers: 0 x[M,2f]  1 out[M,f]   consts: 2 f  3 n = M*f  4 act
+kernel void ffn_gu_rows(device const float* x [[buffer(0)]], device float* out [[buffer(1)]],
+    constant uint& f [[buffer(2)]], constant uint& n [[buffer(3)]],
+    constant uint& act [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) { return; }
+    ulong r = (ulong)(gid / f) * (ulong)(2u * f) + (ulong)(gid % f);
+    out[gid] = ffn_act(x[r], act) * x[r + f];
+}
+
+// Row gather: emb[h*hd + i] = table[rows[h]*hd + i] for h < n_heads, i.e. `n_heads`
+// rows of width `hd` picked by index. Named for its first user, the qwen4exp PLE
+// n-gram lookup (one row per head, flattened into one d-wide vector); the text
+// encoder uses it to keep only the rows the Laya head reads.
+kernel void ple_gather(device const float* table [[buffer(0)]], device const int* rows [[buffer(1)]],
+    device float* emb [[buffer(2)]], constant uint& hd [[buffer(3)]], constant uint& n_heads [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= hd * n_heads) return;
+    uint h = gid / hd, i = gid % hd;
+    emb[gid] = table[(uint)rows[h] * hd + i];
+}
+
+// Elementwise activation, out[i] = ffn_act(x[i], act). `out` may alias `x`.
+// buffers: 0 x  1 out   consts: 2 n  3 act
+kernel void act_m(device const float* x [[buffer(0)]], device float* out [[buffer(1)]],
+    constant uint& n [[buffer(2)]], constant uint& act [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid < n) { out[gid] = ffn_act(x[gid], act); }
+}
+
 kernel void swiglu(device const float* gate [[buffer(0)]], device const float* up [[buffer(1)]],
     device float* out [[buffer(2)]], constant uint& n [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
     if (gid < n) { float g = gate[gid]; out[gid] = (g/(1.0+exp(-g)))*up[gid]; }

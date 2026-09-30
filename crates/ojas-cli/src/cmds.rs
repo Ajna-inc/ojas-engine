@@ -266,6 +266,10 @@ pub fn chat(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
 }
 
 pub fn bench(model: &str, opts: &RunOpts, positional: Option<&str>, context: usize) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if crate::decide::is_laya(model) {
+        return crate::decide::bench(model, opts);
+    }
     let text = opts
         .resolve_prompt(positional)
         .unwrap_or_else(|_| "Write a short paragraph about the sea.".to_string());

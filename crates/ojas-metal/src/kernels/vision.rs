@@ -1,35 +1,45 @@
-//! ViT tower primitives: the kernels a vision encoder needs that the decoder
-//! families do not already provide.
+//! Encoder tower primitives: the kernels a bidirectional encoder needs that the
+//! decoder families do not already provide. The qwen3vl ViT tower and the
+//! ModernBERT text encoder both run on them, through the shared block loop in
+//! `ojas-models/src/decoder/encoder.rs`. The `vit_` prefix is historical; the CUDA
+//! twins in `ojas-cuda/src/kernels/vision.rs` carry the same names.
 //!
-//! Everything else the qwen3vl tower runs is an existing kernel and must stay that
-//! way: GELU is `ffn_act(g, 1u)` in the shared PRELUDE (`prelude.rs:18`),
-//! per-projection bias is `add_rowbias_m` (`gemv.rs:4`), every linear is `gemm_mm_f16`
-//! (`gemv.rs:1820`), non-causal attention is `attention_m_bidir` (`attn_core.rs:262`) /
+//! Everything else an encoder runs is an existing kernel and must stay that way:
+//! activations are `act_m` / `ffn_gu_rows` over the shared `ffn_act` (`ops.rs`,
+//! `prelude.rs`), per-projection bias is `add_rowbias_m` (`gemv.rs`), every linear goes
+//! through `projm` (`gemm_mm_f16_fat` at f16, `gemm_fat.rs`), and non-causal attention is
+//! `attention_m_bidir` (`attn_core.rs`), its per-row key-span variants
+//! (`attn::attn_bidir_span_src`, `attn::attn_mma_span_src`) or
 //! `attention_m_mma_bidir_<hd>` (`attn.rs`). The family is registered in `SPLIT`
-//! (`mod.rs:25`), so the PRELUDE and `ffn_act` come for free.
+//! (`mod.rs`), so the PRELUDE and `ffn_act` come for free.
 //!
-//! 1. `vit_layernorm_m` — mean-subtracting LayerNorm with bias. Every other norm in
-//!    the tree is RMS (`ops.rs:357`, `gemv.rs:11`, `qwen4exp.rs:26`, `mla.rs:10`,
-//!    `train.rs:302`) and LN cannot be a flag on them: RMS carries one accumulator
+//! 1. `vit_layernorm_m` — mean-subtracting LayerNorm, bias optional. Every other norm
+//!    in the tree is RMS (`rmsnorm_m` in `ops.rs`, and its twins in `gemv.rs`,
+//!    `qwen4exp.rs`, `mla.rs` and `train.rs`) and LN cannot be a flag on them: RMS carries one accumulator
 //!    (Σx²) and no bias, LN needs Σx too. It is a structural copy of `rmsnorm_m` —
 //!    same threadgroup-per-row grid, `part[256]` tree reduction and `(3,d)`/`(4,eps)`
-//!    constant slots — plus a second accumulator and a bias buffer at slot 5.
-//! 2. `vit_gelu` — standalone elementwise GELU. `ffn_gu_split` (`ops.rs:167`) is the
-//!    only existing caller of `ffn_act` at this granularity and it multiplies by an
-//!    `up` stream the ViT MLP does not have.
-//! 3. `vit_patchify` — the patch embedding's im2col, not a convolution: 16×16
+//!    constant slots — plus a second accumulator, a bias buffer at slot 5 and its
+//!    presence flag at slot 6.
+//! 2. `vit_patchify` — the patch embedding's im2col, not a convolution: 16×16
 //!    stride-16 patches do not overlap, so it is a pure permutation with no
-//!    duplication, and its `[T, C*P*P]` result feeds `gemm_mm_f16` directly.
-//! 4. `vit_rope` — sectioned vision M-RoPE that writes only the rotated vector.
-//!    `rope_qk_store_m` (`ops.rs:384`) has the section logic but also writes a KV
-//!    cache the tower lacks (its K and V are per-layer temporaries); `rope_m`
-//!    (`ops.rs:370`) does not store but takes a scalar `base_pos`, which cannot express
-//!    a patch's (y, x). Sharing with `ops.rs` would mean moving text into the PRELUDE,
-//!    as `ops` and `vision` are separate SPLIT units.
-//! 5. `vit_qkv_split` — the fused `attn_qkv` output is `[Q|K|V]` interleaved at a
-//!    `3*d` row stride; the attention kernels want `q` at stride `n_head*hd` with
-//!    `kc`/`vc` at stride `kvdim`. One dispatch, three contiguous outputs.
-//! 6. `vit_merge_permute` — the 2×2 spatial reorder that runs before block 0.
+//!    duplication, and its `[T, C*P*P]` result feeds the patch-embed GEMM directly.
+//! 3. `vit_rope` — sectioned M-RoPE driven by a per-row position table, writing only
+//!    the rotated vector. With every section size zero and `freq_dims = hd` it is a
+//!    plain NEOX rope on stream 0, which is how the text encoder restarts positions
+//!    per packed sequence. `rope_qk_store_m` (`ops.rs`) has the section logic but also
+//!    writes a KV cache the tower lacks (its K and V are per-layer temporaries);
+//!    `rope_m` (`ops.rs`) does not store but takes a scalar `base_pos`, which cannot
+//!    express a patch's (y, x). Sharing with `ops.rs` would mean moving text into the
+//!    PRELUDE, as `ops` and `vision` are separate SPLIT units.
+//! 4. `vit_qkv_prep` — the attention inputs in one pass over the fused `attn_qkv`
+//!    output: split `[Q|K|V]`, rotate Q and K with `vit_rope`'s arithmetic, store Q as
+//!    f32 and K, V as the half the attention kernels read. The encoder block runs this;
+//!    `vit_qkv_split`, `vit_rope` and `copy_f32_half` in sequence are its oracle, and
+//!    `tests/vision_kernels.rs` holds the two bit-identical. `vit_qkv_split` and
+//!    `vit_rope` also keep the names the CUDA twins carry.
+//! 5. `vit_merge_permute` — the 2×2 spatial reorder that runs before block 0.
+//! 6. `vit_gelu` — `act_m` with act 1, kept only for the CUDA twin's name (see the
+//!    kernel).
 //!
 //! # Constraints these kernels encode
 //!
@@ -41,8 +51,9 @@
 //! is what a ViT's `post_ln` sees, and the one-pass Σx²-mean² identity cancels on those
 //! same rows and can go negative.
 //!
-//! GELU is the tanh approximation with the cube clamped, since fast-math `tanh(inf)`
-//! is NaN. A more accurate variant moved a logits digest 0.20% (`gemm_fat.rs:626`).
+//! The ViT's GELU is the tanh approximation (`act_m` with act 1), as in the
+//! reference; ModernBERT's is the exact erf form (act 3). See `ffn_act` in the
+//! prelude.
 //!
 //! Patchify row order is load-bearing: any other nesting compiles, runs, and gives a
 //! subtly wrong tower. See `vit_patchify` below; oracle `ojas_cpu::cpu_vit::patchify`.
@@ -80,13 +91,15 @@ pub const BODY: &str = r#"
 // variance, the regime a ViT's post_ln lives in.
 //
 // buffers: 0 x[M,d] f32  1 w[d] f32  2 out[M,d] f32  5 b[d] f32
-// consts : 3 d (uint)    4 eps (float)
+// consts : 3 d (uint)    4 eps (float)   6 has_bias (uint)
+// With has_bias == 0 the bias is not read (ModernBERT's norms carry none); bind any
+// buffer at slot 5.
 // grid   : M threadgroups x ts threads. `out` may alias `x`: both reductions finish
 //          before the store loop, and a thread only rewrites the elements it reads
 //          itself (tests/vision_kernels.rs asserts it).
 kernel void vit_layernorm_m(device const float* x [[buffer(0)]], device const float* w [[buffer(1)]],
     device float* out [[buffer(2)]], constant uint& d [[buffer(3)]], constant float& eps [[buffer(4)]],
-    device const float* b [[buffer(5)]],
+    device const float* b [[buffer(5)]], constant uint& has_bias [[buffer(6)]],
     uint m [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]], uint ts [[threads_per_threadgroup]]) {
     device const float* xm = x + (ulong)m*(ulong)d; device float* om = out + (ulong)m*(ulong)d;
     threadgroup float part[256]; threadgroup float part2[256];
@@ -102,13 +115,14 @@ kernel void vit_layernorm_m(device const float* x [[buffer(0)]], device const fl
     part2[lid]=s2; threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint off=ts/2u;off>0u;off>>=1u){ if(lid<off) part2[lid]+=part2[lid+off]; threadgroup_barrier(mem_flags::mem_threadgroup); }
     float inv=rsqrt(part2[0]/float(d)+eps);
-    for (uint i=lid;i<d;i+=ts) om[i]=(xm[i]-mean)*inv*w[i]+b[i];
+    if (has_bias != 0u) { for (uint i=lid;i<d;i+=ts) om[i]=(xm[i]-mean)*inv*w[i]+b[i]; }
+    else                { for (uint i=lid;i<d;i+=ts) om[i]=(xm[i]-mean)*inv*w[i]; }
 }
 
-// Elementwise GELU. The ViT MLP is fc1 -> GELU -> fc2 with no gate/up split, so
-// `ffn_gu_split` (ops.rs:167) does not fit — it needs an `up` stream. `act=1u` is
-// the tanh approximation in the shared PRELUDE, the expression every GELU in this
-// tree must use (gemm_fat.rs:626).
+// Elementwise tanh GELU: `act_m` with act 1, kept as its own entry because the CUDA
+// twin (`ojas-cuda/src/kernels/vision.rs`) is named `vit_gelu` and the cross-backend
+// parity ratchet counts shared names. Retire both together once the CUDA encoder
+// path adopts `act_m`. Encoders on Metal dispatch `act_m`.
 // buffers: 0 x f32  1 out f32 (may alias x)   consts: 2 n (uint)
 kernel void vit_gelu(device const float* x [[buffer(0)]], device float* out [[buffer(1)]],
     constant uint& n [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
@@ -165,19 +179,18 @@ kernel void vit_patchify(device const float* img [[buffer(0)]], device float* ou
 // degenerates to a plain NEOX rope driven by stream 0, which makes the buffer safe
 // to reuse for a non-sectioned caller.
 //
+// `freq_dims` is ggml's `n_dims`, the width the frequency ramp is spread over:
+// theta_scale = base^(-2/freq_dims). Vision rope passes hd/2 (ggml's vision mode
+// rotates the whole head but ramps over half of it); a plain NEOX text rope passes
+// hd, giving the usual theta_j = pos * base^(-2j/hd).
+//
 // buffers: 0 v[M,R] f32 (in place)   5 mpos u32
-// consts : 1 hd   3 R = n_head*hd   4 M   |   float: 2 base
+// consts : 1 hd   3 R = n_head*hd   4 M   6 freq_dims   |   float: 2 base
 // grid   : ceil(M*(R/hd)*(hd/2) / 64) x 64
-kernel void vit_rope(device float* v [[buffer(0)]], constant uint& hd [[buffer(1)]],
-    constant float& base [[buffer(2)]], constant uint& R [[buffer(3)]],
-    constant uint& M [[buffer(4)]], device const uint* mpos [[buffer(5)]],
-    uint gid [[thread_position_in_grid]]) {
-    uint nd = hd/2u;                            // rotated pairs per head (vision: hd/2)
-    uint nh = R/hd;                             // heads per row
-    uint perRow = nh*nd;
-    if (gid >= M*perRow) { return; }
-    uint m = gid/perRow, rem = gid%perRow;
-    uint head = rem/nd, j = rem%nd;
+// Rotation angle of pair `j` in row `m`: the section lookup and the indep_sects ramp
+// described above. Shared by `vit_rope` and `vit_qkv_prep` so both evaluate the
+// same expression.
+inline float vit_rope_angle(device const uint* mpos, uint m, uint j, float base, uint freq_dims) {
     uint s0=mpos[0], s1=mpos[1], s2=mpos[2], s3=mpos[3];
     uint sect = s0+s1+s2+s3;
     uint sel = 0u, start = 0u, sector = j;
@@ -188,13 +201,63 @@ kernel void vit_rope(device float* v [[buffer(0)]], constant uint& hd [[buffer(1
         else if (sector < s0+s1+s2) { sel = 2u; start = s0+s1; }
         else                        { sel = 3u; start = s0+s1+s2; }
     }
-    float ts = pow(base, -2.0/float(nd));
+    float ts = pow(base, -2.0/float(freq_dims));
     float th = float(mpos[4u + 4u*m + sel]);
     for (uint e = start; e < sector; e++) { th *= ts; }   // indep_sects ramp
+    return th;
+}
+
+kernel void vit_rope(device float* v [[buffer(0)]], constant uint& hd [[buffer(1)]],
+    constant float& base [[buffer(2)]], constant uint& R [[buffer(3)]],
+    constant uint& M [[buffer(4)]], device const uint* mpos [[buffer(5)]],
+    constant uint& freq_dims [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint nd = hd/2u;                            // rotated pairs per head
+    uint nh = R/hd;                             // heads per row
+    uint perRow = nh*nd;
+    if (gid >= M*perRow) { return; }
+    uint m = gid/perRow, rem = gid%perRow;
+    uint head = rem/nd, j = rem%nd;
+    float th = vit_rope_angle(mpos, m, j, base, freq_dims);
     float s = sin(th), c = cos(th);
     ulong b = (ulong)m*(ulong)R + (ulong)(head*hd);
     float x0 = v[b+j], x1 = v[b+nd+j];
     v[b+j] = x0*c - x1*s; v[b+nd+j] = x0*s + x1*c;
+}
+
+// The encoder's attention inputs in one pass over the fused QKV projection: split
+// the [Q|K|V] row, rotate Q and K by `vit_rope`'s arithmetic, store Q as f32 and K,
+// V as the half the attention kernels read. Replaces vit_qkv_split, two vit_rope
+// and two copy_f32_half dispatches, and their round trips through memory; the
+// results are those five kernels' bit for bit.
+//
+// buffers: 0 qkv[M,3d] f32  1 q[M,d] f32  2 kh[M,d] half  3 vh[M,d] half  5 mpos
+// consts : 4 d  6 hd  7 M  8 freq_dims (0: no rotation)  |  float: 9 base
+// grid   : one thread per (row, head, rotated pair), M*d/2 threads
+kernel void vit_qkv_prep(device const float* qkv [[buffer(0)]], device float* q [[buffer(1)]],
+    device half* kh [[buffer(2)]], device half* vh [[buffer(3)]],
+    constant uint& d [[buffer(4)]], device const uint* mpos [[buffer(5)]],
+    constant uint& hd [[buffer(6)]], constant uint& M [[buffer(7)]],
+    constant uint& freq_dims [[buffer(8)]], constant float& base [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint nd = hd/2u;
+    uint perRow = d/2u;
+    if (gid >= M*perRow) { return; }
+    uint m = gid/perRow, rem = gid%perRow;
+    uint head = rem/nd, j = rem%nd;
+    ulong r = (ulong)m*(ulong)(3u*d) + (ulong)(head*hd);
+    ulong o = (ulong)m*(ulong)d + (ulong)(head*hd);
+    float q0 = qkv[r+j],       q1 = qkv[r+nd+j];
+    float k0 = qkv[r+d+j],     k1 = qkv[r+d+nd+j];
+    if (freq_dims != 0u) {
+        float th = vit_rope_angle(mpos, m, j, base, freq_dims);
+        float s = sin(th), c = cos(th);
+        float a = q0, b = q1;  q0 = a*c - b*s;  q1 = a*s + b*c;
+        a = k0; b = k1;        k0 = a*c - b*s;  k1 = a*s + b*c;
+    }
+    q[o+j] = q0; q[o+nd+j] = q1;
+    kh[o+j] = half(k0); kh[o+nd+j] = half(k1);
+    vh[o+j] = half(qkv[r+2u*d+j]); vh[o+nd+j] = half(qkv[r+2u*d+nd+j]);
 }
 
 // Split a fused attn_qkv row into three contiguous d-wide streams.
@@ -205,6 +268,10 @@ kernel void vit_rope(device float* v [[buffer(0)]], constant uint& hd [[buffer(1
 // `n_head*hd`, and `attention_m_bidir` / `attention_m_mma_bidir_*` stride `kc`/`vc`
 // by `kvdim`. Copying once here is cheaper than teaching four kernels a second
 // stride.
+//
+// The encoder block now runs `vit_qkv_prep`, which does this split, the rotation and
+// the half conversion in one pass; this kernel is its test oracle and keeps the name
+// of its CUDA twin.
 //
 // buffers: 0 qkv[M,3d] f32  1 q[M,d]  2 k[M,d]  3 v[M,d]
 // consts : 4 d   5 total = M*d        grid: ceil(total/64) x 64

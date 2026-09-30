@@ -259,3 +259,155 @@ fn bidir_source_drops_every_causality_site() {
         }
     }
 }
+
+/// Packed variable-length batches with an optional symmetric window: the shape a
+/// text-encoder request takes (several questions' sequences in one row buffer,
+/// ModernBERT's local layers seeing `|i - j| <= 64`).
+///
+/// The oracle is f64 attention on the host over the f16-rounded K and V the kernel
+/// reads, restricted to each row's own sequence and window. Neighbouring sequences are
+/// real data rather than padding, so a kernel that let a query see across a sequence
+/// boundary produces a plausible but wrong row, which the per-row cosine catches. K/V
+/// rows past the packed total are poisoned as in the tests above.
+#[test]
+fn bidir_span_matches_per_sequence_oracle() {
+    let gpu = match MetalGpu::new() {
+        Ok(g) => g,
+        Err(e) => { eprintln!("attn_bidir: no Metal device ({e}); skipping"); return; }
+    };
+    let src = ojas_metal::kernels::attn::attn_bidir_span_src();
+    let entry = ojas_metal::kernels::attn::ATTN_BIDIR_SPAN;
+    let span_pipe = gpu.pipeline(&src, entry).expect("span pipeline");
+    let scale = 1.0f32 / (HD as f32).sqrt();
+    // Lengths: a single-token sequence, lengths on both sides of the 129-key window,
+    // and one long enough that most of its rows see a clipped window.
+    let lens = [115usize, 1, 33, 200, 129, 64, 31, 32];
+    let total: usize = lens.iter().sum();
+    for window in [None, Some(64usize)] {
+        let mut seed = 0x5EA1u32 ^ window.unwrap_or(0) as u32;
+        let q: Vec<f32> = (0..total * NH * HD).map(|_| lcg(&mut seed) * QAMP).collect();
+        let kv = |seed: &mut u32, amp: f32| -> Vec<f32> {
+            (0..(total + KV_PAD) * KVDIM)
+                .map(|i| lcg(seed) * if i < total * KVDIM { amp } else { POISON })
+                .collect()
+        };
+        let (k, v) = (kv(&mut seed, KAMP), kv(&mut seed, VAMP));
+        let round = |x: &[f32]| -> Vec<f64> { x.iter().map(|&a| half::f16::from_f32(a).to_f64()).collect() };
+        let (kr, vr) = (round(&k), round(&v));
+
+        let mut spans: Vec<[u32; 2]> = Vec::with_capacity(total);
+        let mut start = 0usize;
+        for &len in &lens {
+            for i in start..start + len {
+                let (lo, hi) = match window {
+                    None => (start, start + len),
+                    Some(w) => (i.saturating_sub(w).max(start), (i + w + 1).min(start + len)),
+                };
+                spans.push([lo as u32, hi as u32]);
+            }
+            start += len;
+        }
+
+        let mut want = vec![0f32; total * NH * HD];
+        for (i, &[lo, hi]) in spans.iter().enumerate() {
+            for h in 0..NH {
+                let qi = &q[(i * NH + h) * HD..(i * NH + h + 1) * HD];
+                let logits: Vec<f64> = (lo as usize..hi as usize).map(|j| {
+                    let kj = &kr[j * KVDIM + h * HD..j * KVDIM + (h + 1) * HD];
+                    qi.iter().zip(kj).map(|(&a, &b)| a as f64 * b).sum::<f64>() * scale as f64
+                }).collect();
+                let mx = logits.iter().cloned().fold(f64::MIN, f64::max);
+                let w: Vec<f64> = logits.iter().map(|&l| (l - mx).exp()).collect();
+                let z: f64 = w.iter().sum();
+                for c in 0..HD {
+                    let acc: f64 = (lo as usize..hi as usize).zip(&w)
+                        .map(|(j, &p)| p * vr[j * KVDIM + h * HD + c]).sum();
+                    want[(i * NH + h) * HD + c] = (acc / z) as f32;
+                }
+            }
+        }
+
+        let (qb, kb, vb) = (upload_f32(&gpu, &q), upload_f16(&gpu, &k), upload_f16(&gpu, &v));
+        let flat: Vec<u32> = spans.iter().flatten().copied().collect();
+        let sb = gpu.device.new_buffer_with_data(flat.as_ptr() as *const c_void, (flat.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared);
+        let n = total * NH * HD;
+        let ob = upload_f32(&gpu, &vec![GUARD_FILL; GUARD * 2 + n]);
+        let cb = gpu.command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&span_pipe);
+        enc.set_buffer(0, Some(&qb), 0);
+        enc.set_buffer(1, Some(&kb), 0);
+        enc.set_buffer(2, Some(&vb), 0);
+        enc.set_buffer(3, Some(&ob), (GUARD * 4) as u64);
+        for (i, x) in [(4u64, HD as u32), (5, KVDIM as u32), (6, total as u32), (7, GROUP as u32), (9, NH as u32)] {
+            enc.set_bytes(i, 4, &x as *const u32 as *const c_void);
+        }
+        enc.set_bytes(8, 4, &scale as *const f32 as *const c_void);
+        enc.set_buffer(10, Some(&sb), 0);
+        enc.dispatch_thread_groups(MTLSize::new((total * NH) as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let label = format!("{entry} lens={lens:?} window={window:?}");
+        assert_rows_distinct(&label, &want, total * NH);
+        compare(&label, &want, &host(&ob, GUARD + n)[GUARD..], total * NH);
+        assert_guards(&label, &ob, n);
+
+        // The MMA twin on the same batch. It reads K/V in 8-row blocks past a tile's
+        // key range, so its K/V are zero past the packed total (the contract), and it
+        // takes one descriptor per 32-row query tile inside a sequence.
+        if !gpu.native_reduce { continue; }
+        let mma_name = ojas_metal::kernels::attn::attn_mma_span_name(HD as u32);
+        let mma = gpu.pipeline(&ojas_metal::kernels::attn::attn_mma_span_src(HD as u32), &mma_name)
+            .expect("mma span pipeline");
+        let zero_pad = |v: &[f32]| { let mut z = v[..total * KVDIM].to_vec(); z.resize((total + KV_PAD) * KVDIM, 0.0); z };
+        let (kz, vz) = (upload_f16(&gpu, &zero_pad(&k)), upload_f16(&gpu, &zero_pad(&v)));
+        let mut tiles: Vec<u32> = Vec::new();
+        let mut start = 0usize;
+        for &len in &lens {
+            for q0 in (start..start + len).step_by(32) {
+                let nq = 32.min(start + len - q0);
+                let (klo, khi) = (spans[q0][0], spans[q0 + nq - 1][1]);
+                tiles.extend_from_slice(&[q0 as u32, nq as u32, klo, khi]);
+            }
+            start += len;
+        }
+        let tb = gpu.device.new_buffer_with_data(tiles.as_ptr() as *const c_void, (tiles.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared);
+        let mo = upload_f32(&gpu, &vec![GUARD_FILL; GUARD * 2 + n]);
+        let cb = gpu.command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&mma);
+        enc.set_buffer(0, Some(&qb), 0);
+        enc.set_buffer(1, Some(&kz), 0);
+        enc.set_buffer(2, Some(&vz), 0);
+        enc.set_buffer(3, Some(&mo), (GUARD * 4) as u64);
+        for (i, x) in [(4u64, HD as u32), (5, KVDIM as u32), (6, 0), (7, GROUP as u32), (9, NH as u32), (10, total as u32)] {
+            enc.set_bytes(i, 4, &x as *const u32 as *const c_void);
+        }
+        enc.set_bytes(8, 4, &scale as *const f32 as *const c_void);
+        enc.set_buffer(11, Some(&tb), 0);
+        enc.set_buffer(12, Some(&sb), 0);
+        enc.dispatch_thread_groups(MTLSize::new(NH as u64, (tiles.len() / 4) as u64, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let label = format!("{mma_name} lens={lens:?} window={window:?}");
+        compare(&label, &want, &host(&mo, GUARD + n)[GUARD..], total * NH);
+        assert_guards(&label, &mo, n);
+    }
+}
+
+/// The span rewrite slices exactly one kernel, moves both loop bounds, and does not
+/// shadow a family kernel.
+#[test]
+fn bidir_span_source_moves_both_bounds() {
+    let src = ojas_metal::kernels::attn::attn_bidir_span_src();
+    assert_eq!(src.matches("kernel void ").count(), 1, "sliced more than one kernel");
+    assert!(src.contains("uint seq = sp.y;"), "upper key bound not rewritten");
+    assert!(src.contains("t = sp.x + sgid"), "lower key bound not rewritten");
+    assert!(ojas_metal::kernels::source_of(ojas_metal::kernels::attn::ATTN_BIDIR_SPAN).is_none(),
+        "the span kernel collides with a family kernel name");
+}
