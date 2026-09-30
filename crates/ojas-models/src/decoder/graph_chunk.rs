@@ -1,6 +1,5 @@
 #![allow(clippy::too_many_arguments)]
 use super::*;
-use objc::{msg_send, sel, sel_impl};
 use metal::MTLSize;
 use std::ffi::c_void;
  // re-export
@@ -113,7 +112,8 @@ impl<'a> DecoderGpu<'a> {
             enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(256, 1, 1));
     }
 
-    /// One qwen35 prefill chunk (M ≤ MAXM tokens) in a single command buffer.
+    /// One qwen35 prefill chunk (M ≤ MAXM tokens), split across command buffers every
+    /// `prefill_cb_layers` layers.
     /// Mirrors the qwen35 branch of encode_forward with M-token batched kernels;
     /// activations are [M, dim] row-major throughout.
     pub(crate) fn forward_chunk(&self, tokens: &[u32], base_pos: usize, verify: bool) {
@@ -202,9 +202,13 @@ impl<'a> DecoderGpu<'a> {
         // concurrent dispatch (reference-style): independent kernels within a stage
         // overlap; bar() marks the real data dependencies (this path is qwen35-only,
         // so bar() is always active here).
-        let cb = if ext.is_none() { Some(self.gpu.command_buffer()) } else { None };
-        let enc_owned = cb.as_ref().map(|c| c.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent));
-        let enc: &metal::ComputeCommandEncoderRef = match ext { Some(e) => e, None => enc_owned.as_ref().unwrap() };
+        // Without an external encoder the chunk owns its command buffers, split by
+        // layer (`pass.rs`).
+        let mut pass = ext.is_none().then(|| super::pass::SplitPass::new(self.gpu, true, self.cfg.prefill_cb_layers, m));
+        let mut enc = match ext {
+            Some(e) => e.to_owned(),
+            None => pass.as_mut().unwrap().open(),
+        };
         let ints = |enc: &metal::ComputeCommandEncoderRef, vals: &[(u64, u32)]| {
             for (idx, v) in vals { enc.set_bytes(*idx, 4, v as *const u32 as *const c_void); }
         };
@@ -223,7 +227,7 @@ impl<'a> DecoderGpu<'a> {
                 enc.dispatch_thread_groups(MTLSize::new(((d + 63)/64) as u64, 1, 1), MTLSize::new(64, 1, 1));
                 continue;
             }
-            self.embed_named_off(enc, "token_embd.weight", t, d, (i as u64)*(d as u64)*f4);
+            self.embed_named_off(&enc, "token_embd.weight", t, d, (i as u64)*(d as u64)*f4);
         }
         self.bar(&enc); // x (embeddings) ready
         // The M-row projection and norm dispatches live as methods (`chunk_gemm`,
@@ -236,6 +240,7 @@ impl<'a> DecoderGpu<'a> {
             self.rmsnorm_rows(enc, m, w)
         };
         for l in 0..self.arch.n_layers {
+            if let Some(pass) = pass.as_mut() { pass.layer(l, &mut enc); }
             let p = |s: &str| format!("blk.{l}.{s}");
             let lp = self.arch.layers[l];
             rmsnorm_m(&enc, &self.wt.w32[&p("attn_norm.weight")]);
@@ -465,13 +470,12 @@ impl<'a> DecoderGpu<'a> {
                 enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(self.tune.max_tg.min(1024), 1, 1));
             }
         }
-        if let Some(cb) = cb {
-            enc.end_encoding();
-            let _ = ojas_metal::commit_and_wait_checked(cb, "chunked prefill");
-            let (gs, ge): (f64, f64) = unsafe { (msg_send![&*cb, GPUStartTime], msg_send![&*cb, GPUEndTime]) };
-            self.gpu_s.set(self.gpu_s.get() + (ge - gs));
+        if let Some(pass) = pass {
+            let cbs = pass.command_buffers();
+            let gpu = pass.finish(&enc, "chunked prefill");
+            self.gpu_s.set(self.gpu_s.get() + gpu);
             if self.cfg.prefill_dbg {
-                tracing::trace!(target: "prefill", "chunk M={} gpu={:.1}ms", m, (ge - gs) * 1e3);
+                tracing::trace!(target: "prefill", "chunk M={} command buffers={} gpu={:.1}ms", m, cbs, gpu * 1e3);
             }
         }
     }

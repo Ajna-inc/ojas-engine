@@ -248,6 +248,8 @@ impl<'a> DecoderGpu<'a> {
                    x: &metal::Buffer, y: &metal::Buffer, k: u32, n: u32, m: u32, accum: bool) {
         let w = &self.wt.wq[wname];
         let ty = self.wt.w_qtype[wname];
+        let off = self.wt.w_off.get(wname).copied().unwrap_or(0);
+        if self.kquant_fat(ty, enc, x, w, off, y, k, n, m, accum) { return; }
         // Cooperative Q8 wins on wide projections, but loses on narrow HC
         // down projections. Four-row tiles avoid rereading weights at M=3/4.
         let cooperative = ty == 8 && self.arch.qwen4exp.is_some()
@@ -1193,11 +1195,11 @@ impl<'a> DecoderGpu<'a> {
         }
         // Native Q6_K (a Q4_K_M file's attn_qkv, kept native at prec 3). Without a
         // batched branch for this store, qwen35's chunk prefill asserts "missing MTP
-        // matrix dispatch" on the first prompt. This loops `mm()`'s own Q6_K contract
-        // row by row; `gemm_mm_q6k` is faster but load.rs records it corrupting the
-        // batched accum path, so it is not used here.
+        // matrix dispatch" on the first prompt. Prefill widths take the fat GEMM;
+        // below them this loops `mm()`'s own Q6_K contract row by row.
         if let Some(w) = self.wt.w6k.get(name) {
             let off = self.wt.w_off.get(name).copied().unwrap_or(0);
+            if self.kquant_fat(14, enc, x, w, off, y, k, n, m, accum) { return true; }
             for row in 0..m as u64 {
                 enc.set_compute_pipeline_state(&self.p[if accum { "gemv_q6k_accum" } else { "gemv_q6k" }]);
                 enc.set_buffer(0, Some(x), row * (k as u64) * 4);
@@ -1288,22 +1290,25 @@ impl<'a> DecoderGpu<'a> {
         if self.wt.q8 {
             self.gemm8_off(enc, x, x_off, &self.wt.w8[wname], &self.wt.scale8[wname], y, k, n, m, accum);
         } else if self.p.contains_key("gemm_mm_f16_fat") {
-            self.gemm16_fat(enc, x, x_off, &self.wt.w16[wname], y, k, n, m, accum);
+            self.gemm_fat(enc, "gemm_mm_f16_fat", x, x_off, &self.wt.w16[wname], 0, y, k, n, m, accum, true);
         } else {
             self.gemm16_off(enc, x, x_off, &self.wt.w16[wname], y, k, n, m, accum);
         }
     }
 
-    /// f16 GEMM through `gemm_mm_f16_fat` (fat tile, double-buffered weights), with
-    /// split-K into `st.skbuf` for the narrow shapes a short request cannot fill the
-    /// GPU with; see `ojas_metal::kernels::gemm_fat::f16_fat_splits`.
-    pub(crate) fn gemm16_fat(&self, enc: &metal::ComputeCommandEncoderRef, x: &metal::Buffer, x_off: u64,
-                  w: &metal::Buffer, y: &metal::Buffer, k: u32, n: u32, m: u32, accum: bool) {
+    /// A `gemm_fat.rs` fat GEMM (`entry` names the weight format: f16, Q4_K or Q6_K
+    /// as stored). `split_k` allows split-K into `st.skbuf` for the narrow shapes a
+    /// short request cannot fill the GPU with (see
+    /// `ojas_metal::kernels::gemm_fat::f16_fat_splits`); it needs a serial encoder,
+    /// since the reduce follows the GEMM with no barrier and every split shares one
+    /// scratch buffer.
+    pub(crate) fn gemm_fat(&self, enc: &metal::ComputeCommandEncoderRef, entry: &str, x: &metal::Buffer, x_off: u64,
+                  w: &metal::Buffer, w_off: u64, y: &metal::Buffer, k: u32, n: u32, m: u32, accum: bool, split_k: bool) {
         let scratch = (self.st.skbuf.length() / 4).min(u32::MAX as u64) as u32;
-        let nsplit = ojas_metal::kernels::gemm_fat::f16_fat_splits(m, n, k, scratch);
-        enc.set_compute_pipeline_state(&self.p["gemm_mm_f16_fat"]);
+        let nsplit = if split_k { ojas_metal::kernels::gemm_fat::f16_fat_splits(m, n, k, scratch) } else { 1 };
+        enc.set_compute_pipeline_state(&self.p[entry]);
         enc.set_buffer(0, Some(x), x_off);
-        enc.set_buffer(1, Some(w), 0);
+        enc.set_buffer(1, Some(w), w_off);
         enc.set_buffer(2, Some(if nsplit > 1 { &self.st.skbuf } else { y }), 0);
         for (i, v) in [(3u64, k), (4, n), (6, accum as u32), (7, m), (9, nsplit)] {
             enc.set_bytes(i, 4, &v as *const u32 as *const c_void);
@@ -1315,6 +1320,24 @@ impl<'a> DecoderGpu<'a> {
             self.enc_reduce(enc, "splitk_accum", &[(&self.st.skbuf, 0), (y, 1)],
                 &[(2, total), (3, nsplit), (4, accum as u32)], &[], total.div_ceil(256) as u64, 256);
         }
+    }
+
+    /// `y[M,n] = x[M,k] @ W^T` for a GGUF Q4_K (type 12) or Q6_K (14) matrix at a
+    /// prefill width, through the fat GEMM over its blocks as stored. False, having
+    /// encoded nothing, for any other type, a short M, a shape the tile does not
+    /// cover, or a GPU without simdgroup matrices; the caller then keeps its GEMV.
+    ///
+    /// The batched GEMV is what prefill ran on before: Qwen3.5 4B Q4_K_M at
+    /// precision 4, 591-token prompt, first token 7.7 s (M2 Max).
+    pub(crate) fn kquant_fat(&self, ty: u32, enc: &metal::ComputeCommandEncoderRef, x: &metal::Buffer,
+                             w: &metal::Buffer, w_off: u64, y: &metal::Buffer, k: u32, n: u32, m: u32, accum: bool) -> bool {
+        let entry = match ty { 12 => "gemm_mm_q4k_fat", 14 => "gemm_mm_q6k_fat", _ => return false };
+        if m < 8 || n % 64 != 0 || k % 256 != 0 || !self.gpu.native_reduce || !self.p.contains_key(entry) {
+            return false;
+        }
+        // No split-K: the chunk graph encodes concurrently (gate and up in flight at once).
+        self.gemm_fat(enc, entry, x, 0, w, w_off, y, k, n, m, accum, false);
+        true
     }
 
     /// Memory barrier for concurrent-dispatch encoders (qwen35/moe decode uses

@@ -18,7 +18,9 @@ use ojas_infer::SampleOpts;
 #[derive(Debug, Clone)]
 pub struct RunOpts {
     pub device: Device,
-    pub precision: u8,
+    /// Metal decoder tier; `None` lets the loader choose for the file: 3 for dense
+    /// decoders, 4 for models with experts or a vision tower.
+    pub precision: Option<u8>,
     pub n_predict: usize,
     pub prompt: Option<String>,
     pub prompt_file: Option<String>,
@@ -71,7 +73,7 @@ impl Default for RunOpts {
     fn default() -> Self {
         RunOpts {
             device: Device::Auto,
-            precision: 4,
+            precision: None,
             n_predict: 128,
             prompt: None,
             prompt_file: None,
@@ -299,7 +301,7 @@ pub fn take_run_flags(args: &mut Vec<String>) -> Result<RunOpts> {
             "--repeat-last-n" => o.sample.repeat_window = num!(&mut i),
             "-s" | "--seed" => o.sample.seed = num!(&mut i),
             "--device" => o.device = Device::parse(&take(&mut i)?)?,
-            "--precision" => o.precision = num!(&mut i),
+            "--precision" => o.precision = Some(num!(&mut i)),
             "--host" => o.host = take(&mut i)?,
             "--port" => {
                 o.port = num!(&mut i);

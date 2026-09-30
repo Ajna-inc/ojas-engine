@@ -572,6 +572,7 @@ dependencies = [
  "objc",
  "ojas-core",
  "ojas-cpu",
+ "ojas-formats",
 ]
 
 [[package]]

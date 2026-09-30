@@ -124,6 +124,11 @@ pub struct EngineConfig {
     pub ubatch: usize,
     /// OJAS_SNAP — SSM snapshot ladder interval in tokens (≥256).
     pub snap_interval: usize,
+    /// OJAS_PREFILL_CB_LAYERS — layers per command buffer in a batched prefill, so no
+    /// one command buffer holds the GPU long enough for macOS to end it ("Impacting
+    /// Interactivity"); see `ojas-models` `decoder/pass.rs`. 0 keeps each chunk in
+    /// one command buffer.
+    pub prefill_cb_layers: usize,
     /// OJAS_PREFILL_DBG — prefill debug prints.
     pub prefill_dbg: bool,
     /// OJAS_NO_PREFIX_REUSE — disable cross-turn KV-prefix reuse (dense + SSM),
@@ -301,6 +306,10 @@ impl EngineConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(2048)
                 .max(256),
+            prefill_cb_layers: var("OJAS_PREFILL_CB_LAYERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
             prefill_dbg: flag("OJAS_PREFILL_DBG"),
             no_prefix_reuse: flag("OJAS_NO_PREFIX_REUSE"),
             moe_dbuf: flag("OJAS_MOE_DBUF"),
