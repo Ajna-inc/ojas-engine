@@ -422,7 +422,11 @@ impl<'a> DecoderGpu<'a> {
             // separate lm_head (output.weight) — using token_embd here gives garbage.
             // MMA GEMM (vocab 152064 %64==0).
             let vocab = self.arch.vocab as u32;
-            if let Some(w) = self.wt.w6k.get(&self.arch.lm_head) {
+            let lm_off = self.wt.w_off.get(&self.arch.lm_head).copied().unwrap_or(0);
+            if self.wt.w6k.get(&self.arch.lm_head).is_some_and(|w|
+                self.kquant_fat(14, &enc, &self.st.h, w, lm_off, &self.st.logits, d, vocab, m, false)) {
+                // Native Q6_K head at a prefill width: the fat GEMM.
+            } else if let Some(w) = self.wt.w6k.get(&self.arch.lm_head) {
                 // Native Q6_K head. Requires a full 64-wide N tile and 256-aligned K
                 // (one super-block); every real vocab/hidden pair satisfies both.
                 enc.set_compute_pipeline_state(&self.p["gemm_mm_q6k"]);

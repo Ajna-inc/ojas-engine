@@ -19,7 +19,7 @@ use ojas_infer::SampleOpts;
 pub struct RunOpts {
     pub device: Device,
     /// Metal decoder tier; `None` lets the loader choose for the file: 3 for dense
-    /// decoders, 4 for models with experts or a vision tower.
+    /// decoders, 4 for models with experts.
     pub precision: Option<u8>,
     pub n_predict: usize,
     pub prompt: Option<String>,

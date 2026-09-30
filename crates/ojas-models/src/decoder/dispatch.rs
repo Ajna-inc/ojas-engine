@@ -365,9 +365,13 @@ impl<'a> DecoderGpu<'a> {
             enc.dispatch_thread_groups(MTLSize::new(((n + 7) / 8) as u64, 1, 1), MTLSize::new(256, 1, 1));
             return;
         }
-        // Native Q4_K path (faithful dequant in-kernel). plain/accum only.
-        if let Some(w) = self.wt.w4k.get(wname) {
-            enc.set_compute_pipeline_state(&self.p[if kind == "accum" { "gemv_q4k_accum" } else { "gemv_q4k" }]);
+        // Native Q4_K / Q6_K kept in their own maps (a Q6_K token table, prec 3's
+        // all-native fallback): the same blocks `wq` holds, so the same native GEMV
+        // bodies (`NAT_GEMV_Q4K`/`NAT_GEMV_Q6K`). plain/accum only.
+        for (map, ty) in [(&self.wt.w4k, 12u32), (&self.wt.w6k, 14)] {
+            let Some(w) = map.get(wname) else { continue };
+            let tag = if ty == 12 { "q4k" } else { "q6k" };
+            enc.set_compute_pipeline_state(&self.p[&if kind == "accum" { format!("gemv_nat_{tag}_accum") } else { format!("gemv_nat_{tag}") }]);
             enc.set_buffer(0, Some(x), 0);
             // Zero-copy buffers start at a page boundary below the tensor; the
             // leftover bytes ride in `w_off`. Copied buffers have no offset.
@@ -375,10 +379,8 @@ impl<'a> DecoderGpu<'a> {
             enc.set_buffer(2, Some(y), 0);
             enc.set_bytes(3, 4, &k as *const u32 as *const c_void);
             enc.set_bytes(4, 4, &n as *const u32 as *const c_void);
-            // 64 threads, not 256: autotune picks 64 for the tuned Q4/Q8 families on
-            // these shapes, and 256 (8 rows/tg) leaves the Apple scheduler with too
-            // few groups to hide memory latency.
-            enc.dispatch_thread_groups(MTLSize::new(((n + 1) / 2) as u64, 1, 1), MTLSize::new(64, 1, 1));
+            let (threads, rows) = ojas_metal::kernels::nat::nat_launch(ty).expect("K-quant launch shape");
+            enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(rows) as u64, 1, 1), MTLSize::new(threads as u64, 1, 1));
             return;
         }
         // Q4L: Q4_K values in the tuned layout. 4 output rows per simdgroup, so the
@@ -404,20 +406,6 @@ impl<'a> DecoderGpu<'a> {
             let t = self.q4l_threads(k, n);
             let rows = t / 32 * 4;                      // 4 rows per simdgroup
             enc.dispatch_thread_groups(MTLSize::new(((n + rows - 1) / rows) as u64, 1, 1), MTLSize::new(t as u64, 1, 1));
-            return;
-        }
-        // Native Q6_K path — same contract as Q4_K above (plain/accum only).
-        if let Some(w) = self.wt.w6k.get(wname) {
-            enc.set_compute_pipeline_state(&self.p[if kind == "accum" { "gemv_q6k_accum" } else { "gemv_q6k" }]);
-            enc.set_buffer(0, Some(x), 0);
-            enc.set_buffer(1, Some(w), self.wt.w_off.get(wname).copied().unwrap_or(0));
-            enc.set_buffer(2, Some(y), 0);
-            enc.set_bytes(3, 4, &k as *const u32 as *const c_void);
-            enc.set_bytes(4, 4, &n as *const u32 as *const c_void);
-            // 64 threads, not 256: autotune picks 64 for the tuned Q4/Q8 families on
-            // these shapes, and 256 (8 rows/tg) leaves the Apple scheduler with too
-            // few groups to hide memory latency.
-            enc.dispatch_thread_groups(MTLSize::new(((n + 1) / 2) as u64, 1, 1), MTLSize::new(64, 1, 1));
             return;
         }
         // Native Q4 path (o_proj/ffn_down/lm_head are plain/accum, no bias). Long-K
@@ -1193,6 +1181,22 @@ impl<'a> DecoderGpu<'a> {
             enc.dispatch_thread_groups(MTLSize::new(((n + 7) / 8) as u64, 1, 1), MTLSize::new(256, 1, 1));
             return true;
         }
+        // Native Q4_K: the fat GEMM at prefill widths, else `mm()`'s own Q4_K
+        // contract row by row.
+        if let Some(w) = self.wt.w4k.get(name) {
+            let off = self.wt.w_off.get(name).copied().unwrap_or(0);
+            if self.kquant_fat(12, enc, x, w, off, y, k, n, m, accum) { return true; }
+            for row in 0..m as u64 {
+                enc.set_compute_pipeline_state(&self.p[if accum { "gemv_q4k_accum" } else { "gemv_q4k" }]);
+                enc.set_buffer(0, Some(x), row * (k as u64) * 4);
+                enc.set_buffer(1, Some(w), off);
+                enc.set_buffer(2, Some(y), row * (n as u64) * 4);
+                enc.set_bytes(3, 4, &k as *const u32 as *const c_void);
+                enc.set_bytes(4, 4, &n as *const u32 as *const c_void);
+                enc.dispatch_thread_groups(MTLSize::new(((n + 1) / 2) as u64, 1, 1), MTLSize::new(64, 1, 1));
+            }
+            return true;
+        }
         // Native Q6_K (a Q4_K_M file's attn_qkv, kept native at prec 3). Without a
         // batched branch for this store, qwen35's chunk prefill asserts "missing MTP
         // matrix dispatch" on the first prompt. Prefill widths take the fat GEMM;
@@ -1282,13 +1286,14 @@ impl<'a> DecoderGpu<'a> {
         enc.dispatch_thread_groups(MTLSize::new(((m + 31) / 32) as u64, (n / 64) as u64, 1), MTLSize::new(128, 1, 1));
     }
 
-    /// Precision-aware projection for the diffusion forward: Q8 (w8+scale8) when quantized,
-    /// else f16 (w16). Lets forward_diffusion_range run at either precision from one code path.
+    /// Projection over a weight stored as Q8 (w8+scale8) or f16 (w16), whichever the
+    /// loader chose for it. Serves the diffusion forward at either precision and the
+    /// vision tower, which stays f16 at every precision.
     pub(crate) fn projm(&self, enc: &metal::ComputeCommandEncoderRef, x: &metal::Buffer, x_off: u64,
              wname: &str, y: &metal::Buffer, k: u32, n: u32, m: u32, accum: bool) {
         self.check_shape(wname, k, n);
-        if self.wt.q8 {
-            self.gemm8_off(enc, x, x_off, &self.wt.w8[wname], &self.wt.scale8[wname], y, k, n, m, accum);
+        if let (Some(w), Some(s)) = (self.wt.w8.get(wname), self.wt.scale8.get(wname)) {
+            self.gemm8_off(enc, x, x_off, w, s, y, k, n, m, accum);
         } else if self.p.contains_key("gemm_mm_f16_fat") {
             self.gemm_fat(enc, "gemm_mm_f16_fat", x, x_off, &self.wt.w16[wname], 0, y, k, n, m, accum, true);
         } else {

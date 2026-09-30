@@ -96,9 +96,9 @@ pub const FORMATS: &[QFormat] = &[
     // K-quants: 8 sub-blocks of 32
     QFormat { tag: "q2k",    walker: "Q2K",    ty: 10, block_bytes: 84,  weights: 256, subs: 8, needs_grids: false , nr0: 4, nsg: 2, fast_body: None },
     QFormat { tag: "q3k",    walker: "Q3K",    ty: 11, block_bytes: 110, weights: 256, subs: 8, needs_grids: false , nr0: 2, nsg: 2, fast_body: Some("NAT_GEMV_Q3K") },
-    QFormat { tag: "q4k",    walker: "Q4K",    ty: 12, block_bytes: 144, weights: 256, subs: 8, needs_grids: false , nr0: 2, nsg: 2, fast_body: None },
+    QFormat { tag: "q4k",    walker: "Q4K",    ty: 12, block_bytes: 144, weights: 256, subs: 8, needs_grids: false , nr0: 2, nsg: 2, fast_body: Some("NAT_GEMV_Q4K") },
     QFormat { tag: "q5k",    walker: "Q5K",    ty: 13, block_bytes: 176, weights: 256, subs: 8, needs_grids: false , nr0: 1, nsg: 2, fast_body: Some("NAT_GEMV_Q5K") },
-    QFormat { tag: "q6k",    walker: "Q6K",    ty: 14, block_bytes: 210, weights: 256, subs: 8, needs_grids: false , nr0: 2, nsg: 2, fast_body: None },
+    QFormat { tag: "q6k",    walker: "Q6K",    ty: 14, block_bytes: 210, weights: 256, subs: 8, needs_grids: false , nr0: 2, nsg: 2, fast_body: Some("NAT_GEMV_Q6K") },
     QFormat { tag: "iq4xs",  walker: "IQ4XS",  ty: 23, block_bytes: 136, weights: 256, subs: 8, needs_grids: false , nr0: 2, nsg: 2, fast_body: Some("NAT_GEMV_IQ4XS") },
     // IQ family: 8 sub-blocks of 32, codebook-driven
     QFormat { tag: "iq1s",   walker: "IQ1S",   ty: 19, block_bytes: 50,  weights: 256, subs: 8, needs_grids: true , nr0: 4, nsg: 2, fast_body: Some("NAT_GEMV_IQ1S") },
@@ -756,6 +756,109 @@ pub const GEMV_BODIES: &str = r#"
                 uint _nb5 = _hf5 ? (uint(_ql[_l])>>4) : (uint(_ql[_l])&0x0Fu); \
                 _q5 += _yl[_l]*(float(_nb5)+_h5); } \
             _sumf[_r] += _d*float(_s5)*_q5 - _dm*float(_m5)*_ysum; \
+        } \
+    } \
+    QUNROLL for (uint _r = 0u; _r < (NR); _r++) { \
+        float acc = QSUM(_sumf[_r]); \
+        if (lane == 0u && _row0+_r < N) { uint n = _row0+_r; STORE; } \
+    }
+
+// Q4_K, specialized. The generic body reads one 32-weight sub-block per lane and
+// re-derives its 6-bit scale and min from the packed bytes for every row, which
+// held Q4_K at 289 Gw/s (K=2560, N=9216, M2 Max) against the tuned Q4L layout's
+// ~530 on the same weights.
+//
+// Here eight lanes share a super-block and four super-blocks are in flight per
+// simdgroup. Lane (ix, iq, ir) = (lane/8, lane%8/4, lane%4) owns eight weights of
+// each of the sub-blocks 2iq, 2iq+1, 2iq+4 and 2iq+5, so its 32 activations and
+// their four sums are loaded once per super-block and reused across all NR rows.
+// The quants are read as 16-bit words: masking a word leaves nibble v at a fixed
+// power-of-two multiple (v, 16v, 256v, 4096v), which the scale absorbs, and the
+// four scales/mins the lane needs come out of three words with the kmask ops.
+// The min term is -dmin*m*SUM(y), once per sub-block, as in Q5_K.
+#define NAT_GEMV_Q4K(WALK_SUB, BLKB, WPB, SUBS, SUBW, NR, STORE) \
+    uint _row0 = (tgid*(ts/32u) + sgid) * (NR); \
+    if (_row0 >= N) { return; } \
+    uint nb = K/256u; \
+    uint _ix = lane/8u, _iq = (lane%8u)/4u, _ir = lane%4u; \
+    float _sumf[NR]; \
+    QUNROLL for (uint _r = 0u; _r < (NR); _r++) { _sumf[_r] = 0.0f; } \
+    float _yl[16], _yh[16]; \
+    for (uint _ib = _ix; _ib < nb; _ib += 4u) { \
+        QG float* _y4 = x + (QU64)_ib*256u + 64u*_iq + 8u*_ir; \
+        float _s0 = 0.0f, _s1 = 0.0f, _s2 = 0.0f, _s3 = 0.0f; \
+        QUNROLL for (uint _i = 0u; _i < 8u; _i++) { \
+            _yl[_i] = _y4[_i];         _s0 += _yl[_i]; \
+            _yl[_i+8u] = _y4[_i+32u];  _s1 += _yl[_i+8u]; \
+            _yh[_i] = _y4[_i+128u];    _s2 += _yh[_i]; \
+            _yh[_i+8u] = _y4[_i+160u]; _s3 += _yh[_i+8u]; } \
+        QUNROLL for (uint _r = 0u; _r < (NR); _r++) { \
+            if (_row0+_r >= N) { break; } \
+            QG uchar* _b = w + ((QU64)(_row0+_r)*(QU64)nb + _ib)*144u; \
+            QG ushort* _sw = (QG ushort*)(_b + 4u) + _iq; \
+            uint _w0 = _sw[0], _w2 = _sw[2], _w4 = _sw[4]; \
+            uint _sc01 = _w0 & 0x3F3Fu, _mn01 = _w2 & 0x3F3Fu; \
+            uint _sc45 = (_w4 & 0x0F0Fu) | ((_w0 & 0xC0C0u) >> 2); \
+            uint _mn45 = ((_w4 >> 4) & 0x0F0Fu) | ((_w2 & 0xC0C0u) >> 2); \
+            QG ushort* _q1 = (QG ushort*)(_b + 16u) + 16u*_iq + 4u*_ir; \
+            QG ushort* _q2 = _q1 + 32u; \
+            float _a0 = 0.0f, _a1 = 0.0f, _a2 = 0.0f, _a3 = 0.0f; \
+            float _c0 = 0.0f, _c1 = 0.0f, _c2 = 0.0f, _c3 = 0.0f; \
+            QUNROLL for (uint _i = 0u; _i < 8u; _i += 2u) { \
+                uint _u1 = _q1[_i/2u], _u2 = _q2[_i/2u]; \
+                _a0 += _yl[_i]*float(_u1 & 0x000Fu);    _a1 += _yl[_i+1u]*float(_u1 & 0x0F00u); \
+                _a2 += _yl[_i+8u]*float(_u1 & 0x00F0u); _a3 += _yl[_i+9u]*float(_u1 & 0xF000u); \
+                _c0 += _yh[_i]*float(_u2 & 0x000Fu);    _c1 += _yh[_i+1u]*float(_u2 & 0x0F00u); \
+                _c2 += _yh[_i+8u]*float(_u2 & 0x00F0u); _c3 += _yh[_i+9u]*float(_u2 & 0xF000u); } \
+            _sumf[_r] += QF16(_b) * ((_a0 + _a1*(1.0f/256.0f))*float(_sc01 & 0xFFu) \
+                                   + (_a2 + _a3*(1.0f/256.0f))*float(_sc01 >> 8)*(1.0f/16.0f) \
+                                   + (_c0 + _c1*(1.0f/256.0f))*float(_sc45 & 0xFFu) \
+                                   + (_c2 + _c3*(1.0f/256.0f))*float(_sc45 >> 8)*(1.0f/16.0f)) \
+                       - QF16(_b + 2u) * (_s0*float(_mn01 & 0xFFu) + _s1*float(_mn01 >> 8) \
+                                        + _s2*float(_mn45 & 0xFFu) + _s3*float(_mn45 >> 8)); \
+        } \
+    } \
+    QUNROLL for (uint _r = 0u; _r < (NR); _r++) { \
+        float acc = QSUM(_sumf[_r]); \
+        if (lane == 0u && _row0+_r < N) { uint n = _row0+_r; STORE; } \
+    }
+
+// Q6_K, specialized on the same plan: sixteen lanes share a super-block and two
+// super-blocks are in flight. Lane (ix, ip, il) = (lane%2, lane/16, lane/2%8)
+// owns weights l0..l0+3 (l0 = 4il) of each quarter of half ip, which share one
+// qh byte per l and one int8 scale per quarter, so the 16 activations are loaded
+// once per super-block and reused across all NR rows. The generic body measured
+// 282 Gw/s here. Scales are signed bytes, read as (b ^ 0x80) - 128 so the
+// arithmetic does not depend on the dialect's `char` signedness.
+#define NAT_GEMV_Q6K(WALK_SUB, BLKB, WPB, SUBS, SUBW, NR, STORE) \
+    uint _row0 = (tgid*(ts/32u) + sgid) * (NR); \
+    if (_row0 >= N) { return; } \
+    uint nb = K/256u; \
+    uint _ix = lane%2u, _ip = lane/16u, _l0 = 4u*((lane/2u)%8u); \
+    uint _is = 8u*_ip + _l0/16u, _yo = 128u*_ip + _l0; \
+    uint _qol = 64u*_ip + _l0, _qoh = 128u + 32u*_ip + _l0; \
+    float _sumf[NR]; \
+    QUNROLL for (uint _r = 0u; _r < (NR); _r++) { _sumf[_r] = 0.0f; } \
+    float _yv[16]; \
+    for (uint _ib = _ix; _ib < nb; _ib += 2u) { \
+        QG float* _y = x + (QU64)_ib*256u + _yo; \
+        QUNROLL for (uint _l = 0u; _l < 4u; _l++) { \
+            _yv[_l] = _y[_l]; _yv[4u+_l] = _y[_l+32u]; _yv[8u+_l] = _y[_l+64u]; _yv[12u+_l] = _y[_l+96u]; } \
+        QUNROLL for (uint _r = 0u; _r < (NR); _r++) { \
+            if (_row0+_r >= N) { break; } \
+            QG uchar* _b = w + ((QU64)(_row0+_r)*(QU64)nb + _ib)*210u; \
+            QG uchar* _q1 = _b + _qol; QG uchar* _q2 = _q1 + 32u; QG uchar* _qh = _b + _qoh; \
+            QG uchar* _sc = _b + 192u + _is; \
+            float _t0 = 0.0f, _t1 = 0.0f, _t2 = 0.0f, _t3 = 0.0f; \
+            QUNROLL for (uint _l = 0u; _l < 4u; _l++) { \
+                uint _h = _qh[_l], _v1 = _q1[_l], _v2 = _q2[_l]; \
+                _t0 += _yv[_l]    *float(int((_v1 & 0x0Fu) | ((_h & 0x03u) << 4)) - 32); \
+                _t1 += _yv[4u+_l] *float(int((_v2 & 0x0Fu) | ((_h & 0x0Cu) << 2)) - 32); \
+                _t2 += _yv[8u+_l] *float(int((_v1 >> 4)    |  (_h & 0x30u))       - 32); \
+                _t3 += _yv[12u+_l]*float(int((_v2 >> 4)    | ((_h & 0xC0u) >> 2)) - 32); } \
+            _sumf[_r] += QF16(_b + 208u) * ( \
+                  _t0*float(int(uint(_sc[0]) ^ 0x80u) - 128) + _t1*float(int(uint(_sc[2]) ^ 0x80u) - 128) \
+                + _t2*float(int(uint(_sc[4]) ^ 0x80u) - 128) + _t3*float(int(uint(_sc[6]) ^ 0x80u) - 128)); \
         } \
     } \
     QUNROLL for (uint _r = 0u; _r < (NR); _r++) { \

@@ -89,7 +89,7 @@ its positionals. They use llama.cpp's names where one exists.
 
 | flag | effect |
 |---|---|
-| `--precision N` | decoder precision tier (default 4, disk-streamed experts) |
+| `--precision N` | decoder precision tier (default: 3 for dense models, 4 for models with experts, whose weights stream from disk) |
 | `--mixed-q4 …` | mixed-precision presets applied at load |
 | `--q4-head` / `--no-q4-head` | quantize the output head |
 | `--q4-ffn-down` / `--no-q4-ffn-down` / `--q4-ffn-down-last N` | quantize FFN down projections |
@@ -132,6 +132,7 @@ disable rather than assigning `0`.
 | `OJAS_MTP`, `OJAS_NO_SPEC` | draft model; disable speculative decoding |
 | `OJAS_MMPROJ` | vision projector |
 | `OJAS_NO_MMAP`, `OJAS_PREWARM`, `OJAS_UBATCH`, `OJAS_TOPK` | loading and decode behaviour |
+| `OJAS_PREFILL_CB_LAYERS` | layers per GPU command buffer during prompt processing (default 1; 0 keeps each chunk in one) |
 | `OJAS_CACHE_DIR` | compiled-kernel cache |
 | `OJAS_LOG` | log level, e.g. `OJAS_LOG=debug` |
 
