@@ -45,9 +45,20 @@ pub struct Bpe {
     scores: Vec<f32>,               // SPM: per-token score (higher merges first)
     spm: bool,                      // true = SentencePiece score-BPE (model="llama", gemma3)
     g4: bool,                       // gemma-4: SPM-style BPE (▁ spaces, merge-by-rank, <0xXX> fallback)
+    /// SPM-style BPE options, as Hugging Face's `Metaspace` pre-tokenizer spells them:
+    /// prepend `▁` to each text segment that does not start with one
+    /// (`tokenizer.ggml.add_space_prefix`), and split into words before every `▁` so
+    /// merges never cross a word (`tokenizer.ggml.pre = "metaspace"`). Both are off for
+    /// gemma-4, which does neither.
+    g4_prefix: bool,
+    g4_split: bool,
     enc: HashMap<u8, char>,
     dec: HashMap<char, u8>,
     specials: Vec<(String, usize)>, // (literal string, id), longest first
+    /// Contraction matching of the GPT2-family pre-tokenizer. The original GPT-2
+    /// pattern (`'s|'t|'re|...`) is case-sensitive; the Llama-3/Qwen pattern wraps it
+    /// in `(?i:...)`. Selected from `tokenizer.ggml.pre`.
+    contractions: Contractions,
     /// Ids of CONTROL(3)/USER_DEFINED(4) tokens. Their GGUF text is literal UTF-8
     /// rather than gpt2 byte-encoded, so it must not be mapped back through `dec`:
     /// a real 0x20 in the text has no `dec` entry (space is `\u{0120}` there) and is
@@ -77,6 +88,12 @@ impl Bpe {
         };
         let spm = model == "llama" || model == "gemma" || model == "gemma2"; // score-based SPM
         let g4 = model == "gemma4";                                          // rank-based SPM-style BPE
+        let pre = match g.meta.get("tokenizer.ggml.pre") {
+            Some(ojas_formats::gguf::Meta::Str(p)) => p.clone(),
+            _ => String::new(),
+        };
+        let g4_prefix = g4 && matches!(g.meta.get("tokenizer.ggml.add_space_prefix"), Some(ojas_formats::gguf::Meta::Bool(true)));
+        let g4_split = g4 && pre == "metaspace";
         let scores = g.float_arr("tokenizer.ggml.scores").cloned().unwrap_or_default();
         // special tokens: CONTROL(3) / USER_DEFINED(4) — matched atomically in raw text.
         let mut specials: Vec<(String, usize)> = Vec::new();
@@ -91,7 +108,8 @@ impl Bpe {
         }
         specials.sort_by(|a, b| b.0.len().cmp(&a.0.len())); // longest first
         let (enc, dec) = byte_maps();
-        Bpe { tokens, vocab, ranks, scores, spm, g4, enc, dec, specials, literal }
+        let contractions = Contractions::for_pre(&pre);
+        Bpe { tokens, vocab, ranks, scores, spm, g4, g4_prefix, g4_split, enc, dec, specials, contractions, literal }
     }
 
     pub fn encode(&self, text: &str) -> Vec<usize> {
@@ -133,6 +151,19 @@ impl Bpe {
         // (first word has no ▁; internal spaces become ▁).
         let mut norm = String::new();
         for c in text.chars() { norm.push(if c == ' ' { '\u{2581}' } else { c }); }
+        if self.g4_prefix && !norm.starts_with('\u{2581}') { norm.insert(0, '\u{2581}'); }
+        if !self.g4_split { return self.bpe_g4_word(&norm, out); }
+        // Split before every ▁, each word keeping its leading ▁ ("▁a▁▁b" → "▁a", "▁", "▁b").
+        let mut start = 0usize;
+        for (i, c) in norm.char_indices() {
+            if c == '\u{2581}' && i > start { self.bpe_g4_word(&norm[start..i], out); start = i; }
+        }
+        if start < norm.len() { self.bpe_g4_word(&norm[start..], out); }
+    }
+
+    /// Rank-ordered merges over one span of characters, then `<0xXX>` byte fallback
+    /// for any piece the vocabulary lacks.
+    fn bpe_g4_word(&self, norm: &str, out: &mut Vec<usize>) {
         let mut parts: Vec<String> = norm.chars().map(|c| c.to_string()).collect();
         if parts.is_empty() { return; }
         while parts.len() > 1 {
@@ -186,7 +217,7 @@ impl Bpe {
     }
 
     fn encode_ordinary(&self, text: &str, out: &mut Vec<usize>) {
-        for word in pretokenize(text) {
+        for word in pretokenize(text, self.contractions) {
             // byte-encode the pre-token to the GPT2 byte-char alphabet
             let piece: String = word.bytes().map(|b| self.enc[&b]).collect();
             self.bpe_word(&piece, out);
@@ -260,11 +291,47 @@ impl Bpe {
     }
 }
 
+/// How the GPT2-family pre-tokenizer matches the contractions `'s 't 're 've 'm 'll 'd`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Contractions {
+    /// `(?i:'s|'t|...)`: Llama-3, Qwen and most recent BPE vocabularies.
+    #[default]
+    CaseInsensitive,
+    /// `'s|'t|...`: the original GPT-2 pattern (llama.cpp `LLAMA_VOCAB_PRE_TYPE_GPT2`
+    /// and the pre-types that share its regex).
+    CaseSensitive,
+}
+
+impl Contractions {
+    /// Pre-tokenizer names whose regex is the case-sensitive GPT-2 pattern, following
+    /// the `tokenizer.ggml.pre` mapping in llama.cpp's `llama-vocab.cpp`.
+    const CASE_SENSITIVE_PRE: &'static [&'static str] = &[
+        "gpt-2", "phi-2", "modern-bert", "roberta-bpe", "olmo", "mpt", "jais", "trillion",
+        "jina-es", "jina-de", "jina-v1-en", "jina-v2-es", "jina-v2-de", "jina-v2-code",
+        "gigachat", "mellum", "exaone4", "a.x-4.0", "granite-docling",
+    ];
+
+    pub fn for_pre(pre: &str) -> Self {
+        if Self::CASE_SENSITIVE_PRE.contains(&pre) { Self::CaseSensitive } else { Self::CaseInsensitive }
+    }
+
+    /// Length in chars of the contraction starting at `ch[i]` (an apostrophe), or 0.
+    fn match_len(self, ch: &[char], i: usize) -> usize {
+        let fold = |c: char| if self == Self::CaseInsensitive { c.to_ascii_lowercase() } else { c };
+        let at = |k: usize| ch.get(i + k).copied().map(fold);
+        match (at(1), at(2)) {
+            (Some('l'), Some('l')) | (Some('r'), Some('e')) | (Some('v'), Some('e')) => 3,
+            (Some('s' | 't' | 'm' | 'd'), _) => 2,
+            _ => 0,
+        }
+    }
+}
+
 /// GPT2-family pre-tokenizer (hand-rolled; the `regex` crate lacks the lookahead
 /// the real pattern uses). Splits into: contractions, optional-single-leading-space
 /// + a same-category run (letters / digits / other), and whitespace runs (BPE then
 /// merges "ĠĠ…"). Good enough that prompt tokenization matches real BPE on ordinary text.
-fn pretokenize(text: &str) -> Vec<String> {
+fn pretokenize(text: &str, contractions: Contractions) -> Vec<String> {
     let ch: Vec<char> = text.chars().collect();
     let n = ch.len();
     let cat = |c: char| -> u8 { if c.is_alphabetic() { 1 } else if c.is_numeric() { 2 } else { 3 } };
@@ -272,15 +339,11 @@ fn pretokenize(text: &str) -> Vec<String> {
     let mut i = 0;
     while i < n {
         let c = ch[i];
-        // contractions: 's 't 're 've 'm 'll 'd (case-insensitive, like llama-bpe)
-        if c == '\'' && i + 1 < n {
-            let two: String = ch[i + 1..(i + 3).min(n)].iter().collect::<String>().to_lowercase();
-            let one = two.chars().next().unwrap_or(' ');
-            let m2 = ["ll", "re", "ve"].iter().find(|p| two.starts_with(*p));
-            if let Some(p) = m2 { out.push(format!("'{p}")); i += 3; continue; }
-            if "std".contains(one) || one == 'm' {
-                out.push(format!("'{one}")); i += 2; continue;
-            }
+        // A contraction is emitted as written: case folding only decides whether it
+        // matches, it never changes the text that reaches BPE.
+        if c == '\'' {
+            let len = contractions.match_len(&ch, i);
+            if len > 0 { out.push(ch[i..i + len].iter().collect()); i += len; continue; }
         }
         if c.is_whitespace() {
             // maximal whitespace run; if followed by a non-ws char, the last ws char
@@ -532,4 +595,71 @@ pub fn eog_token_ids(g: &ojas_formats::gguf::Gguf, arch: &str) -> Vec<u32> {
         by_text(chat_eos(arch));
     }
     ids
+}
+
+#[cfg(test)]
+mod pretokenize_tests {
+    use super::{pretokenize, Contractions};
+
+    #[test]
+    fn contractions_keep_their_case() {
+        let got = pretokenize("THEY'RE here", Contractions::CaseInsensitive);
+        assert_eq!(got, ["THEY", "'RE", " here"]);
+    }
+
+    #[test]
+    fn case_sensitive_pattern_only_matches_lowercase() {
+        assert_eq!(pretokenize("THEY'RE", Contractions::CaseSensitive), ["THEY", "'", "RE"]);
+        assert_eq!(pretokenize("they're", Contractions::CaseSensitive), ["they", "'re"]);
+        assert_eq!(pretokenize("don't I'll", Contractions::CaseSensitive), ["don", "'t", " I", "'ll"]);
+    }
+
+    #[test]
+    fn pre_names_select_the_pattern() {
+        assert_eq!(Contractions::for_pre("modern-bert"), Contractions::CaseSensitive);
+        assert_eq!(Contractions::for_pre("gpt-2"), Contractions::CaseSensitive);
+        assert_eq!(Contractions::for_pre("llama-bpe"), Contractions::CaseInsensitive);
+        assert_eq!(Contractions::for_pre("qwen2"), Contractions::CaseInsensitive);
+    }
+}
+
+#[cfg(test)]
+mod metaspace_tests {
+    use super::{byte_maps, Bpe, Contractions};
+    use std::collections::HashMap;
+
+    /// A vocabulary where the merges could join words if nothing stopped them:
+    /// `▁▁` exists, so "a  b" without the word split would merge the two spaces.
+    fn bpe(prefix: bool, split: bool) -> Bpe {
+        let tokens: Vec<String> = ["▁", "a", "b", "▁a", "▁b", "▁▁", "<0x21>"].iter().map(|s| s.to_string()).collect();
+        let vocab: HashMap<String, usize> = tokens.iter().enumerate().map(|(i, t)| (t.clone(), i)).collect();
+        let ranks: HashMap<(String, String), usize> = [("▁", "▁"), ("▁", "a"), ("▁", "b")].iter().enumerate()
+            .map(|(r, (x, y))| ((x.to_string(), y.to_string()), r)).collect();
+        let (enc, dec) = byte_maps();
+        Bpe {
+            tokens, vocab, ranks, scores: Vec::new(), spm: false, g4: true, g4_prefix: prefix, g4_split: split,
+            enc, dec, specials: Vec::new(), contractions: Contractions::default(), literal: Default::default(),
+        }
+    }
+
+    fn pieces(b: &Bpe, text: &str) -> Vec<String> {
+        b.encode(text).into_iter().map(|i| b.tokens[i].clone()).collect()
+    }
+
+    #[test]
+    fn metaspace_prefixes_and_splits_words() {
+        let b = bpe(true, true);
+        assert_eq!(pieces(&b, "a  b"), ["▁a", "▁", "▁b"]);
+        // An existing leading space is the prefix; no second one is added.
+        assert_eq!(pieces(&b, " a"), ["▁a"]);
+        // Unknown characters fall back to bytes.
+        assert_eq!(pieces(&b, "a!"), ["▁a", "<0x21>"]);
+    }
+
+    #[test]
+    fn gemma4_mode_is_unchanged() {
+        // No prefix and no split: the ranks may merge across the double space.
+        let b = bpe(false, false);
+        assert_eq!(pieces(&b, "a  b"), ["a", "▁▁", "b"]);
+    }
 }

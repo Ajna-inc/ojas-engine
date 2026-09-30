@@ -10,6 +10,8 @@
 
 mod backend;
 mod cmds;
+#[cfg(target_os = "macos")]
+mod decide;
 mod detok;
 mod flags;
 mod ocr;
@@ -36,6 +38,7 @@ usage:
   ojas detect <model.onnx> <image|dir>  object detection (CPU; --conf --iou --json)
   ojas plate  <det.onnx> <rec.onnx> <dict.txt> <image|dir>  detect + read plates
   ojas vbench <model.onnx>              vision forward-pass timing
+  ojas decide <laya.gguf>               typed decisions (Laya, Metal; serve and bench take one too)
 ";
 
 // No `\` line-continuation: it would strip the leading indent off the first
@@ -89,7 +92,9 @@ runtime flags:
          --host H --port P   serve address (default 127.0.0.1:8080)
   -r,    --reps N         bench repetitions (default 3)
          --conf N --iou N  vision thresholds (detect/plate)
-         --json           vision: JSON output
+         --json           detect/decide: JSON output
+         --state S / --state-file F          decide: JSON object or text to decide about
+         --questions Q / --questions-file F  decide: {id: {type, instructions, criteria}}
 ";
 
 fn main() -> Result<()> {
@@ -125,6 +130,10 @@ fn main() -> Result<()> {
         Some("plate") => vision::plate(need(2)?, need(3)?, need(4)?, need(5)?, &opts),
         Some("vbench") => vision::vbench(need(2)?, &opts),
         Some("vision-serve") => vserve::vision_serve(need(2)?, &opts),
+        #[cfg(target_os = "macos")]
+        Some("decide") => decide::decide(need(2)?, &opts),
+        #[cfg(not(target_os = "macos"))]
+        Some("decide") => anyhow::bail!("`decide` needs the Metal backend and is not built on this platform"),
 
         #[cfg(target_os = "macos")]
         Some("worker") if a.len() >= 7 => ojas_swarm::worker(

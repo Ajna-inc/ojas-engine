@@ -490,14 +490,20 @@ pub fn silu(x: f32) -> f32 { x / (1.0 + (-x).exp()) }
 ///
 /// Not the erf form. The two differ by ~1e-3 around |x| ≈ 2, and
 /// `kernels/gemm_fat.rs:626` records that a more accurate variant moved a
-/// logits checksum by 0.20%. Every GELU in the tree — CPU and Metal
-/// (`kernels/prelude.rs` `ffn_act(g, 1u)`) — must be this expression in this
-/// association order.
+/// logits checksum by 0.20%. Every model whose reference uses the tanh form —
+/// CPU and Metal (`kernels/prelude.rs` `ffn_act(g, 1u)`) — must use this
+/// expression in this association order. Models trained with PyTorch's default
+/// `nn.GELU()` (ModernBERT) use [`gelu_erf`] instead.
 pub fn gelu(x: f32) -> f32 {
     const SQRT_2_OVER_PI: f32 = 0.797_884_560_802_865_4;
     const COEF_A: f32 = 0.044_715;
     0.5 * x * (1.0 + (SQRT_2_OVER_PI * x * (1.0 + COEF_A * x * x)).tanh())
 }
+
+/// GELU, exact form, and the f64 error function it is built on. They live in
+/// `ojas-core` so that the Laya host code (`ojas-models`) and this oracle share one
+/// implementation; the Metal kernel's `erf_as` is an independent approximation.
+pub use ojas_core::math::{erf, gelu_erf};
 
 /// NeoX-style RoPE in place on a per-head vector (head_dim), position `pos`.
 pub fn rope(v: &mut [f32], head_dim: usize, pos: usize, base: f32) {

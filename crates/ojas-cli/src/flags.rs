@@ -34,8 +34,16 @@ pub struct RunOpts {
     pub conf: Option<f32>,
     /// Vision (`detect`): NMS IoU threshold; None = the command's default.
     pub iou: Option<f32>,
-    /// Vision (`detect`): emit JSON instead of a table.
+    /// `detect` and `decide`: emit JSON instead of a table.
     pub json: bool,
+    /// `decide`: the state, as JSON (an object or array) or plain text, inline or
+    /// from a file.
+    pub state: Option<String>,
+    pub state_file: Option<String>,
+    /// `decide`: the questions, a JSON object of `{id: {type, instructions, criteria}}`,
+    /// inline or from a file.
+    pub questions: Option<String>,
+    pub questions_file: Option<String>,
     /// Vision (`plate`): OCR input normalization — "signed" (default) or
     /// "unit" for exports with normalization folded in-graph (see MANIFEST).
     pub ocr_norm: Option<String>,
@@ -82,6 +90,10 @@ impl Default for RunOpts {
             conf: None,
             iou: None,
             json: false,
+            state: None,
+            state_file: None,
+            questions: None,
+            questions_file: None,
             ocr_norm: None,
             sample_set: false,
         }
@@ -297,6 +309,10 @@ pub fn take_run_flags(args: &mut Vec<String>) -> Result<RunOpts> {
             "--conf" => o.conf = Some(num!(&mut i)),
             "--iou" => o.iou = Some(num!(&mut i)),
             "--json" => o.json = true,
+            "--state" => o.state = Some(take(&mut i)?),
+            "--state-file" => o.state_file = Some(take(&mut i)?),
+            "--questions" => o.questions = Some(take(&mut i)?),
+            "--questions-file" => o.questions_file = Some(take(&mut i)?),
             "--ocr-norm" => o.ocr_norm = Some(take(&mut i)?),
             "--token" => o.token = Some(take(&mut i)?),
             "--token-file" => o.token_file = Some(take(&mut i)?),

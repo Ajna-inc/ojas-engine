@@ -1,4 +1,5 @@
-//! The ViT kernels (`kernels/vision.rs`), gated against the CPU oracle.
+//! The encoder kernels (`kernels/vision.rs`, plus `act_m` from `kernels/ops.rs`),
+//! gated against the CPU oracle.
 //!
 //! `ojas_cpu::cpu_math::layernorm`, `ojas_cpu::cpu_math::gelu` and
 //! `ojas_cpu::cpu_vit::patchify` are the same functions the CPU ViT tower runs, so a
@@ -75,7 +76,7 @@ fn lcg(seed: &mut u32) -> f32 {
 }
 
 fn pipe(gpu: &MetalGpu, entry: &str) -> ComputePipelineState {
-    let src = ojas_metal::kernels::family_source("vision").expect("vision family registered");
+    let src = ojas_metal::kernels::source_of(entry).unwrap_or_else(|| panic!("{entry} is not a registered kernel"));
     gpu.pipeline(src, entry).unwrap_or_else(|e| panic!("{entry} pipeline: {e}"))
 }
 
@@ -108,7 +109,7 @@ const LN_SHAPES: &[(usize, usize, u64)] = &[
 
 /// One `vit_layernorm_m` dispatch. `out` is bound past its leading guard.
 fn ln_run(gpu: &MetalGpu, p: &ComputePipelineState, x: &Buffer, w: &Buffer, b: &Buffer,
-          out: &Buffer, d: u32, eps: f32, m: u64, ts: u64) {
+          out: &Buffer, d: u32, eps: f32, m: u64, ts: u64, has_bias: bool) {
     let cb = gpu.command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(p);
@@ -118,6 +119,8 @@ fn ln_run(gpu: &MetalGpu, p: &ComputePipelineState, x: &Buffer, w: &Buffer, b: &
     enc.set_bytes(3, 4, &d as *const u32 as *const c_void);
     enc.set_bytes(4, 4, &eps as *const f32 as *const c_void);
     enc.set_buffer(5, Some(b), 0);
+    let hb = has_bias as u32;
+    enc.set_bytes(6, 4, &hb as *const u32 as *const c_void);
     enc.dispatch_thread_groups(MTLSize::new(m, 1, 1), MTLSize::new(ts, 1, 1));
     enc.end_encoding();
     cb.commit();
@@ -140,7 +143,7 @@ fn vit_layernorm_m_matches_cpu_oracle() {
             let bias: Vec<f32> = (0..d).map(|_| lcg(&mut seed) * 0.5).collect();
             let (xb, wb, bb) = (upload(&gpu, &x), upload(&gpu, &w), upload(&gpu, &bias));
             let ob = guarded(&gpu, m * d);
-            ln_run(&gpu, &p, &xb, &wb, &bb, &ob, d as u32, eps, m as u64, ts);
+            ln_run(&gpu, &p, &xb, &wb, &bb, &ob, d as u32, eps, m as u64, ts, true);
             let got = payload(&ob, m * d);
             assert_guards(&format!("layernorm m={m} d={d} ts={ts}"), &ob, m * d);
             for r in 0..m {
@@ -200,7 +203,7 @@ fn vit_layernorm_m_eps_is_inside_the_sqrt() {
 
         let (xb, wb, bb) = (upload(&gpu, &x), upload(&gpu, &w), upload(&gpu, &bias));
         let ob = guarded(&gpu, d);
-        ln_run(&gpu, &p, &xb, &wb, &bb, &ob, d as u32, eps, 1, 256);
+        ln_run(&gpu, &p, &xb, &wb, &bb, &ob, d as u32, eps, 1, 256, true);
         let got = payload(&ob, d);
         assert_guards("layernorm eps gate", &ob, d);
 
@@ -270,7 +273,7 @@ fn vit_layernorm_m_is_safe_in_place() {
     // Reference run, out-of-place.
     let xb = upload(&gpu, &x);
     let ob = guarded(&gpu, m * d);
-    ln_run(&gpu, &p, &xb, &wb, &bb, &ob, d as u32, eps, m as u64, 256);
+    ln_run(&gpu, &p, &xb, &wb, &bb, &ob, d as u32, eps, m as u64, 256, true);
     let want: Vec<f32> = payload(&ob, m * d).to_vec();
 
     // One buffer bound to slots 0 and 2. Guards must still hold.
@@ -286,6 +289,8 @@ fn vit_layernorm_m_is_safe_in_place() {
     enc.set_bytes(3, 4, &dd as *const u32 as *const c_void);
     enc.set_bytes(4, 4, &eps as *const f32 as *const c_void);
     enc.set_buffer(5, Some(&bb), 0);
+    let hb = 1u32;
+    enc.set_bytes(6, 4, &hb as *const u32 as *const c_void);
     enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(256, 1, 1));
     enc.end_encoding();
     cb.commit();
@@ -295,8 +300,37 @@ fn vit_layernorm_m_is_safe_in_place() {
     assert_eq!(got, want.as_slice(), "in-place layernorm diverged from the out-of-place run");
 }
 
+/// `has_bias == 0` is the ModernBERT form: `y = (x - mean)/sqrt(var + eps) * w`. Slot 5
+/// is bound to a buffer of NaNs, so a kernel that still read the bias would poison
+/// every output rather than shift it by a plausible amount.
+#[test]
+fn vit_layernorm_m_without_bias_never_reads_slot_5() {
+    let Some(gpu) = gpu_or_skip("vision/layernorm-nobias") else { return };
+    let p = pipe(&gpu, "vit_layernorm_m");
+    for &(m, d, ts) in &[(1usize, 1024usize, 256u64), (5, 768, 256), (3, 257, 64)] {
+        let mut seed = 0xB1A5u32 ^ d as u32;
+        let x: Vec<f32> = (0..m * d).map(|i| lcg(&mut seed) * 3.0 + (i / d) as f32 - 1.0).collect();
+        let w: Vec<f32> = (0..d).map(|_| lcg(&mut seed) + 1.0).collect();
+        let (xb, wb, nanb) = (upload(&gpu, &x), upload(&gpu, &w), upload(&gpu, &vec![f32::NAN; d]));
+        let ob = guarded(&gpu, m * d);
+        ln_run(&gpu, &p, &xb, &wb, &nanb, &ob, d as u32, 1e-5, m as u64, ts, false);
+        assert_guards(&format!("layernorm no-bias m={m} d={d}"), &ob, m * d);
+        let got = payload(&ob, m * d);
+        let zero = vec![0f32; d];
+        for r in 0..m {
+            let want = ojas_cpu::cpu_math::layernorm(&x[r * d..(r + 1) * d], &w, &zero, 1e-5);
+            let scale = want.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-6);
+            for i in 0..d {
+                let g = got[r * d + i];
+                assert!(g.is_finite(), "no-bias m={m} d={d} row {r} elem {i}: {g} (bias slot was read)");
+                assert!((g - want[i]).abs() / scale < 1e-5, "no-bias m={m} d={d} row {r} elem {i}: {g} vs {}", want[i]);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// vit_gelu
+// act_m: the elementwise activation (the ViT MLP runs act 1, tanh GELU)
 // ---------------------------------------------------------------------------
 
 /// Ragged element counts: 1 and 7 are sub-threadgroup, 13 is `dispatch.rs:93`'s
@@ -304,13 +338,14 @@ fn vit_layernorm_m_is_safe_in_place() {
 /// (768*... rounded) and 16385 leaves a 1-thread tail.
 const GELU_N: &[usize] = &[1, 7, 13, 255, 256, 257, 4096, 16385];
 
-fn gelu_run(gpu: &MetalGpu, p: &ComputePipelineState, x: &Buffer, out: &Buffer, out_off: u64, n: u32) {
+fn act_run(gpu: &MetalGpu, p: &ComputePipelineState, x: &Buffer, out: &Buffer, out_off: u64, n: u32, act: u32) {
     let cb = gpu.command_buffer();
     let enc = cb.new_compute_command_encoder();
     enc.set_compute_pipeline_state(p);
     enc.set_buffer(0, Some(x), 0);
     enc.set_buffer(1, Some(out), out_off);
     enc.set_bytes(2, 4, &n as *const u32 as *const c_void);
+    enc.set_bytes(3, 4, &act as *const u32 as *const c_void);
     enc.dispatch_thread_groups(MTLSize::new((n as u64).div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
     enc.end_encoding();
     cb.commit();
@@ -334,41 +369,51 @@ fn gelu_input(i: usize, n: usize) -> f32 {
     }
 }
 
+/// Every activation code against its CPU oracle: 1 is the ViT's tanh GELU, 3 the exact
+/// erf GELU (ModernBERT, PyTorch `nn.GELU()`), 4 ReLU. The erf oracle is f64
+/// (`cpu_math::erf`), independent of the kernel's Abramowitz-Stegun approximation.
 #[test]
-fn vit_gelu_matches_cpu_oracle() {
-    let Some(gpu) = gpu_or_skip("vision/gelu") else { return };
-    let p = pipe(&gpu, "vit_gelu");
-    let mut worst = 0f64;
-    let mut worst_at = String::new();
-    for &n in GELU_N {
-        let x: Vec<f32> = (0..n).map(|i| gelu_input(i, n)).collect();
-        let xb = upload(&gpu, &x);
-        let ob = guarded(&gpu, n);
-        gelu_run(&gpu, &p, &xb, &ob, (GUARD * 4) as u64, n as u32);
-        let got = payload(&ob, n);
-        assert_guards(&format!("gelu n={n}"), &ob, n);
-        for i in 0..n {
-            let e = ojas_cpu::cpu_math::gelu(x[i]) as f64;
-            let g = got[i] as f64;
-            assert!(g.is_finite(), "gelu n={n} i={i} x={}: got {g}", x[i]);
-            // Relative to the magnitude of the input: GELU(x) -> x in the tail,
-            // so an absolute tolerance would be meaningless at x=1e4.
-            let tol_base = e.abs().max(x[i].abs() as f64).max(1.0);
-            let rel = (g - e).abs() / tol_base;
-            if rel > worst { worst = rel; worst_at = format!("n={n} i={i} x={} ({g} vs {e})", x[i]); }
+fn act_m_matches_cpu_oracle() {
+    let Some(gpu) = gpu_or_skip("encoder/act") else { return };
+    let p = pipe(&gpu, "act_m");
+    let oracles: [(u32, &str, fn(f32) -> f32); 3] = [
+        (1, "gelu-tanh", ojas_cpu::cpu_math::gelu),
+        (3, "gelu-erf", ojas_cpu::cpu_math::gelu_erf),
+        (4, "relu", |x| x.max(0.0)),
+    ];
+    for (act, name, oracle) in oracles {
+        let mut worst = 0f64;
+        let mut worst_at = String::new();
+        for &n in GELU_N {
+            let x: Vec<f32> = (0..n).map(|i| gelu_input(i, n)).collect();
+            let xb = upload(&gpu, &x);
+            let ob = guarded(&gpu, n);
+            act_run(&gpu, &p, &xb, &ob, (GUARD * 4) as u64, n as u32, act);
+            let got = payload(&ob, n);
+            assert_guards(&format!("{name} n={n}"), &ob, n);
+            for i in 0..n {
+                let e = oracle(x[i]) as f64;
+                let g = got[i] as f64;
+                assert!(g.is_finite(), "{name} n={n} i={i} x={}: got {g}", x[i]);
+                // Relative to the magnitude of the input: GELU(x) -> x in the tail,
+                // so an absolute tolerance would be meaningless at x=1e4.
+                let tol_base = e.abs().max(x[i].abs() as f64).max(1.0);
+                let rel = (g - e).abs() / tol_base;
+                if rel > worst { worst = rel; worst_at = format!("n={n} i={i} x={} ({g} vs {e})", x[i]); }
+            }
         }
+        println!("act_m {name}: worst rel err {worst:.3e} at {worst_at}");
+        assert!(worst < 1e-6, "{name}: worst rel err {worst:.3e} at {worst_at}");
     }
-    println!("vit_gelu: worst rel err {worst:.3e} at {worst_at}");
-    assert!(worst < 1e-6, "worst rel err {worst:.3e} at {worst_at}");
 }
 
 /// The kernel is one thread per element, so `out` may alias `x`. The ViT MLP
 /// wants that (fc1 writes a scratch row, GELU rewrites it in place); asserting it
 /// here makes it a contract instead of an accident.
 #[test]
-fn vit_gelu_is_safe_in_place() {
-    let Some(gpu) = gpu_or_skip("vision/gelu-inplace") else { return };
-    let p = pipe(&gpu, "vit_gelu");
+fn act_m_is_safe_in_place() {
+    let Some(gpu) = gpu_or_skip("encoder/act-inplace") else { return };
+    let p = pipe(&gpu, "act_m");
     let n = 3072usize;
     let x: Vec<f32> = (0..n).map(|i| gelu_input(i, n)).collect();
     // One buffer, bound to both slots: guards on either side still have to hold.
@@ -382,8 +427,9 @@ fn vit_gelu_is_safe_in_place() {
     enc.set_compute_pipeline_state(&p);
     enc.set_buffer(0, Some(&xb), (GUARD * 4) as u64);
     enc.set_buffer(1, Some(&xb), (GUARD * 4) as u64);
-    let nn = n as u32;
+    let (nn, act) = (n as u32, 1u32);
     enc.set_bytes(2, 4, &nn as *const u32 as *const c_void);
+    enc.set_bytes(3, 4, &act as *const u32 as *const c_void);
     enc.dispatch_thread_groups(MTLSize::new((n as u64).div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
     enc.end_encoding();
     cb.commit();
@@ -519,4 +565,160 @@ fn vit_patchify_row_order_is_channel_major_kx_fastest() {
     }
     println!("vit_patchify: ({pw}x{ph}) patches, row order (ic, ky, kx) with kx fastest, \
               K={row} — verified positionally against ggml-cpu/ops.cpp:6417");
+}
+
+/// `vit_gelu` exists for the CUDA twin's name; it must stay `act_m` with act 1 exactly,
+/// or the two Metal entry points would quietly diverge.
+#[test]
+fn vit_gelu_is_act_m_with_tanh_gelu() {
+    let Some(gpu) = gpu_or_skip("vision/vit-gelu") else { return };
+    let (vg, am) = (pipe(&gpu, "vit_gelu"), pipe(&gpu, "act_m"));
+    let n = 4099usize;
+    let x: Vec<f32> = (0..n).map(|i| gelu_input(i, n)).collect();
+    let xb = upload(&gpu, &x);
+    let (a, b) = (guarded(&gpu, n), guarded(&gpu, n));
+    act_run(&gpu, &am, &xb, &a, (GUARD * 4) as u64, n as u32, 1);
+    let cb = gpu.command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(&vg);
+    enc.set_buffer(0, Some(&xb), 0);
+    enc.set_buffer(1, Some(&b), (GUARD * 4) as u64);
+    let nn = n as u32;
+    enc.set_bytes(2, 4, &nn as *const u32 as *const c_void);
+    enc.dispatch_thread_groups(MTLSize::new((n as u64).div_ceil(256), 1, 1), MTLSize::new(256, 1, 1));
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+    assert_guards("vit_gelu", &b, n);
+    let (pa, pb) = (payload(&a, n), payload(&b, n));
+    assert!(pa.iter().zip(pb).all(|(u, v)| u.to_bits() == v.to_bits()), "vit_gelu diverged from act_m(act=1)");
+}
+
+// ---------------------------------------------------------------------------
+// vit_qkv_prep and ffn_gu_rows (the encoder block's fused steps)
+// ---------------------------------------------------------------------------
+
+/// One dispatch of `pipe` with buffers, u32 and f32 constants, `groups` x `threads`.
+fn dispatch(gpu: &MetalGpu, pipe: &ComputePipelineState, bufs: &[(u64, &Buffer)], ints: &[(u64, u32)],
+            floats: &[(u64, f32)], groups: u64, threads: u64) {
+    let cb = gpu.command_buffer();
+    let enc = cb.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipe);
+    for &(i, b) in bufs { enc.set_buffer(i, Some(b), 0); }
+    for &(i, v) in ints { enc.set_bytes(i, 4, &v as *const u32 as *const c_void); }
+    for &(i, v) in floats { enc.set_bytes(i, 4, &v as *const f32 as *const c_void); }
+    enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(threads, 1, 1));
+    enc.end_encoding();
+    cb.commit();
+    cb.wait_until_completed();
+}
+
+fn upload_u32(gpu: &MetalGpu, v: &[u32]) -> Buffer {
+    gpu.device.new_buffer_with_data(v.as_ptr() as *const c_void, (v.len() * 4) as u64,
+        MTLResourceOptions::StorageModeShared)
+}
+
+fn words(buf: &Buffer, n: usize) -> &[u32] {
+    unsafe { std::slice::from_raw_parts(buf.contents() as *const u32, n) }
+}
+
+fn halves(buf: &Buffer, n: usize) -> &[u16] {
+    unsafe { std::slice::from_raw_parts(buf.contents() as *const u16, n) }
+}
+
+/// `vit_qkv_prep` claims to be `vit_qkv_split`, `vit_rope` on Q and K, and
+/// `copy_f32_half` on K and V, fused. Held to that bit for bit in the three ways the
+/// encoders call it: the text rope (no sections, ramp over `hd`), the vision M-RoPE
+/// (four sections, ramp over `hd/2`) and no rotation at all (the Laya head).
+#[test]
+fn vit_qkv_prep_is_split_rope_and_half_fused() {
+    let Some(gpu) = gpu_or_skip("encoder/qkv-prep") else { return };
+    let (prep, split, rope, half) = (pipe(&gpu, "vit_qkv_prep"), pipe(&gpu, "vit_qkv_split"),
+                                     pipe(&gpu, "vit_rope"), pipe(&gpu, "copy_f32_half"));
+    let hd = 64u32;
+    for &(m, d) in &[(1usize, 128u32), (37, 768), (130, 1024)] {
+        for (mode, sections, freq_dims, base) in [("text", [0u32; 4], hd, 160000.0f32),
+                                                  ("vision", [hd / 4; 4], hd / 2, 10000.0),
+                                                  ("none", [0u32; 4], 0, 0.0)] {
+            let mut seed = 0x9E37u32 ^ (m as u32) ^ d;
+            let qkv: Vec<f32> = (0..m * 3 * d as usize).map(|_| lcg(&mut seed) * 4.0).collect();
+            // Positions restart partway, as packed sequences do; the vision streams
+            // differ per channel, as a patch's (y, x) does.
+            let mut mpos = sections.to_vec();
+            for r in 0..m as u32 { mpos.extend_from_slice(&[r % 23, r / 5, r % 23, r / 5]); }
+            let (qkvb, posb) = (upload(&gpu, &qkv), upload_u32(&gpu, &mpos));
+            let dm = m as u32 * d;
+            let (q, kh, vh) = (upload(&gpu, &vec![0.0; dm as usize]), upload(&gpu, &vec![0.0; dm as usize / 2 + 1]),
+                               upload(&gpu, &vec![0.0; dm as usize / 2 + 1]));
+            let threads = dm / 2;
+            dispatch(&gpu, &prep, &[(0, &qkvb), (1, &q), (2, &kh), (3, &vh), (5, &posb)],
+                &[(4, d), (6, hd), (7, m as u32), (8, freq_dims)], &[(9, base)], threads.div_ceil(64) as u64, 64);
+
+            let (q2, k2, v2) = (upload(&gpu, &vec![0.0; dm as usize]), upload(&gpu, &vec![0.0; dm as usize]),
+                                upload(&gpu, &vec![0.0; dm as usize]));
+            dispatch(&gpu, &split, &[(0, &qkvb), (1, &q2), (2, &k2), (3, &v2)], &[(4, d), (5, dm)], &[],
+                dm.div_ceil(64) as u64, 64);
+            if freq_dims != 0 {
+                let pairs = m as u32 * (d / hd) * (hd / 2);
+                for t in [&q2, &k2] {
+                    dispatch(&gpu, &rope, &[(0, t), (5, &posb)], &[(1, hd), (3, d), (4, m as u32), (6, freq_dims)],
+                        &[(2, base)], pairs.div_ceil(64) as u64, 64);
+                }
+            }
+            let (kh2, vh2) = (upload(&gpu, &vec![0.0; dm as usize / 2 + 1]), upload(&gpu, &vec![0.0; dm as usize / 2 + 1]));
+            for (src, dst) in [(&k2, &kh2), (&v2, &vh2)] {
+                dispatch(&gpu, &half, &[(0, src), (1, dst)], &[(2, dm)], &[], dm.div_ceil(256) as u64, 256);
+            }
+            let label = format!("{mode} m={m} d={d}");
+            assert_eq!(words(&q, dm as usize), words(&q2, dm as usize), "{label}: Q differs from split + rope");
+            assert_eq!(halves(&kh, dm as usize), halves(&kh2, dm as usize), "{label}: K differs from split + rope + half");
+            assert_eq!(halves(&vh, dm as usize), halves(&vh2, dm as usize), "{label}: V differs from split + half");
+        }
+    }
+}
+
+/// `ffn_gu_rows` over ModernBERT's fused `[gate | up]` rows: `act(gate) * up`, first
+/// half activated, against the f64 oracles, at ragged widths and row counts.
+#[test]
+fn ffn_gu_rows_matches_cpu_oracle() {
+    let Some(gpu) = gpu_or_skip("encoder/ffn-gu-rows") else { return };
+    let p = pipe(&gpu, "ffn_gu_rows");
+    let oracles: [(u32, &str, fn(f32) -> f32); 3] = [
+        (1, "gelu-tanh", ojas_cpu::cpu_math::gelu),
+        (3, "gelu-erf", ojas_cpu::cpu_math::gelu_erf),
+        (4, "relu", |x| x.max(0.0)),
+    ];
+    for &(m, f) in &[(1usize, 2624usize), (7, 1152), (3, 13)] {
+        let mut seed = 0x61u32 ^ (m * f) as u32;
+        let x: Vec<f32> = (0..m * 2 * f).map(|_| lcg(&mut seed) * 6.0).collect();
+        let xb = upload(&gpu, &x);
+        for (act, name, oracle) in oracles {
+            let ob = guarded(&gpu, m * f);
+            let cb = gpu.command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&p);
+            enc.set_buffer(0, Some(&xb), 0);
+            enc.set_buffer(1, Some(&ob), (GUARD * 4) as u64);
+            let n = (m * f) as u32;
+            for (i, v) in [(2u64, f as u32), (3, n), (4, act)] { enc.set_bytes(i, 4, &v as *const u32 as *const c_void); }
+            enc.dispatch_thread_groups(MTLSize::new(n.div_ceil(256) as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_guards(&format!("ffn_gu_rows {name} m={m} f={f}"), &ob, m * f);
+            let got = payload(&ob, m * f);
+            for r in 0..m {
+                for i in 0..f {
+                    let (g, u) = (x[r * 2 * f + i], x[r * 2 * f + f + i]);
+                    let want = oracle(g) as f64 * u as f64;
+                    // The activation's error scales with |g| (the erf approximation is
+                    // good to 1.5e-7 absolute, times 0.5|g|) and the product scales it
+                    // by |u|, so the bound is relative to both, as in act_m's test.
+                    let tol = 1e-6 * (g.abs() as f64).max(1.0) * (u.abs() as f64).max(1.0);
+                    assert!((got[r * f + i] as f64 - want).abs() <= tol,
+                        "ffn_gu_rows {name} m={m} f={f} row {r} col {i}: {} vs {want}", got[r * f + i]);
+                }
+            }
+        }
+    }
 }

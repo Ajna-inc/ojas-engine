@@ -13,14 +13,32 @@ using namespace metal;
 
 
 
-// FFN gate activation: act=0 SiLU (Qwen/Llama), act=1 GeLU tanh-approx (Gemma).
-// The cube can overflow to inf → fast-math tanh(inf)=NaN, so clamp the tanh arg.
+// erf(x), Abramowitz & Stegun 7.1.26: |error| <= 1.5e-7, far below the f16
+// rounding every activation here already carries. MSL has no erf builtin.
+inline float erf_as(float x) {
+    float a = fabs(x);
+    float t = 1.0f/(1.0f + 0.3275911f*a);
+    float y = 1.0f - (((((1.061405429f*t - 1.453152027f)*t) + 1.421413741f)*t - 0.284496736f)*t
+                      + 0.254829592f)*t*exp(-a*a);
+    return copysign(y, x);
+}
+
+// Activation selector shared by every FFN and elementwise kernel:
+//   act=0 SiLU (Qwen/Llama)
+//   act=1 GeLU, tanh approximation (Gemma, the qwen3vl ViT)
+//   act=3 GeLU, exact erf form (PyTorch nn.GELU(), ModernBERT)
+//   act=4 ReLU
+// act=2 is reserved: gemm_fat's epilogue uses it for an identity bisect.
+// The tanh cube can overflow to inf and fast-math tanh(inf) is NaN, so its
+// argument is clamped.
 inline float ffn_act(float g, uint act) {
     if (act == 1u) {
         float inner = 0.7978845608f*(g + 0.044715f*g*g*g);
         inner = clamp(inner, -30.0f, 30.0f);
         return 0.5f*g*(1.0f + tanh(inner));
     }
+    if (act == 3u) { return 0.5f*g*(1.0f + erf_as(g*0.70710678118654752f)); }
+    if (act == 4u) { return max(g, 0.0f); }
     return g/(1.0f+exp(-g));
 }
 

@@ -16,11 +16,12 @@
 //! gets its own entry and command buffer, runs before prefill, and hands back rows
 //! that `prefill_embeds` injects.
 //!
-//! Every matmul goes through `projm` (`dispatch.rs:1131`): all eight ViT shapes
-//! satisfy its `N%64==0, K%32==0` guard, and it keeps the weight lookup inside
-//! `Weights::repr`'s single probe order (`mod.rs:444`). Every other dispatch is
-//! `enc_reduce` (`dispatch.rs:631`), except the MMA attention, which needs a 2-D
-//! grid and is written inline as in `batch.rs:326` and `graph_chunk.rs:311`.
+//! The twelve blocks are the shared encoder block (`encoder.rs`), which the text
+//! encoder also runs; this file owns what is specific to the tower: the patch
+//! embedding, the 2x2 merge, the position embedding, the M-RoPE table and the
+//! projector. Every matmul goes through `projm` (`dispatch.rs`): all eight ViT
+//! shapes satisfy its `N%64==0, K%32==0` guard, and it keeps the weight lookup inside
+//! `Weights::repr`'s single probe order (`mod.rs`).
 //! Structurally this is `forward_diffusion_range` (`batch.rs:33`) — already a
 //! bidirectional, fully-biased, M-token encoder — with RMSNorm swapped for
 //! LayerNorm and SwiGLU for GELU, including the `mk`/`big` idiom for working sets
@@ -51,9 +52,7 @@
 
 use super::*;
 use anyhow::{ensure, Result};
-use metal::MTLSize;
 use objc::{msg_send, sel, sel_impl};
-use std::ffi::c_void;
 
 /// Name of the folded patch-embed weight `load.rs` synthesizes from
 /// `v.patch_embd.weight + v.patch_embd.weight.1`.
@@ -301,8 +300,6 @@ impl<'a> DecoderGpu<'a> {
         let h = mk(rows * dv, &self.st.vh);
         let qkv = mk(rows * 3 * dv, &self.st.vqkv);
         let q = mk(rows * dv, &self.st.vq);
-        let kb = mk(rows * dv, &self.st.vk);
-        let vb = mk(rows * dv, &self.st.vv);
         let khb = mkz(((rows + 32) * dv + 1) / 2, &self.st.vkh);
         let vhb = mkz(((rows + 32) * dv + 1) / 2, &self.st.vvh);
         let ffnb = mk((rows * ffn).max(mmrows * mmh), &self.st.vffn);
@@ -352,7 +349,6 @@ impl<'a> DecoderGpu<'a> {
 
         // ---- graph
         let (d32, m32) = (dv as u32, n_pos as u32);
-        let scale = 1.0 / (hd as f32).sqrt();
         // MMA flash attention shares one KV pass across 32 queries; the per-(query,
         // head)-threadgroup kernel streams all of K and V per query, ~824 GB/layer
         // at page scale. MMA is Apple7+ only (`load.rs:344`'s `keep` closure drops
@@ -390,75 +386,28 @@ impl<'a> DecoderGpu<'a> {
         self.enc_reduce(&enc, "add_rowbias_m", &[(&x, 0), (&peb, 1)],
             &[(2, (n_pos * dv) as u32), (3, (n_pos * dv) as u32)], &[], ((n_pos * dv + 63) / 64) as u64, 64);
 
-        // 4. twelve pre-norm blocks
+        // 4. twelve pre-norm blocks, through the shared encoder block
+        let geom = encoder::Geom { d: dv, n_head: nh, hd, ffn, eps: v.eps };
+        let scratch = encoder::Scratch {
+            x: &x, h: &h, qkv: &qkv, q: &q, kh: &khb, vh: &vhb,
+            ffn: &ffnb, ffn_wide: &ffnb, pos: &mposb,
+        };
         for l in 0..v.layers as usize {
             let p = |s: &str| format!("v.blk.{l}.{s}");
-            let ln = |enc: &metal::ComputeCommandEncoderRef, src: &metal::Buffer, dst: &metal::Buffer, n: &str| {
-                self.enc_reduce(enc, "vit_layernorm_m",
-                    &[(src, 0), (&self.wt.w32[&format!("{n}.weight")], 1), (dst, 2),
-                      (&self.wt.w32[&format!("{n}.bias")], 5)],
-                    &[(3, d32)], &[(4, v.eps)], m32 as u64, 256);
+            let norm = |n: &str| encoder::Norm { weight: p(&format!("{n}.weight")), bias: Some(p(&format!("{n}.bias"))) };
+            let block = encoder::Block {
+                attn_norm: Some(norm("ln1")),
+                qkv: p("attn_qkv.weight"), qkv_bias: Some(p("attn_qkv.bias")),
+                out: p("attn_out.weight"), out_bias: Some(p("attn_out.bias")),
+                ffn_norm: norm("ln2"),
+                up: p("ffn_up.weight"), up_bias: Some(p("ffn_up.bias")),
+                down: p("ffn_down.weight"), down_bias: Some(p("ffn_down.bias")),
+                mlp: encoder::Mlp::Plain,
+                act: encoder::Act::GeluTanh,
+                // ggml's vision rope spreads the frequency ramp over half the head.
+                rope: Some(encoder::Rope { base: v.rope_base, freq_dims: v.hd / 2 }),
             };
-            ln(&enc, &x, &h, &p("ln1"));
-            self.projm(&enc, &h, 0, &p("attn_qkv.weight"), &qkv, d32, 3 * d32, m32, false);
-            self.enc_reduce(&enc, "add_rowbias_m", &[(&qkv, 0), (&self.wt.w32[&p("attn_qkv.bias")], 1)],
-                &[(2, 3 * d32), (3, (n_pos * 3 * dv) as u32)], &[], ((n_pos * 3 * dv + 63) / 64) as u64, 64);
-            self.enc_reduce(&enc, "vit_qkv_split", &[(&qkv, 0), (&q, 1), (&kb, 2), (&vb, 3)],
-                &[(4, d32), (5, (n_pos * dv) as u32)], &[], ((n_pos * dv + 63) / 64) as u64, 64);
-            // vision M-RoPE on Q and K (V is never rotated)
-            let ropairs = n_pos * nh * (hd / 2);
-            for tgt in [&q, &kb] {
-                self.enc_reduce(&enc, "vit_rope", &[(tgt, 0), (&mposb, 5)],
-                    &[(1, hd as u32), (3, d32), (4, m32)], &[(2, v.rope_base)],
-                    ((ropairs + 63) / 64) as u64, 64);
-            }
-            // K/V to f16: every bidirectional attention kernel in the tree reads
-            // `device const half*` (the decoder's KV cache is f16, and so is
-            // ggml_flash_attn_ext's). The 32 rows past n_pos stay zero.
-            self.enc_reduce(&enc, "copy_f32_half", &[(&kb, 0), (&khb, 1)],
-                &[(2, (n_pos * dv) as u32)], &[], ((n_pos * dv + 255) / 256) as u64, 256);
-            self.enc_reduce(&enc, "copy_f32_half", &[(&vb, 0), (&vhb, 1)],
-                &[(2, (n_pos * dv) as u32)], &[], ((n_pos * dv + 255) / 256) as u64, 256);
-            // bidirectional attention (no mask, no causality): buffer(6) is the
-            // whole KV length, not a base position.
-            if use_mma {
-                enc.set_compute_pipeline_state(&self.p[&mma]);
-                enc.set_buffer(0, Some(&q), 0);
-                enc.set_buffer(1, Some(&khb), 0);
-                enc.set_buffer(2, Some(&vhb), 0);
-                enc.set_buffer(3, Some(&h), 0);
-                for (i, val) in [(4u32, hd as u32), (5, d32), (6, m32), (7, 1u32), (9, nh as u32), (10, m32)] {
-                    enc.set_bytes(i as u64, 4, &val as *const u32 as *const c_void);
-                }
-                enc.set_bytes(8, 4, &scale as *const f32 as *const c_void);
-                enc.dispatch_thread_groups(MTLSize::new(nh as u64, ((n_pos + 31) / 32) as u64, 1),
-                                           MTLSize::new(256, 1, 1));
-            } else {
-                self.enc_reduce(&enc, "attention_m_bidir",
-                    &[(&q, 0), (&khb, 1), (&vhb, 2), (&h, 3)],
-                    &[(4, hd as u32), (5, d32), (6, m32), (7, 1), (9, nh as u32)], &[(8, scale)],
-                    (n_pos * nh) as u64, 256);
-            }
-            // Biased out-proj straight into the residual: `projm(accum)` gives
-            // `x += o`, then the bias rides the same buffer — one buffer and one
-            // dispatch fewer than staging `o` separately. The bias therefore enters
-            // the f32 sum last here and first in the oracle (`cpu_math::matmul`
-            // seeds each dot with it, `cpu_math.rs:207`): a last-bits f32
-            // difference, four orders of magnitude under the f16 activation
-            // rounding that dominates this comparison.
-            self.projm(&enc, &h, 0, &p("attn_out.weight"), &x, d32, d32, m32, true);
-            self.enc_reduce(&enc, "add_rowbias_m", &[(&x, 0), (&self.wt.w32[&p("attn_out.bias")], 1)],
-                &[(2, d32), (3, (n_pos * dv) as u32)], &[], ((n_pos * dv + 63) / 64) as u64, 64);
-            // GELU MLP
-            ln(&enc, &x, &h, &p("ln2"));
-            self.projm(&enc, &h, 0, &p("ffn_up.weight"), &ffnb, d32, ffn as u32, m32, false);
-            self.enc_reduce(&enc, "add_rowbias_m", &[(&ffnb, 0), (&self.wt.w32[&p("ffn_up.bias")], 1)],
-                &[(2, ffn as u32), (3, (n_pos * ffn) as u32)], &[], ((n_pos * ffn + 63) / 64) as u64, 64);
-            self.enc_reduce(&enc, "vit_gelu", &[(&ffnb, 0), (&ffnb, 1)],
-                &[(2, (n_pos * ffn) as u32)], &[], ((n_pos * ffn + 255) / 256) as u64, 256);
-            self.projm(&enc, &ffnb, 0, &p("ffn_down.weight"), &x, ffn as u32, d32, m32, true);
-            self.enc_reduce(&enc, "add_rowbias_m", &[(&x, 0), (&self.wt.w32[&p("ffn_down.bias")], 1)],
-                &[(2, d32), (3, (n_pos * dv) as u32)], &[], ((n_pos * dv + 63) / 64) as u64, 64);
+            self.encode_block(&enc, &block, &geom, &scratch, encoder::Keys::All { mma: use_mma }, n_pos);
             if want_layers {
                 enc.end_encoding();
                 gpu_s += commit_vit(cb, &format!("vit block {l}"))?;
@@ -474,16 +423,14 @@ impl<'a> DecoderGpu<'a> {
         //    already made every group of four tokens spatial neighbours, so
         //    [n_pos, d_v] read as [n_pos/4, 4*d_v] is the merged sequence, and
         //    `projm`'s K does the reinterpreting.
-        self.enc_reduce(&enc, "vit_layernorm_m",
-            &[(&x, 0), (&self.wt.w32["v.post_ln.weight"], 1), (&x, 2), (&self.wt.w32["v.post_ln.bias"], 5)],
-            &[(3, d32)], &[(4, v.eps)], m32 as u64, 256);
+        let post_ln = encoder::Norm { weight: "v.post_ln.weight".into(), bias: Some("v.post_ln.bias".into()) };
+        self.enc_layernorm(&enc, &x, &x, &post_ln, d32, v.eps, m32);
         self.projm(&enc, &x, 0, "mm.0.weight", &ffnb, kmm as u32, mmh as u32, n_mm as u32, false);
         self.enc_reduce(&enc, "add_rowbias_m", &[(&ffnb, 0), (&self.wt.w32["mm.0.bias"], 1)],
             &[(2, mmh as u32), (3, (n_mm * mmh) as u32)], &[], ((n_mm * mmh + 63) / 64) as u64, 64);
         // GELU to a DIFFERENT buffer, so `ffnb` survives the encode as mm.0's
         // pre-activation value — the checkpoint the oracle taps as `ffn_up_b`.
-        self.enc_reduce(&enc, "vit_gelu", &[(&ffnb, 0), (&rowsb, 1)],
-            &[(2, (n_mm * mmh) as u32)], &[], ((n_mm * mmh + 255) / 256) as u64, 256);
+        self.enc_act(&enc, &ffnb, &rowsb, encoder::Act::GeluTanh, (n_mm * mmh) as u32);
         self.projm(&enc, &rowsb, 0, "mm.2.weight", &outb, mmh as u32, pd as u32, n_mm as u32, false);
         self.enc_reduce(&enc, "add_rowbias_m", &[(&outb, 0), (&self.wt.w32["mm.2.bias"], 1)],
             &[(2, pd as u32), (3, (n_mm * pd) as u32)], &[], ((n_mm * pd + 63) / 64) as u64, 64);

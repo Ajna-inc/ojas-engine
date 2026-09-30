@@ -1287,8 +1287,33 @@ impl<'a> DecoderGpu<'a> {
         self.check_shape(wname, k, n);
         if self.wt.q8 {
             self.gemm8_off(enc, x, x_off, &self.wt.w8[wname], &self.wt.scale8[wname], y, k, n, m, accum);
+        } else if self.p.contains_key("gemm_mm_f16_fat") {
+            self.gemm16_fat(enc, x, x_off, &self.wt.w16[wname], y, k, n, m, accum);
         } else {
             self.gemm16_off(enc, x, x_off, &self.wt.w16[wname], y, k, n, m, accum);
+        }
+    }
+
+    /// f16 GEMM through `gemm_mm_f16_fat` (fat tile, double-buffered weights), with
+    /// split-K into `st.skbuf` for the narrow shapes a short request cannot fill the
+    /// GPU with; see `ojas_metal::kernels::gemm_fat::f16_fat_splits`.
+    pub(crate) fn gemm16_fat(&self, enc: &metal::ComputeCommandEncoderRef, x: &metal::Buffer, x_off: u64,
+                  w: &metal::Buffer, y: &metal::Buffer, k: u32, n: u32, m: u32, accum: bool) {
+        let scratch = (self.st.skbuf.length() / 4).min(u32::MAX as u64) as u32;
+        let nsplit = ojas_metal::kernels::gemm_fat::f16_fat_splits(m, n, k, scratch);
+        enc.set_compute_pipeline_state(&self.p["gemm_mm_f16_fat"]);
+        enc.set_buffer(0, Some(x), x_off);
+        enc.set_buffer(1, Some(w), 0);
+        enc.set_buffer(2, Some(if nsplit > 1 { &self.st.skbuf } else { y }), 0);
+        for (i, v) in [(3u64, k), (4, n), (6, accum as u32), (7, m), (9, nsplit)] {
+            enc.set_bytes(i, 4, &v as *const u32 as *const c_void);
+        }
+        enc.dispatch_thread_groups(MTLSize::new(m.div_ceil(64) as u64, (n / 64) as u64, nsplit as u64),
+                                   MTLSize::new(128, 1, 1));
+        if nsplit > 1 {
+            let total = m * n;
+            self.enc_reduce(enc, "splitk_accum", &[(&self.st.skbuf, 0), (y, 1)],
+                &[(2, total), (3, nsplit), (4, accum as u32)], &[], total.div_ceil(256) as u64, 256);
         }
     }
 

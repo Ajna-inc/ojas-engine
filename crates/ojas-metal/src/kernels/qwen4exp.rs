@@ -148,15 +148,7 @@ kernel void hc_combine(device float* res [[buffer(0)]], device const float* bloc
     res[(ulong)(t * hc + c) * (ulong)d + i] += block[(ulong)t * (ulong)d + i] * w;
 }
 
-// PLE n-gram gather: emb[h*hd + i] = table[rows[h]*hd + i], flattening the head
-// axis so the result is one d-wide vector (d == hd * n_heads).
-kernel void ple_gather(device const float* table [[buffer(0)]], device const int* rows [[buffer(1)]],
-    device float* emb [[buffer(2)]], constant uint& hd [[buffer(3)]], constant uint& n_heads [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]) {
-    if (gid >= hd * n_heads) return;
-    uint h = gid / hd, i = gid % hd;
-    emb[gid] = table[(uint)rows[h] * hd + i];
-}
+// `ple_gather` (the PLE n-gram gather) is the general row gather and lives in `ops`.
 
 // Per-stream indexer gate: s[c] = (Σ_i keyn[c*d+i]·queryn[c*d+i]) / sqrt(d), then a
 // signed square root before the sigmoid, giving one gate scalar per stream.
