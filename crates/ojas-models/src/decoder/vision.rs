@@ -211,9 +211,9 @@ impl<'a> DecoderGpu<'a> {
     /// Decides whether a comparison against `ojas_cpu::CpuVit` means anything: the
     /// oracle reads the GGUF's f16 directly, so a requantized tower would run
     /// different weights and the measured cosine would price the requantizer, not
-    /// the encoder. Measured on surya-2 at 36 patches when prec 1 still sent the
-    /// tower through `quantize_row_i8`: a projector cosine of 0.998657 against
-    /// 0.999999 in f16, with layer 0 already at 0.999930.
+    /// the encoder. On surya-2 at 36 patches, a tower requantized through
+    /// `quantize_row_i8` gives a projector cosine of 0.998657 against 0.999999 in
+    /// f16, with layer 0 already at 0.999930.
     pub fn vision_weights_f16(&self) -> bool {
         self.arch.vision.is_some() && self.wt.repr("v.blk.0.attn_qkv.weight") == Repr::F16
     }

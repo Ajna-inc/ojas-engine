@@ -422,23 +422,23 @@ impl<'a> DecoderGpu<'a> {
             // separate lm_head (output.weight) — using token_embd here gives garbage.
             // MMA GEMM (vocab 152064 %64==0).
             let vocab = self.arch.vocab as u32;
-            let lm_off = self.wt.w_off.get(&self.arch.lm_head).copied().unwrap_or(0);
-            if self.wt.w6k.get(&self.arch.lm_head).is_some_and(|w|
-                self.kquant_fat(14, &enc, &self.st.h, w, lm_off, &self.st.logits, d, vocab, m, false)) {
-                // Native Q6_K head at a prefill width: the fat GEMM.
-            } else if let Some(w) = self.wt.w6k.get(&self.arch.lm_head) {
-                // Native Q6_K head. Requires a full 64-wide N tile and 256-aligned K
-                // (one super-block); every real vocab/hidden pair satisfies both.
-                enc.set_compute_pipeline_state(&self.p["gemm_mm_q6k"]);
-                enc.set_buffer(0, Some(&self.st.h), 0);
-                enc.set_buffer(1, Some(w), self.wt.w_off.get(&self.arch.lm_head).copied().unwrap_or(0));
-                enc.set_buffer(2, Some(&self.st.logits), 0);
-                enc.set_bytes(3, 4, &d as *const u32 as *const c_void);
-                enc.set_bytes(4, 4, &vocab as *const u32 as *const c_void);
-                let zero = 0u32;
-                enc.set_bytes(6, 4, &zero as *const u32 as *const c_void);
-                enc.set_bytes(7, 4, &m as *const u32 as *const c_void);
-                enc.dispatch_thread_groups(MTLSize::new(((m + 31) / 32) as u64, (vocab / 64) as u64, 1), MTLSize::new(128, 1, 1));
+            if let Some(w) = self.wt.w6k.get(&self.arch.lm_head) {
+                // Native Q6_K head: the fat GEMM at prefill widths, else the 32-row tile.
+                // Both need a full 64-wide N tile and 256-aligned K (one super-block);
+                // every real vocab/hidden pair satisfies both.
+                let off = self.wt.w_off.get(&self.arch.lm_head).copied().unwrap_or(0);
+                if !self.kquant_fat(14, &enc, &self.st.h, w, off, &self.st.logits, d, vocab, m, false) {
+                    enc.set_compute_pipeline_state(&self.p["gemm_mm_q6k"]);
+                    enc.set_buffer(0, Some(&self.st.h), 0);
+                    enc.set_buffer(1, Some(w), off);
+                    enc.set_buffer(2, Some(&self.st.logits), 0);
+                    enc.set_bytes(3, 4, &d as *const u32 as *const c_void);
+                    enc.set_bytes(4, 4, &vocab as *const u32 as *const c_void);
+                    let zero = 0u32;
+                    enc.set_bytes(6, 4, &zero as *const u32 as *const c_void);
+                    enc.set_bytes(7, 4, &m as *const u32 as *const c_void);
+                    enc.dispatch_thread_groups(MTLSize::new(((m + 31) / 32) as u64, (vocab / 64) as u64, 1), MTLSize::new(128, 1, 1));
+                }
             } else {
                 self.gemm8(&enc, &self.st.h, &self.wt.w8[&self.arch.lm_head], &self.wt.scale8[&self.arch.lm_head],
                     &self.st.logits, d, vocab, m, false);

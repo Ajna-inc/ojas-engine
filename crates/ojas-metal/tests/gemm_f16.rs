@@ -1,7 +1,8 @@
 //! The fat GEMM (`kernels/gemm_fat.rs`) against an f64 reference over the f16-rounded
 //! operands it multiplies: `gemm_mm_f16_fat`, the encoders' f16 GEMM, and the
 //! `gemm_mm_q4k_fat`/`gemm_mm_q6k_fat` fills over GGUF K-quant rows, whose weights the
-//! reference takes from `ojas_formats::gguf::dequant_to_f16`.
+//! reference takes from `ojas_formats::gguf::dequant_to_f16`, and `gemm_mm_q8_fat` over
+//! the loader's int8 rows with per-row scales.
 //!
 //! Covered: partial token tiles (M not a multiple of 64, including 1), long K, split-K
 //! partitions reduced by `splitk_accum`, and the accumulate form the residual
@@ -193,6 +194,66 @@ fn gemm_fat_kquant_fills_match_dequant_reference() {
                 // reference from its; the two may differ by an ulp per weight.
                 assert!(worst < 1e-3, "{label}: worst relative error {worst:.3e}");
             }
+        }
+    }
+}
+
+#[test]
+fn gemm_fat_q8_fill_matches_reference() {
+    let gpu = match MetalGpu::new() {
+        Ok(g) => g,
+        Err(e) => { eprintln!("gemm_f16: no Metal device ({e}); skipping"); return; }
+    };
+    if !gpu.native_reduce {
+        eprintln!("gemm_f16: simdgroup_matrix needs Apple7/Mac2; skipping");
+        return;
+    }
+    let fat = gpu.pipeline(ojas_metal::kernels::gemm_fat::GEMM_FAT_KERNELS, "gemm_mm_q8_fat")
+        .expect("gemm_mm_q8_fat pipeline");
+    for &(m, k, n) in &[(1u32, 32u32, 64u32), (37, 96, 128), (130, 1024, 192)] {
+        for accum in [0u32, 1] {
+            let mut seed = m ^ (k << 4) ^ (n << 9) ^ (accum << 20);
+            let x: Vec<f32> = (0..(m * k) as usize).map(|_| lcg(&mut seed)).collect();
+            let w: Vec<i8> = (0..(n * k) as usize).map(|_| (lcg(&mut seed) * 127.0) as i8).collect();
+            let sc: Vec<f32> = (0..n as usize).map(|_| 0.001 + 0.01 * lcg(&mut seed).abs()).collect();
+            let y0: Vec<f32> = (0..(m * n) as usize).map(|_| lcg(&mut seed)).collect();
+            let mut init = vec![GUARD_FILL; GUARD + (m * n) as usize + 64 * n as usize + GUARD];
+            init[GUARD..GUARD + (m * n) as usize].copy_from_slice(&y0);
+            let (xb, wb, sb, yb) = (upload(&gpu, &x), upload(&gpu, &w), upload(&gpu, &sc), upload(&gpu, &init));
+
+            let cb = gpu.command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&fat);
+            enc.set_buffer(0, Some(&xb), 0);
+            enc.set_buffer(1, Some(&wb), 0);
+            enc.set_buffer(2, Some(&yb), (GUARD * 4) as u64);
+            enc.set_buffer(5, Some(&sb), 0);
+            for (i, v) in [(3u64, k), (4, n), (6, accum), (7, m), (9, 1)] {
+                enc.set_bytes(i, 4, &v as *const u32 as *const c_void);
+            }
+            enc.dispatch_thread_groups(MTLSize::new(m.div_ceil(64) as u64, (n / 64) as u64, 1),
+                                       MTLSize::new(128, 1, 1));
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            let label = format!("gemm_mm_q8_fat M={m} K={k} N={n} accum={accum}");
+            let all = host(&yb, init.len());
+            assert!(all[..GUARD].iter().all(|&v| v == GUARD_FILL), "{label}: stored before the output");
+            assert!(all[GUARD + (m * n) as usize..].iter().all(|&v| v == GUARD_FILL), "{label}: stored past row M-1");
+            let y = &all[GUARD..GUARD + (m * n) as usize];
+            let mut worst = 0f64;
+            for t in 0..m as usize {
+                for r in 0..n as usize {
+                    let dot: f64 = (0..k as usize).map(|j| {
+                        let wv = half::f16::from_f32(w[r * k as usize + j] as f32 * sc[r]).to_f64();
+                        half::f16::from_f32(x[t * k as usize + j]).to_f64() * wv
+                    }).sum();
+                    let want = dot + if accum != 0 { y0[t * n as usize + r] as f64 } else { 0.0 };
+                    worst = worst.max((y[t * n as usize + r] as f64 - want).abs() / want.abs().max(1.0));
+                }
+            }
+            assert!(worst < 1e-4, "{label}: worst relative error {worst:.3e}");
         }
     }
 }

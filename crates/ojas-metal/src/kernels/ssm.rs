@@ -84,22 +84,46 @@ kernel void conv1d_prefill(device float* qkv [[buffer(0)]], device float* cstate
     for (uint j = 0u; j < K-1u; j++) { cstate[j*n_ch + c] = st[j]; }
 }
 
+// L2-normalize each q and k head of the conv output in place, q also scaled by
+// 1/sqrt(S): the normalization `deltanet_fused` would otherwise repeat in every one
+// of a head's S columns. One simdgroup per (head, token); heads 0..H_k-1 are q,
+// H_k..2H_k-1 are k, contiguous at the start of each conv_ch row. Same arithmetic
+// as `deltanet_fused`'s l2_mode 0 and 1. Assumes S == 128.
+kernel void qk_l2norm_heads(device float* qkv [[buffer(0)]], constant uint& S [[buffer(1)]],
+    constant uint& H_k [[buffer(2)]], constant uint& conv_ch [[buffer(3)]], constant float& eps [[buffer(4)]],
+    constant uint& clamp_l2 [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]], ushort lane [[thread_index_in_simdgroup]]) {
+    device float* v = qkv + (ulong)tg.y*(ulong)conv_ch + tg.x*S + lane*4u;
+    float x[4]; float ss = 0.0;
+    _Pragma("unroll")
+    for (short j = 0; j < 4; j++) { x[j] = v[j]; ss += x[j]*x[j]; }
+    ss = simd_sum(ss);
+    float n = clamp_l2 ? 1.0/max(sqrt(ss), eps) : rsqrt(ss + eps);
+    if (tg.x < H_k) { n *= 1.0/sqrt(float(S)); }
+    _Pragma("unroll")
+    for (short j = 0; j < 4; j++) { v[j] = x[j]*n; }
+}
+
 // Gated-DeltaNet recurrence over M tokens, gated-delta-net kernel style: one simdgroup
 // per state column, the 128 column values living in registers (4 per lane) and
 // reductions via simd_sum — no threadgroup memory, no barriers, and S_v×H_v simdgroups
-// per layer, 8× the parallelism of a threadgroup-resident version. The per-head q/k
-// L2-norm is fused in (llama does it as a separate op) and the 1/sqrt(S) scale folds
-// into the q normalizer. Token-serial in-kernel, the recurrence being inherently
-// sequential. Used by decode (M=1) and prefill.
+// per layer, 8× the parallelism of a threadgroup-resident version. Decode fuses the
+// per-head q/k L2-norm in, with the 1/sqrt(S) scale folded into the q normalizer;
+// prefill normalizes beforehand (`l2_mode` 2). Token-serial in-kernel, the
+// recurrence being inherently sequential. Used by decode (M=1) and prefill.
 // q/k/v are slices of the RAW conv output rows ([M, conv_ch]); gate/beta rows
 // [M, H_v]; out rows [M, H_v*S]. Assumes S == 128 (4 regs × 32 lanes).
+// `l2_mode`: 0 normalizes q/k with eps inside the square root, 1 with eps as a
+// floor (diagnostics), 2 takes them already normalized and q pre-scaled by
+// 1/sqrt(S) (`qk_l2norm_heads`), which saves every column of a head two of the
+// four reductions per token.
 kernel void deltanet_fused(device float* state [[buffer(0)]], device const float* qkv [[buffer(1)]],
     device const float* gate [[buffer(2)]], device const float* beta [[buffer(3)]], device float* out [[buffer(4)]],
     constant uint& S [[buffer(5)]], constant uint& H_k [[buffer(6)]], constant uint& H_v [[buffer(7)]],
     constant uint& conv_ch [[buffer(8)]], constant uint& M [[buffer(9)]], constant float& eps [[buffer(10)]],
     device float* snap [[buffer(11)]], constant uint& snap_t [[buffer(12)]],
     constant uint& kmap_div [[buffer(13)]],
-    constant uint& clamp_l2 [[buffer(14)]],
+    constant uint& l2_mode [[buffer(14)]],
     uint2 tg [[threadgroup_position_in_grid]],
     ushort sgid [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
     uint h = tg.y;
@@ -125,19 +149,23 @@ kernel void deltanet_fused(device float* state [[buffer(0)]], device const float
     for (uint t = 0u; t < M; t++) {
         device const float* row = qkv + (ulong)t*(ulong)conv_ch;
         float qv[4], kv[4];
-        float sq = 0.0, s2 = 0.0;
         _Pragma("unroll")
         for (short j = 0; j < 4; j++) {
             uint is = lane*4u + j;
             qv[j] = row[hk*S + is];
             kv[j] = row[H_k*S + hk*S + is];
-            sq += qv[j]*qv[j]; s2 += kv[j]*kv[j];
         }
-        sq = simd_sum(sq); s2 = simd_sum(s2);
-        // GDN (including Flash) uses epsilon inside the squared norm.
-        // The clamp mode is retained for explicit normalization diagnostics.
-        float qn = clamp_l2 ? scale/max(sqrt(sq), eps) : rsqrt(sq + eps)*scale;
-        float kn = clamp_l2 ? 1.0/max(sqrt(s2), eps) : rsqrt(s2 + eps);
+        float qn = 1.0, kn = 1.0;
+        if (l2_mode != 2u) {
+            float sq = 0.0, s2 = 0.0;
+            _Pragma("unroll")
+            for (short j = 0; j < 4; j++) { sq += qv[j]*qv[j]; s2 += kv[j]*kv[j]; }
+            sq = simd_sum(sq); s2 = simd_sum(s2);
+            // GDN (including Flash) uses epsilon inside the squared norm.
+            // The clamp mode is retained for explicit normalization diagnostics.
+            qn = l2_mode == 1u ? scale/max(sqrt(sq), eps) : rsqrt(sq + eps)*scale;
+            kn = l2_mode == 1u ? 1.0/max(sqrt(s2), eps) : rsqrt(s2 + eps);
+        }
         float g = exp(gate[t*H_v + h]); float bet = beta[t*H_v + h];
         float sk = 0.0;
         _Pragma("unroll")

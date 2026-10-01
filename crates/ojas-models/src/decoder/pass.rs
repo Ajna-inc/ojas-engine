@@ -24,6 +24,13 @@ pub(crate) struct SplitPass<'g> {
     layers: usize,
     cb: Option<metal::CommandBuffer>,
     committed: Vec<metal::CommandBuffer>,
+    /// `OJAS_PREFILL_PROFILE`: every [`SplitPass::stage`] mark also cuts a command
+    /// buffer, and [`SplitPass::finish`] logs the GPU time per stage label.
+    profile: bool,
+    /// Stage label of the open command buffer.
+    label: &'static str,
+    /// Stage label of each committed command buffer, in commit order.
+    labels: Vec<&'static str>,
 }
 
 impl<'g> SplitPass<'g> {
@@ -32,7 +39,8 @@ impl<'g> SplitPass<'g> {
     /// splitting.
     pub(crate) fn new(gpu: &'g MetalGpu, concurrent: bool, layers: usize, rows: u32) -> Self {
         let layers = if rows < SPLIT_MIN_ROWS { 0 } else { layers };
-        SplitPass { gpu, concurrent, layers, cb: None, committed: Vec::new() }
+        let profile = ojas_core::config::EngineConfig::current().prefill_profile;
+        SplitPass { gpu, concurrent, layers, cb: None, committed: Vec::new(), profile, label: "embed", labels: Vec::new() }
     }
 
     /// Opens the first command buffer and returns its encoder.
@@ -50,11 +58,27 @@ impl<'g> SplitPass<'g> {
     /// Called before layer `l` is encoded: at a group boundary, ends `enc`, commits
     /// its command buffer and replaces `enc` with the next one's encoder.
     pub(crate) fn layer(&mut self, l: usize, enc: &mut metal::ComputeCommandEncoder) {
-        if self.layers == 0 || l == 0 || l % self.layers != 0 { return; }
+        // Profiling cuts at every stage mark, and each layer opens with one; a second
+        // cut here would leave an empty command buffer, whose timestamps are not set.
+        if self.profile || self.layers == 0 || l == 0 || l % self.layers != 0 { return; }
+        self.cut(enc);
+    }
+
+    /// Marks the start of a named stage. Free unless profiling, when it cuts a
+    /// command buffer so the stage's GPU time can be read on its own; the encoders
+    /// then see one stage at a time, so overlap between stages is not measured.
+    pub(crate) fn stage(&mut self, label: &'static str, enc: &mut metal::ComputeCommandEncoder) {
+        if !self.profile { return; }
+        self.cut(enc);
+        self.label = label;
+    }
+
+    fn cut(&mut self, enc: &mut metal::ComputeCommandEncoder) {
         enc.end_encoding();
-        let done = self.cb.take().expect("SplitPass::layer before open");
+        let done = self.cb.take().expect("SplitPass used before open");
         done.commit();
         self.committed.push(done);
+        self.labels.push(self.label);
         *enc = self.open();
     }
 
@@ -66,11 +90,22 @@ impl<'g> SplitPass<'g> {
         let last = self.cb.take().expect("SplitPass::finish before open");
         last.commit();
         self.committed.push(last);
+        self.labels.push(self.label);
         let mut gpu = 0.0;
-        for cb in &self.committed {
+        let mut stages: Vec<(&'static str, f64)> = Vec::new();
+        for (cb, &label) in self.committed.iter().zip(&self.labels) {
             let _ = ojas_metal::wait_checked(cb, context);
             let (gs, ge): (f64, f64) = unsafe { (msg_send![&**cb, GPUStartTime], msg_send![&**cb, GPUEndTime]) };
-            gpu += ge - gs;
+            let t = ge - gs;
+            gpu += t;
+            match stages.iter_mut().find(|s| s.0 == label) {
+                Some(s) => s.1 += t,
+                None => stages.push((label, t)),
+            }
+        }
+        if self.profile {
+            let line: Vec<String> = stages.iter().map(|(l, t)| format!("{l}={:.3}", t * 1e3)).collect();
+            tracing::info!(target: "prefill", "{context} stages ms: {}", line.join(" "));
         }
         gpu
     }

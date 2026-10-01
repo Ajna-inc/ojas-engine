@@ -129,6 +129,10 @@ pub struct EngineConfig {
     /// Interactivity"); see `ojas-models` `decoder/pass.rs`. 0 keeps each chunk in
     /// one command buffer.
     pub prefill_cb_layers: usize,
+    /// OJAS_PREFILL_PROFILE — log the GPU time of each named stage of a batched
+    /// prefill chunk (`decoder/pass.rs`). Splits every stage into its own command
+    /// buffer, so the total runs slower than unprofiled.
+    pub prefill_profile: bool,
     /// OJAS_PREFILL_DBG — prefill debug prints.
     pub prefill_dbg: bool,
     /// OJAS_NO_PREFIX_REUSE — disable cross-turn KV-prefix reuse (dense + SSM),
@@ -310,6 +314,7 @@ impl EngineConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
+            prefill_profile: flag("OJAS_PREFILL_PROFILE"),
             prefill_dbg: flag("OJAS_PREFILL_DBG"),
             no_prefix_reuse: flag("OJAS_NO_PREFIX_REUSE"),
             moe_dbuf: flag("OJAS_MOE_DBUF"),

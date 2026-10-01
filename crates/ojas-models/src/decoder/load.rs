@@ -307,22 +307,23 @@ impl<'a> DecoderGpu<'a> {
     /// Precision 4 streams mixture-of-experts weights from disk, and to do so keeps
     /// every other quantized tensor in the file's own format behind the native
     /// kernels. For a dense model that buys nothing, since all of it is resident
-    /// anyway. M2 Max, cold prefill, precision 3 against 4:
+    /// anyway. M2 Max, precision 3 against 4:
     ///
-    /// | file                       | decode tok/s  | first token      |
-    /// |----------------------------|---------------|------------------|
-    /// | Qwen3.5 4B Q4_K_M, 591 tok | 79.9 vs 84.8  | 0.67 s vs 0.78 s |
-    /// | same, 2340 tok             | 74.5 vs 78.8  | 2.41 s vs 2.81 s |
-    /// | Qwen3.5 4B F16, 591 tok    | 55.4 vs 33.1  | 0.72 s vs 0.69 s |
-    /// | Qwen3 0.6B F16             | 202 vs 125    | 0.02 s vs 0.12 s |
-    /// | Qwen2.5 0.5B Q8_0          | 249 vs 201    | 0.02 s vs 0.07 s |
+    /// | file                       | decode tok/s  | prompt               |
+    /// |----------------------------|---------------|----------------------|
+    /// | Qwen3.5 4B Q4_K_M          | 82.7 vs 81.8  | 1082 vs 901 tok/s    |
+    /// | Ornith 9B Q4_K_M           | 49.2 vs 48.9  | 621 vs 521 tok/s     |
+    /// | Qwen3.5 4B F16, 591 tok    | 55.4 vs 33.1  | 0.72 s vs 0.69 s     |
+    /// | Qwen3 0.6B F16             | 202 vs 125    | 0.02 s vs 0.12 s     |
+    /// | Qwen2.5 0.5B Q8_0          | 249 vs 201    | 0.02 s vs 0.07 s     |
     ///
-    /// On a K-quant file the two are close: precision 4 reads the file's own Q4_K and
-    /// Q6_K bytes, which are fewer than precision 3's Q8 copies of the Q6_K tensors, so
-    /// it decodes ~6% faster and loads in 0.1 s against 1.1; precision 3's tuned Q4L
-    /// tiles prefill ~15% faster. Prompts outweigh replies in the workloads this
-    /// engine serves (page context, OCR), and on F16 and Q8_0 files precision 3 wins
-    /// outright, so dense decoders take precision 3.
+    /// (Q4_K_M rows: 512-token prompt and 128-token decode; the others: first token
+    /// of a 591-token prompt.) On a K-quant file the two decode alike, since precision
+    /// 4 reads the file's own Q4_K and Q6_K bytes through native kernels as fast as
+    /// precision 3's relayout, and precision 4 loads in 0.1 s against 1.1; precision
+    /// 3's tuned Q4L tiles process prompts ~20% faster. Prompts outweigh replies in
+    /// the workloads this engine serves (page context, OCR), and on F16 and Q8_0 files
+    /// precision 3 wins outright, so dense decoders take precision 3.
     ///
     /// Precision 3 stores F16 and Q8_0 matrices as Q8 and Q4_K as its Q4L relayout;
     /// `--precision 4` (or 0 for f16) keeps a file exact. It cannot overcommit

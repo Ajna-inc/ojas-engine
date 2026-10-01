@@ -1249,6 +1249,39 @@ impl<'a> DecoderGpu<'a> {
             // pass from 52.6 to 87.3 ms at M=8. The padded GEMM beats gemv_m_q4l even
             // when it throws away 3/4 of the tile, despite the grid collapsing to N/64
             // threadgroups (32 of them for n=2048 on a 38-core GPU).
+            // Prefill widths take the fat tile (64x64, double-buffered weights); a
+            // verify step's handful of rows keeps the 32-row base tile. Long-K
+            // narrow-N shapes (ffn_down) split K the way the Q4L path does, for the
+            // same reason: N = 2560 gives 160 tiles for 38 cores. The partials go to
+            // `st.skbuf` and a barrier precedes the reduce; no other GEMM runs beside
+            // these accumulating projections. OJAS_NO_Q8_FAT opts out for A/B.
+            if self.gpu.native_reduce && n % 64 == 0 && k % 32 == 0 && m > 32
+                && self.p.contains_key("gemm_mm_q8_fat") && std::env::var("OJAS_NO_Q8_FAT").is_err() {
+                let mut nsplit = 1u32;
+                if k >= sk_kmin() && n <= 4096 && m <= MAXM as u32 && std::env::var("OJAS_NO_SK").is_err() {
+                    let tiles = m.div_ceil(64) * (n / 64);
+                    nsplit = (1024 / tiles.max(1)).clamp(1, 8);
+                    let room = self.st.skbuf.length() / 4;
+                    while nsplit > 1 && ((k / nsplit) < 32 || (nsplit * m * n) as u64 > room) { nsplit -= 1; }
+                }
+                enc.set_compute_pipeline_state(&self.p["gemm_mm_q8_fat"]);
+                enc.set_buffer(0, Some(x), x_off);
+                enc.set_buffer(1, Some(w), 0);
+                enc.set_buffer(2, Some(if nsplit > 1 { &self.st.skbuf } else { y }), 0);
+                enc.set_buffer(5, Some(scale), 0);
+                for (i, v) in [(3u64, k), (4, n), (6, accum as u32), (7, m), (9, nsplit)] {
+                    enc.set_bytes(i, 4, &v as *const u32 as *const c_void);
+                }
+                enc.dispatch_thread_groups(MTLSize::new(m.div_ceil(64) as u64, (n / 64) as u64, nsplit as u64),
+                                           MTLSize::new(128, 1, 1));
+                if nsplit > 1 {
+                    self.barc(enc);
+                    let total = m * n;
+                    self.enc_reduce(enc, "splitk_accum", &[(&self.st.skbuf, 0), (y, 1)],
+                        &[(2, total), (3, nsplit), (4, accum as u32)], &[], total.div_ceil(256) as u64, 256);
+                }
+                return;
+            }
             if self.gpu.native_reduce && n % 64 == 0 && k % 32 == 0 && m > mrow_max() {
             enc.set_compute_pipeline_state(&self.p["gemm_mm_q8"]);
             enc.set_buffer(0, Some(x), x_off);
@@ -1301,8 +1334,8 @@ impl<'a> DecoderGpu<'a> {
         }
     }
 
-    /// A `gemm_fat.rs` fat GEMM (`entry` names the weight format: f16, Q4_K or Q6_K
-    /// as stored). `split_k` allows split-K into `st.skbuf` for the narrow shapes a
+    /// A `gemm_fat.rs` fat GEMM over f16, Q4_K or Q6_K weights as stored (`entry`
+    /// names the format). `split_k` allows split-K into `st.skbuf` for the narrow shapes a
     /// short request cannot fill the GPU with (see
     /// `ojas_metal::kernels::gemm_fat::f16_fat_splits`); it needs a serial encoder,
     /// since the reduce follows the GEMM with no barrier and every split shares one
@@ -1332,8 +1365,8 @@ impl<'a> DecoderGpu<'a> {
     /// encoded nothing, for any other type, a short M, a shape the tile does not
     /// cover, or a GPU without simdgroup matrices; the caller then keeps its GEMV.
     ///
-    /// The batched GEMV is what prefill ran on before: Qwen3.5 4B Q4_K_M at
-    /// precision 4, 591-token prompt, first token 7.7 s (M2 Max).
+    /// Against the batched GEMV it replaces at these widths: Qwen3.5 4B Q4_K_M at
+    /// precision 4, 591-token prompt, first token 0.95 s instead of 7.7 s (M2 Max).
     pub(crate) fn kquant_fat(&self, ty: u32, enc: &metal::ComputeCommandEncoderRef, x: &metal::Buffer,
                              w: &metal::Buffer, w_off: u64, y: &metal::Buffer, k: u32, n: u32, m: u32, accum: bool) -> bool {
         let entry = match ty { 12 => "gemm_mm_q4k_fat", 14 => "gemm_mm_q6k_fat", _ => return false };
