@@ -1693,7 +1693,7 @@ pub fn ocr(model: &str, target: &str, opts: &RunOpts, context: usize) -> Result<
                 }
             };
             let (n, ttft, decode) =
-                stream(&core, bpe, &prompt.ids, opts.n_predict, opts, secondary, &mut guard);
+                stream(&core, bpe, &prompt.ids, opts.n_predict, opts, secondary, None, &mut guard);
             tokens += n;
             done_pages += 1;
             // The same clamp the scheduler applies per slot, through the same function:

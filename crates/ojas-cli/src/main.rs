@@ -10,6 +10,7 @@
 
 mod backend;
 mod cmds;
+mod constrain;
 #[cfg(target_os = "macos")]
 mod decide;
 mod detok;
@@ -81,6 +82,10 @@ runtime flags:
   -f,    --file FNAME     read the prompt from a file
   -sys,  --system TEXT    system prompt
          --raw            no chat template; feed the prompt verbatim
+         --stop S         stop before text S (repeatable; S is not printed)
+         --json-object    output any JSON object
+         --json-schema S / --json-schema-file F   output JSON matching the schema
+         --grammar G / --grammar-file F           output matching a GBNF grammar
          --temp N         sampling temperature (0 = greedy, the exact path)
          --top-p N        nucleus mass
          --top-k N        sampling top-k

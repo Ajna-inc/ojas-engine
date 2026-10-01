@@ -6,11 +6,11 @@
 //! callback drift.
 
 use crate::backend::{with_model, ModelInfo};
-use crate::detok::Detok;
+use crate::detok::TextStream;
 use crate::flags::RunOpts;
 use anyhow::{bail, Context, Result};
 use ojas_core::Model;
-use ojas_infer::EngineCore;
+use ojas_infer::{EngineCore, LogitProcessor};
 use ojas_tokenize::Bpe;
 use std::io::{IsTerminal, Write};
 
@@ -87,20 +87,22 @@ pub(crate) fn stream(
     want: usize,
     opts: &RunOpts,
     also_stop: Option<u32>,
+    processor: Option<&mut dyn LogitProcessor>,
     guard: &mut dyn FnMut(u32) -> bool,
 ) -> (usize, f64, f64) {
     let t0 = std::time::Instant::now();
     let mut first: Option<std::time::Instant> = None;
     let mut last = t0;
     let mut n = 0usize;
-    let mut d = Detok::default();
+    let mut text = TextStream::new(&opts.stop);
     let mut out = std::io::stdout();
     let progress = std::io::stderr().is_terminal();
 
-    core.generate_with(
+    core.generate_ex(
         ids,
         want,
         opts.sampling(),
+        processor,
         &mut |done, total| {
             // Carriage-return progress only works on a terminal; piped or
             // redirected, `\r` erases nothing and the percentages interleave
@@ -124,17 +126,17 @@ pub(crate) fn stream(
             }
             last = std::time::Instant::now();
             n += 1;
-            let piece = d.push(bpe, t);
+            let (piece, stopped) = text.push(bpe, t);
             if !piece.is_empty() {
                 let _ = out.write_all(piece.as_bytes());
                 let _ = out.flush();
             }
             // After the write, so a guard that stops the run still leaves the
             // token that tripped it visible.
-            guard(t)
+            !stopped && guard(t)
         },
     );
-    let tail = d.finish();
+    let tail = text.finish();
     if !tail.is_empty() {
         let _ = out.write_all(tail.as_bytes());
         let _ = out.flush();
@@ -165,9 +167,13 @@ pub fn run(model: &str, opts: &RunOpts, positional: Option<&str>, context: usize
         let mut core = EngineCore::new(m);
         core.eos = primary;
         core.eog = info.eog.clone();
+        let mut constraint = match &opts.format {
+            Some(f) => crate::constrain::processor(Some(f), &crate::constrain::vocab(bpe, info))?,
+            None => None,
+        };
 
         let (n, ttft, decode) =
-            stream(&core, bpe, &ids, opts.n_predict, opts, secondary, &mut |_| true);
+            stream(&core, bpe, &ids, opts.n_predict, opts, secondary, constraint.as_mut().map(|p| p as &mut dyn LogitProcessor), &mut |_| true);
         // Output printed before the fault came out of valid work; anything after
         // it would not. Fail rather than let a truncated answer look complete.
         if let Some(err) = ojas_core::device_fault::peek() {
@@ -192,6 +198,8 @@ pub fn chat(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
         let mut core = EngineCore::new(m);
         core.eos = primary;
         core.eog = info.eog.clone();
+        // Built once for the session, and only when the output is constrained.
+        let vocab = opts.format.as_ref().map(|_| crate::constrain::vocab(bpe, info));
 
         let mut turns: Vec<(String, String)> = Vec::new();
         loop {
@@ -229,27 +237,32 @@ pub fn chat(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
 
             // Capture the reply so the next turn can include it.
             let mut reply = String::new();
-            let mut d = Detok::default();
+            let mut text = TextStream::new(&opts.stop);
             let mut out = std::io::stdout();
-            core.generate_with(
+            let mut constraint = match &vocab {
+                Some(v) => crate::constrain::processor(opts.format.as_ref(), v)?,
+                None => None,
+            };
+            core.generate_ex(
                 &ids,
                 opts.n_predict,
                 opts.sampling(),
+                constraint.as_mut().map(|p| p as &mut dyn LogitProcessor),
                 &mut |_, _| {},
                 &mut |t| {
                     if Some(t) == secondary {
                         return false;
                     }
-                    let piece = d.push(bpe, t);
+                    let (piece, stopped) = text.push(bpe, t);
                     if !piece.is_empty() {
                         reply.push_str(&piece);
                         let _ = out.write_all(piece.as_bytes());
                         let _ = out.flush();
                     }
-                    true
+                    !stopped
                 },
             );
-            let tail = d.finish();
+            let tail = text.finish();
             if !tail.is_empty() {
                 reply.push_str(&tail);
                 let _ = out.write_all(tail.as_bytes());

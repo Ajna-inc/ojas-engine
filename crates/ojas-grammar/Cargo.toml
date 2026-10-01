@@ -1,0 +1,15 @@
+[package]
+name = "ojas-grammar"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Grammar-constrained decoding: GBNF grammars, JSON Schema, and per-token masks."
+
+[dependencies]
+anyhow = "1"
+ojas-infer = { path = "../ojas-infer" }
+ojas-tokenize = { path = "../ojas-tokenize" }
+# Object properties are emitted in the order the schema declares them, which needs
+# the parsed map to keep insertion order.
+serde_json = { version = "1", features = ["preserve_order"] }

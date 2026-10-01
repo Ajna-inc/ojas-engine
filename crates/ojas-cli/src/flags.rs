@@ -28,6 +28,12 @@ pub struct RunOpts {
     /// Feed the prompt to the model verbatim, with no chat template around it.
     pub raw: bool,
     pub sample: SampleOpts,
+    /// Stop strings (`--stop`, repeatable): generation ends before the first one
+    /// and it is not printed.
+    pub stop: Vec<String>,
+    /// Constrained output: any JSON object, JSON matching a schema, or a GBNF
+    /// grammar. At most one.
+    pub format: Option<ojas_grammar::OutputFormat>,
     pub host: String,
     pub port: u16,
     /// Repetitions for `bench`.
@@ -79,6 +85,8 @@ impl Default for RunOpts {
             prompt_file: None,
             system: String::new(),
             raw: false,
+            stop: Vec::new(),
+            format: None,
             token: None,
             token_file: None,
             trust: None,
@@ -274,6 +282,7 @@ pub fn take_engine_flags(args: &mut Vec<String>) -> Result<EngineConfig> {
 /// that rejects unknown flags, so it must run last.
 pub fn take_run_flags(args: &mut Vec<String>) -> Result<RunOpts> {
     let mut o = RunOpts::default();
+    let mut repeat_penalty_set = false;
     let mut rest: Vec<String> = Vec::with_capacity(args.len());
     let mut i = 0usize;
     while i < args.len() {
@@ -294,10 +303,28 @@ pub fn take_run_flags(args: &mut Vec<String>) -> Result<RunOpts> {
             "-f" | "--file" => o.prompt_file = Some(take(&mut i)?),
             "-sys" | "--system" | "--system-prompt" => o.system = take(&mut i)?,
             "--raw" | "--no-template" => o.raw = true,
+            "--stop" => o.stop.push(take(&mut i)?),
+            "--json-object" | "--json-schema" | "--json-schema-file" | "--grammar" | "--grammar-file" => {
+                use ojas_grammar::OutputFormat;
+                if o.format.is_some() {
+                    anyhow::bail!("give at most one of --json-object, --json-schema(-file), --grammar(-file)");
+                }
+                let file = |path: String| std::fs::read_to_string(&path).with_context(|| format!("{a}: reading {path}"));
+                let schema = |text: String| -> Result<serde_json::Value> {
+                    serde_json::from_str(&text).with_context(|| format!("{a}: not valid JSON"))
+                };
+                o.format = Some(match a.as_str() {
+                    "--json-object" => OutputFormat::JsonObject,
+                    "--json-schema" => OutputFormat::JsonSchema(schema(take(&mut i)?)?),
+                    "--json-schema-file" => OutputFormat::JsonSchema(schema(file(take(&mut i)?)?)?),
+                    "--grammar" => OutputFormat::Grammar(take(&mut i)?),
+                    _ => OutputFormat::Grammar(file(take(&mut i)?)?),
+                });
+            }
             "--temp" | "--temperature" => { o.sample.temperature = num!(&mut i); o.sample_set = true; }
             "--top-p" => { o.sample.top_p = num!(&mut i); o.sample_set = true; }
             "--top-k" => { o.sample.top_k = num!(&mut i); o.sample_set = true; }
-            "--repeat-penalty" => { o.sample.repeat_penalty = num!(&mut i); o.sample_set = true; }
+            "--repeat-penalty" => { o.sample.repeat_penalty = num!(&mut i); o.sample_set = true; repeat_penalty_set = true; }
             "--repeat-last-n" => o.sample.repeat_window = num!(&mut i),
             "-s" | "--seed" => o.sample.seed = num!(&mut i),
             "--device" => o.device = Device::parse(&take(&mut i)?)?,
@@ -348,6 +375,12 @@ pub fn take_run_flags(args: &mut Vec<String>) -> Result<RunOpts> {
         i += 1;
     }
     *args = rest;
+    // Structured output repeats its punctuation by design (`":`, `",` on every
+    // field), and a repetition penalty pushes the model off exactly those tokens:
+    // keys swallow their colons and strings gain stray escapes. Off unless asked for.
+    if o.format.is_some() && !repeat_penalty_set {
+        o.sample.repeat_penalty = 1.0;
+    }
     Ok(o)
 }
 

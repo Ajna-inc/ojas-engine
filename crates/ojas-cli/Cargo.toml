@@ -19,6 +19,7 @@ ojas-core = { path = "../ojas-core" }
 ojas-formats = { path = "../ojas-formats" }
 ojas-tokenize = { path = "../ojas-tokenize" }
 ojas-infer = { path = "../ojas-infer" }
+ojas-grammar = { path = "../ojas-grammar" }
 ojas-cpu = { path = "../ojas-cpu" }
 ojas-vision = { path = "../ojas-vision" }
 tracing = { workspace = true }

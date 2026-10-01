@@ -2,6 +2,9 @@
 //! (prefill → decode loop, greedy or sampled). Sessions/spec/diffusion entries
 //! remain on the concrete model types.
 
+mod stop;
+pub use stop::StopMatcher;
+
 use ojas_core::cancel::STREAM_CANCEL;
 use ojas_core::Model;
 use std::sync::atomic::Ordering;
@@ -22,6 +25,55 @@ impl Default for SampleOpts {
     fn default() -> Self {
         SampleOpts { temperature: 0.8, top_p: 0.95, top_k: 0, repeat_penalty: 1.1, repeat_window: 64, seed: 42 }
     }
+}
+
+/// A per-token constraint on what may be generated: grammar-constrained output,
+/// a JSON schema, or any caller-defined mask.
+///
+/// Each step the engine reads the logits on the host, lets [`process`](Self::process)
+/// edit them, and then picks a token as it would unconstrained (argmax, or a sample
+/// within the sampler's top-k window), keeping the best-ranked candidate that
+/// [`allows`](Self::allows) accepts. Checking candidates in rank order is exact
+/// for greedy decoding and samples from the allowed part of the window, without
+/// building a full-vocabulary mask on every step. Speculative decoding is off while
+/// a processor is attached: a drafted token would bypass the check.
+pub trait LogitProcessor {
+    /// Edit this step's logits in place; `f32::NEG_INFINITY` forbids a token.
+    fn process(&mut self, _logits: &mut [f32]) {}
+    /// Whether `token` may be the next token.
+    fn allows(&mut self, _token: u32) -> bool { true }
+    /// `token` was chosen.
+    fn accept(&mut self, _token: u32) {}
+    /// Nothing may follow the tokens accepted so far: stop here.
+    fn finished(&self) -> bool { false }
+}
+
+/// Why [`EngineCore::generate_ex`] stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinishReason {
+    /// The model produced an end-of-generation token.
+    Stop,
+    /// `max_tokens` or the context ran out.
+    Length,
+    /// The [`LogitProcessor`] reported its output complete.
+    Complete,
+    /// The [`LogitProcessor`] allowed no token at this step.
+    NoAllowedToken,
+    /// The `on_token` callback asked to stop (a stop string, a closed client).
+    Caller,
+    /// Cancelled through `STREAM_CANCEL`.
+    Cancelled,
+    /// A device fault was latched; the last tokens are not trustworthy.
+    Fault,
+    /// Constrained decoding needs the model's logits, which it does not expose.
+    NoLogits,
+}
+
+/// The tokens [`EngineCore::generate_ex`] produced and why it stopped.
+#[derive(Clone, Debug)]
+pub struct Generation {
+    pub tokens: Vec<u32>,
+    pub finish: FinishReason,
 }
 
 /// xorshift64* — tiny deterministic RNG (no dependency, stable across builds).
@@ -67,6 +119,56 @@ fn sample_logits(logits: &mut [f32], recent: &[u32], o: &SampleOpts, rng: &mut R
         if r <= 0.0 { return idx[i]; }
     }
     idx[keep - 1]
+}
+
+/// Pick a token from `logits` among those `allows` accepts: the best-ranked allowed
+/// id when `opts` is greedy (or absent), otherwise a sample over the allowed ids
+/// in the sampler's window (top-k, or the top 256 when top-k is off), after the
+/// repetition penalty. When nothing in the window is allowed the scan continues
+/// down the ranking. `None` when no finite-logit token is allowed at all.
+fn pick_allowed(logits: &mut [f32], recent: &[u32], opts: Option<&SampleOpts>, rng: &mut Rng,
+                allows: &mut dyn FnMut(u32) -> bool) -> Option<u32> {
+    let sampled = opts.filter(|o| o.temperature > 0.0);
+    if let Some(o) = sampled {
+        if o.repeat_penalty > 1.0 {
+            for &t in recent {
+                let l = &mut logits[t as usize];
+                *l = if *l > 0.0 { *l / o.repeat_penalty } else { *l * o.repeat_penalty };
+            }
+        }
+    }
+    // Greedy: the argmax is usually allowed, so try it before ranking anything.
+    let arg = (0..logits.len()).max_by(|&a, &b| logits[a].total_cmp(&logits[b]))?;
+    if sampled.is_none() && logits[arg].is_finite() && allows(arg as u32) {
+        return Some(arg as u32);
+    }
+    let mut order: Vec<usize> = (0..logits.len()).filter(|&i| logits[i] > f32::NEG_INFINITY).collect();
+    order.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    let window = sampled.map(|o| if o.top_k > 0 { o.top_k } else { 256 }).unwrap_or(1).min(order.len());
+    let mut keep: Vec<usize> = order[..window].iter().copied().filter(|&i| allows(i as u32)).collect();
+    if keep.is_empty() {
+        keep = order[window..].iter().copied().find(|&i| allows(i as u32)).into_iter().collect();
+    }
+    let first = *keep.first()?;
+    let Some(o) = sampled else { return Some(first as u32) };
+    let inv_t = 1.0 / o.temperature.max(1e-4);
+    let mx = logits[first];
+    let mut probs: Vec<f32> = keep.iter().map(|&i| ((logits[i] - mx) * inv_t).exp()).collect();
+    let sum: f32 = probs.iter().sum();
+    for p in probs.iter_mut() { *p /= sum; }
+    let mut mass = 0.0;
+    let mut n = probs.len();
+    for (i, &p) in probs.iter().enumerate() {
+        mass += p;
+        if mass >= o.top_p { n = i + 1; break; }
+    }
+    let total: f32 = probs[..n].iter().sum();
+    let mut r = rng.next_f32() * total;
+    for i in 0..n {
+        r -= probs[i];
+        if r <= 0.0 { return Some(keep[i] as u32); }
+    }
+    Some(keep[n - 1] as u32)
 }
 
 /// The frontend decode/prefill host loop, generic over the model contract.
@@ -162,20 +264,7 @@ impl<M: Model> EngineCore<M> {
         if self.eog.is_empty() { Some(t) == self.eos } else { self.eog.contains(&t) }
     }
 
-    /// Argmax over `logits` excluding the banned ids.
-    fn best_allowed(&self, logits: &[f32]) -> u32 {
-        let mut best = (f32::NEG_INFINITY, 0u32);
-        for (i, &v) in logits.iter().enumerate() {
-            let id = i as u32;
-            if self.banned.contains(&id) { continue; }
-            if v > best.0 { best = (v, id); }
-        }
-        best.1
-    }
-
     /// Generate up to `max_tokens` ids after `prompt_ids` (greedy or default-sampled).
-
-
     pub fn generate(&self, prompt_ids: &[u32], max_tokens: usize, greedy: bool) -> Vec<u32> {
         let opts = if greedy { None } else { Some(SampleOpts::default()) };
         self.generate_with(prompt_ids, max_tokens, opts.as_ref(), &mut |_, _| {}, &mut |_| true)
@@ -222,7 +311,26 @@ impl<M: Model> EngineCore<M> {
         on_prefill: &mut dyn FnMut(usize, usize),
         on_token: &mut dyn FnMut(u32) -> bool,
     ) -> Vec<u32> {
-        if prompt_ids.is_empty() || max_tokens == 0 { return Vec::new(); }
+        self.generate_ex(prompt_ids, max_tokens, opts, None, on_prefill, on_token).tokens
+    }
+
+    /// [`EngineCore::generate_with`] with an optional [`LogitProcessor`] constraining
+    /// every token, returning why generation stopped as well as the tokens.
+    ///
+    /// A processor (or a non-empty `banned` set) reads the logits on the host each
+    /// step, so the model must expose them; one that does not stops at once with
+    /// [`FinishReason::NoLogits`] rather than emit unconstrained tokens.
+    pub fn generate_ex(
+        &self,
+        prompt_ids: &[u32],
+        max_tokens: usize,
+        opts: Option<&SampleOpts>,
+        mut processor: Option<&mut dyn LogitProcessor>,
+        on_prefill: &mut dyn FnMut(usize, usize),
+        on_token: &mut dyn FnMut(u32) -> bool,
+    ) -> Generation {
+        let ended = |tokens: Vec<u32>, finish: FinishReason| Generation { tokens, finish };
+        if prompt_ids.is_empty() || max_tokens == 0 { return ended(Vec::new(), FinishReason::Length); }
         let capacity = self.model.context_capacity();
         assert!(prompt_ids.len() <= capacity, "prompt exceeds allocated model context");
         let max_tokens = max_tokens.min(capacity.saturating_sub(prompt_ids.len()).saturating_add(1));
@@ -256,7 +364,7 @@ impl<M: Model> EngineCore<M> {
             let mut done = start;
             while done < total {
                 if STREAM_CANCEL.load(Ordering::Relaxed) {
-                    return out;
+                    return ended(out, FinishReason::Cancelled);
                 }
                 let end = (done + PREFILL_STEP).min(total);
                 self.model.prefill(&pre[done..end], done);
@@ -284,8 +392,8 @@ impl<M: Model> EngineCore<M> {
         // id is forbidden. Verifying against a banned argmax would either emit the
         // banned token or change what "verified" means, so speculation is disabled
         // rather than given different semantics from the single-token path.
-        let suppressing = !self.banned.is_empty();
-        let mut spec_on = greedy && !spec_disabled() && !suppressing;
+        let constrained = !self.banned.is_empty() || processor.is_some();
+        let mut spec_on = greedy && !spec_disabled() && !constrained;
         // Full token history (prompt + output) is what the drafter searches.
         let mut hist: Vec<u32> = if spec_on { prompt_ids.to_vec() } else { Vec::new() };
 
@@ -317,7 +425,7 @@ impl<M: Model> EngineCore<M> {
         // a block that shares the backbone, so it fires on novel text where lookup
         // finds nothing, but it costs a real forward.
         let (mut mtp_t, mut mtp_n, mut mtp_acc) = (0.0f64, 0u32, 0.0f64);
-        let mtp_on = greedy && !spec_disabled() && self.model.has_mtp();
+        let mtp_on = greedy && !spec_disabled() && !constrained && self.model.has_mtp();
         // Whether the measured accept rate pays for the measured verify cost.
         //
         // Returns false, not true, when there is nothing to compare (`n_single == 0`,
@@ -334,6 +442,7 @@ impl<M: Model> EngineCore<M> {
             avg_acc * ts > tv * 1.05                            // 5% margin
         };
 
+        let mut finish = FinishReason::Length;
         while out.len() < max_tokens {
             // Only pay for a batched verify when there is a confident (>=3-gram)
             // match. On novel text the drafter returns nothing and costs one array
@@ -421,15 +530,15 @@ impl<M: Model> EngineCore<M> {
                                 acc_hist[accepted.len().min(15)] += 1;
                             }
                             let mut stop = false;
-                            if ojas_core::device_fault::is_faulted() { break; }
+                            if ojas_core::device_fault::is_faulted() { finish = FinishReason::Fault; break; }
                             for t in accepted {
                                 pos += 1;
                                 out.push(t);
                                 hist.push(t);
                                 cur = t;
-                                if self.is_stop(t) { stop = true; break; }
-                                if !on_token(t) { stop = true; break; }
-                                if out.len() >= max_tokens { stop = true; break; }
+                                if self.is_stop(t) { finish = FinishReason::Stop; stop = true; break; }
+                                if !on_token(t) { finish = FinishReason::Caller; stop = true; break; }
+                                if out.len() >= max_tokens { finish = FinishReason::Length; stop = true; break; }
                             }
                             if stop { break; }
                             continue;
@@ -449,7 +558,7 @@ impl<M: Model> EngineCore<M> {
             if mtp_on && self.model.mtp_verify_width() <= capacity.saturating_sub(pos) && (mtp_probe || mtp_worthwhile) {
                 let tm0 = std::time::Instant::now();
                 if let Some(committed) = self.model.mtp_step_committed(cur, pos) {
-                    if STREAM_CANCEL.load(Ordering::Relaxed) { return out; }
+                    if STREAM_CANCEL.load(Ordering::Relaxed) { return ended(out, FinishReason::Cancelled); }
                     // The first verification faults GPU resources into memory. Keep its
                     // output but exclude its cost, comparing steady state over the
                     // remaining probes, so startup does not disable useful MTP.
@@ -464,9 +573,9 @@ impl<M: Model> EngineCore<M> {
                         out.push(t);
                         if spec_on { hist.push(t); }
                         cur = t;
-                        if self.is_stop(t) { stop = true; break; }
-                        if !on_token(t) { stop = true; break; }
-                        if out.len() >= max_tokens { stop = true; break; }
+                        if self.is_stop(t) { finish = FinishReason::Stop; stop = true; break; }
+                        if !on_token(t) { finish = FinishReason::Caller; stop = true; break; }
+                        if out.len() >= max_tokens { finish = FinishReason::Length; stop = true; break; }
                     }
                     if stop { break; }
                     continue;
@@ -474,21 +583,33 @@ impl<M: Model> EngineCore<M> {
             }
 
             let ts0 = std::time::Instant::now();
-            // Suppression needs the distribution: an on-device argmax cannot skip an id.
-            if suppressing {
-                let logits = self.model.forward_logits(cur, pos);
-                cur = match logits {
-                    Some(l) => self.best_allowed(&l),
-                    // A model with no logits path cannot honour a ban, so stop rather
-                    // than emit a token the caller excluded.
-                    None => break,
+            // A constraint needs the distribution: an on-device argmax cannot skip an id.
+            if constrained {
+                let Some(mut logits) = self.model.forward_logits(cur, pos) else {
+                    finish = FinishReason::NoLogits;
+                    break;
                 };
-                if cur == u32::MAX { break; }
+                if ojas_core::device_fault::is_faulted() { finish = FinishReason::Fault; break; }
+                for &b in &self.banned {
+                    if let Some(l) = logits.get_mut(b as usize) { *l = f32::NEG_INFINITY; }
+                }
+                if let Some(p) = processor.as_deref_mut() { p.process(&mut logits); }
+                let picked = match processor.as_deref_mut() {
+                    Some(p) => pick_allowed(&mut logits, &recent, opts, &mut rng, &mut |t| p.allows(t)),
+                    None => pick_allowed(&mut logits, &recent, opts, &mut rng, &mut |_| true),
+                };
+                let Some(t) = picked else { finish = FinishReason::NoAllowedToken; break; };
+                cur = t;
+                if let Some(p) = processor.as_deref_mut() { p.accept(cur); }
                 pos += 1;
                 out.push(cur);
-                if self.is_stop(cur) { break; }
-                if !on_token(cur) { break; }
-                if out.len() >= max_tokens { break; }
+                if self.is_stop(cur) { finish = FinishReason::Stop; break; }
+                if !on_token(cur) { finish = FinishReason::Caller; break; }
+                if processor.as_deref().is_some_and(|p| p.finished()) { finish = FinishReason::Complete; break; }
+                if let Some(o) = opts {
+                    recent.push(cur);
+                    if recent.len() > o.repeat_window { recent.remove(0); }
+                }
                 continue;
             }
             let sampled = opts.filter(|o| o.temperature > 0.0).and_then(|o| {
@@ -512,15 +633,15 @@ impl<M: Model> EngineCore<M> {
             };
             t_single += ts0.elapsed().as_secs_f64();
             n_single += 1;
-            if cur == u32::MAX { break; } // cancelled mid-forward
+            if cur == u32::MAX { finish = FinishReason::Cancelled; break; } // cancelled mid-forward
             // A failed command buffer leaves the output buffers undefined, so this
             // token is meaningless. Stop before emitting it.
-            if ojas_core::device_fault::is_faulted() { break; }
+            if ojas_core::device_fault::is_faulted() { finish = FinishReason::Fault; break; }
             pos += 1;
             out.push(cur);
             if spec_on { hist.push(cur); }
-            if self.is_stop(cur) { break; }
-            if !on_token(cur) { break; }
+            if self.is_stop(cur) { finish = FinishReason::Stop; break; }
+            if !on_token(cur) { finish = FinishReason::Caller; break; }
             if let Some(o) = opts {
                 recent.push(cur);
                 if recent.len() > o.repeat_window { recent.remove(0); }
@@ -547,7 +668,7 @@ impl<M: Model> EngineCore<M> {
                 eprintln!("[spec] mtp_calls={mtp_n} mtp_acc={mtp_acc:.0} mtp_t={:.3}ms", if mtp_n > 1 { mtp_t / (mtp_n - 1) as f64 * 1e3 } else { 0.0 });
             }
         }
-        out
+        ended(out, finish)
     }
 }
 
