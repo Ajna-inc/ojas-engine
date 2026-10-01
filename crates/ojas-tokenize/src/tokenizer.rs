@@ -64,6 +64,9 @@ pub struct Bpe {
     /// (id 1168) came out as `<divdata-bbox="`. llama.cpp's `token_to_piece` copies
     /// USER_DEFINED text raw for the same reason.
     literal: std::collections::HashSet<usize>,
+    /// Ids of CONTROL(3) and UNUSED(5) tokens: markers such as `<|im_end|>` that
+    /// are never text, which constrained decoding must not produce.
+    control: std::collections::HashSet<usize>,
 }
 
 impl Bpe {
@@ -96,8 +99,10 @@ impl Bpe {
         // special tokens: CONTROL(3) / USER_DEFINED(4) — matched atomically in raw text.
         let mut specials: Vec<(String, usize)> = Vec::new();
         let mut literal: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut control: std::collections::HashSet<usize> = std::collections::HashSet::new();
         if let Some(tt) = g.int_arr("tokenizer.ggml.token_type") {
             for (id, &t) in tt.iter().enumerate() {
+                if t == 3 || t == 5 { control.insert(id); }
                 if (t == 3 || t == 4) && id < tokens.len() && !tokens[id].is_empty() {
                     specials.push((tokens[id].clone(), id));
                     literal.insert(id);
@@ -107,7 +112,7 @@ impl Bpe {
         specials.sort_by(|a, b| b.0.len().cmp(&a.0.len())); // longest first
         let (enc, dec) = byte_maps();
         let split = PreSplit::for_pre(&pre);
-        Bpe { tokens, vocab, ranks, scores, spm, g4, g4_prefix, g4_split, enc, dec, specials, split, literal }
+        Bpe { tokens, vocab, ranks, scores, spm, g4, g4_prefix, g4_split, enc, dec, specials, split, literal, control }
     }
 
     pub fn encode(&self, text: &str) -> Vec<usize> {
@@ -267,6 +272,15 @@ impl Bpe {
         }
         bytes
     }
+
+    /// Number of token ids in the vocabulary.
+    pub fn len(&self) -> usize { self.tokens.len() }
+
+    pub fn is_empty(&self) -> bool { self.tokens.is_empty() }
+
+    /// Whether `id` is a control marker (`<|im_end|>`, `<|endoftext|>`, unused
+    /// slots) rather than text.
+    pub fn is_control(&self, id: usize) -> bool { self.control.contains(&id) }
 
     pub fn decode(&self, id: usize) -> String {
         let Some(tok) = self.tokens.get(id) else { return String::new() };
@@ -720,6 +734,7 @@ mod metaspace_tests {
         Bpe {
             tokens, vocab, ranks, scores: Vec::new(), spm: false, g4: true, g4_prefix: prefix, g4_split: split,
             enc, dec, specials: Vec::new(), split: PreSplit::default(), literal: Default::default(),
+            control: Default::default(),
         }
     }
 

@@ -11,7 +11,9 @@
 //! request and a blocking decode loop without buying any parallelism.
 
 use crate::backend::{with_model, ModelInfo};
-use crate::detok::Detok;
+use crate::detok::TextStream;
+use ojas_grammar::{OutputFormat, TokenVocab};
+use std::sync::Arc;
 use crate::flags::RunOpts;
 use anyhow::{Context, Result};
 use ojas_core::Model;
@@ -105,16 +107,62 @@ fn now() -> u64 {
 }
 
 /// Per-request sampling: whatever the body specifies, else the CLI defaults.
-fn sampling_from(body: &Value, base: &RunOpts) -> SampleOpts {
+/// `constrained` requests default to no repetition penalty, which fights the
+/// punctuation structured output repeats on every field.
+fn sampling_from(body: &Value, base: &RunOpts, constrained: bool) -> SampleOpts {
     let f = |k: &str, d: f32| body.get(k).and_then(Value::as_f64).map(|v| v as f32).unwrap_or(d);
     let u = |k: &str, d: usize| body.get(k).and_then(Value::as_u64).map(|v| v as usize).unwrap_or(d);
     SampleOpts {
         temperature: f("temperature", base.sample.temperature),
         top_p: f("top_p", base.sample.top_p),
         top_k: u("top_k", base.sample.top_k),
-        repeat_penalty: f("repeat_penalty", base.sample.repeat_penalty),
+        repeat_penalty: f("repeat_penalty", if constrained { 1.0 } else { base.sample.repeat_penalty }),
         repeat_window: u("repeat_last_n", base.sample.repeat_window),
         seed: body.get("seed").and_then(Value::as_u64).unwrap_or(base.sample.seed),
+    }
+}
+
+/// The output constraint a request asks for: a GBNF `grammar`, a bare
+/// `json_schema`, or OpenAI's `response_format`, `json_object` or
+/// `json_schema` (whose schema sits under `json_schema.schema`). At most one.
+fn output_format(body: &Value) -> Result<Option<OutputFormat>> {
+    let mut found: Vec<OutputFormat> = Vec::new();
+    if let Some(g) = body.get("grammar").filter(|v| !v.is_null()) {
+        let g = g.as_str().context("\"grammar\" must be a string")?;
+        if !g.trim().is_empty() { found.push(OutputFormat::Grammar(g.to_string())); }
+    }
+    if let Some(s) = body.get("json_schema").filter(|v| !v.is_null()) {
+        found.push(OutputFormat::JsonSchema(s.clone()));
+    }
+    if let Some(rf) = body.get("response_format").filter(|v| !v.is_null()) {
+        match rf.get("type").and_then(Value::as_str) {
+            None | Some("text") => {}
+            Some("json_object") => found.push(match rf.get("schema") {
+                Some(s) => OutputFormat::JsonSchema(s.clone()),
+                None => OutputFormat::JsonObject,
+            }),
+            Some("json_schema") => {
+                let schema = rf.get("json_schema").and_then(|j| j.get("schema"))
+                    .context("response_format json_schema needs json_schema.schema")?;
+                found.push(OutputFormat::JsonSchema(schema.clone()));
+            }
+            Some(other) => anyhow::bail!("unsupported response_format type \"{other}\""),
+        }
+    }
+    if found.len() > 1 {
+        anyhow::bail!("give at most one of \"grammar\", \"json_schema\", \"response_format\"");
+    }
+    Ok(found.pop())
+}
+
+/// `stop`: a string or an array of strings.
+fn stop_strings(body: &Value) -> Result<Vec<String>> {
+    match body.get("stop") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(s)) => Ok(vec![s.clone()]),
+        Some(Value::Array(a)) => a.iter().map(|v| v.as_str().map(str::to_string)
+            .context("\"stop\" entries must be strings")).collect(),
+        Some(_) => anyhow::bail!("\"stop\" must be a string or an array of strings"),
     }
 }
 
@@ -167,6 +215,7 @@ fn handle_completion(
     chat: bool,
     oai: bool,
     secondary: Option<u32>,
+    vocab: &Arc<TokenVocab>,
 ) {
     // Refuse a poisoned session before the response shape is chosen, so the client
     // gets an HTTP error rather than a stream it cannot trust.
@@ -195,14 +244,22 @@ fn handle_completion(
         .map(|v| v as usize)
         .unwrap_or(opts.n_predict)
         .min(info.context - ids.len());
-    let s = sampling_from(body, opts);
+    let stops = match stop_strings(body) {
+        Ok(v) => v,
+        Err(e) => return send_err(stream, "400 Bad Request", &format!("{e:#}")),
+    };
+    let mut constraint = match output_format(body).and_then(|f| crate::constrain::processor(f.as_ref(), vocab)) {
+        Ok(p) => p,
+        Err(e) => return send_err(stream, "400 Bad Request", &format!("{e:#}")),
+    };
+    let s = sampling_from(body, opts, constraint.is_some());
     let sampling = if s.temperature <= 0.0 { None } else { Some(&s) };
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let id = format!("cmpl-{:x}", now());
     let created = now();
     let model_name = info.arch.clone();
 
-    let mut d = Detok::default();
+    let mut d = TextStream::new(&stops);
     let mut text = String::new();
     let mut n_out = 0usize;
     let mut alive = true;
@@ -222,16 +279,17 @@ fn handle_completion(
         }
     }
 
-    core.generate_with(&ids, want, sampling, &mut |_, _| {}, &mut |t| {
+    let gen = core.generate_ex(&ids, want, sampling,
+        constraint.as_mut().map(|p| p as &mut dyn ojas_infer::LogitProcessor), &mut |_, _| {}, &mut |t| {
         if Some(t) == secondary {
             return false;
         }
-        let piece = d.push(bpe, t);
+        let (piece, stopped) = d.push(bpe, t);
         n_out += 1;
         out_ids.push(t);
         text.push_str(&piece);
         if !streaming {
-            return true;
+            return !stopped;
         }
         // Emit an event for every token, including one whose decoded piece is empty
         // because the detokenizer is still holding a multi-byte character. Skipping
@@ -257,13 +315,26 @@ fn handle_completion(
         alive = sse(stream, &ev);
         // A disconnected client must stop the decode, not keep the slot busy
         // generating into a closed socket.
-        alive
+        alive && !stopped
     });
-
+    // A model that does not expose logits cannot be constrained; it stops before
+    // emitting anything rather than produce unconstrained output.
+    if gen.finish == ojas_infer::FinishReason::NoLogits {
+        if streaming { return; }
+        return send_err(stream, "501 Not Implemented",
+            "this model's backend does not expose logits, which constrained output needs");
+    }
     let tail = d.finish();
     if !tail.is_empty() {
         text.push_str(&tail);
     }
+    let reason = crate::constrain::finish_reason(gen.finish);
+    // The /completion fields saying which way generation stopped.
+    let stopped = json!({
+        "stopped_eos": matches!(gen.finish, ojas_infer::FinishReason::Stop | ojas_infer::FinishReason::Complete),
+        "stopped_word": d.stopped(),
+        "stopped_limit": gen.finish == ojas_infer::FinishReason::Length,
+    });
     let usage = json!({
         "prompt_tokens": ids.len(),
         "completion_tokens": n_out,
@@ -292,16 +363,21 @@ fn handle_completion(
         }
         if alive {
             let done = if !oai {
-                json!({"content": tail, "stop": true, "tokens_predicted": n_out, "tokens_evaluated": ids.len()})
+                let mut e = json!({"content": tail, "stop": true, "tokens_predicted": n_out, "tokens_evaluated": ids.len()});
+                for (k, v) in stopped.as_object().unwrap() { e[k] = v.clone(); }
+                e
             } else if chat {
+                // Text held back to the end (an unfinished character, a possible
+                // stop string) goes out with the final chunk.
+                let delta = if tail.is_empty() { json!({}) } else { json!({"content": tail}) };
                 json!({
                     "id": id, "object": "chat.completion.chunk", "created": created, "model": model_name,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": usage
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": reason}], "usage": usage
                 })
             } else {
                 json!({
                     "id": id, "object": "text_completion", "created": created, "model": model_name,
-                    "choices": [{"index": 0, "text": tail, "finish_reason": "stop"}], "usage": usage
+                    "choices": [{"index": 0, "text": tail, "finish_reason": reason}], "usage": usage
                 })
             };
             sse(stream, &done);
@@ -321,6 +397,7 @@ fn handle_completion(
     let out = if !oai {
         let mut e = json!({"content": text, "stop": true, "model": model_name,
                "tokens_predicted": n_out, "tokens_evaluated": ids.len()});
+        for (k, v) in stopped.as_object().unwrap() { e[k] = v.clone(); }
         if return_tokens {
             e["tokens"] = json!(out_ids);
         }
@@ -328,13 +405,13 @@ fn handle_completion(
     } else if chat {
         json!({
             "id": id, "object": "chat.completion", "created": created, "model": model_name,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": reason}],
             "usage": usage
         })
     } else {
         json!({
             "id": id, "object": "text_completion", "created": created, "model": model_name,
-            "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "text": text, "finish_reason": reason}],
             "usage": usage
         })
     };
@@ -350,6 +427,8 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
         let (primary, secondary) = stop_ids(bpe, info);
         let mut core = EngineCore::new(m);
         core.eos = primary;
+        // Token bytes for constrained requests, built once for the session.
+        let vocab = crate::constrain::vocab(bpe, info);
 
         let addr = format!("{}:{}", opts.host, opts.port);
         let listener = TcpListener::bind(&addr).with_context(|| format!("binding {addr}"))?;
@@ -422,7 +501,7 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
                     core.banned = if ignore_eos { info.eog.clone() } else { Vec::new() };
                     core.eos = if ignore_eos { None } else { primary };
                     let stop = if ignore_eos { None } else { secondary };
-                    handle_completion(stream, &core, bpe, info, opts, &body, chat, oai, stop);
+                    handle_completion(stream, &core, bpe, info, opts, &body, chat, oai, stop, &vocab);
                 }
                 _ => send_err(stream, "404 Not Found", &format!("no route for {} {}", req.method, path)),
             }
@@ -480,7 +559,7 @@ mod tests {
     #[test]
     fn body_sampling_overrides_the_cli_default() {
         let base = RunOpts::default();
-        let s = sampling_from(&json!({"temperature": 0.1, "top_k": 5, "seed": 99}), &base);
+        let s = sampling_from(&json!({"temperature": 0.1, "top_k": 5, "seed": 99}), &base, false);
         assert!((s.temperature - 0.1).abs() < 1e-6);
         assert_eq!(s.top_k, 5);
         assert_eq!(s.seed, 99);
@@ -491,9 +570,40 @@ mod tests {
     #[test]
     fn absent_sampling_fields_fall_back_to_the_cli() {
         let base = RunOpts::default();
-        let s = sampling_from(&json!({}), &base);
+        let s = sampling_from(&json!({}), &base, false);
         assert!((s.temperature - base.sample.temperature).abs() < 1e-6);
         assert_eq!(s.repeat_window, base.sample.repeat_window);
+    }
+
+    #[test]
+    fn constrained_requests_default_to_no_repeat_penalty() {
+        let base = RunOpts::default();
+        assert_eq!(sampling_from(&json!({}), &base, true).repeat_penalty, 1.0);
+        assert_eq!(sampling_from(&json!({"repeat_penalty": 1.2}), &base, true).repeat_penalty, 1.2);
+    }
+
+    #[test]
+    fn output_format_reads_every_request_shape() {
+        let schema = json!({"type": "object", "properties": {"a": {"type": "integer"}}});
+        let f = |b: Value| output_format(&b).unwrap();
+        assert!(f(json!({})).is_none());
+        assert!(f(json!({"response_format": {"type": "text"}})).is_none());
+        assert!(matches!(f(json!({"response_format": {"type": "json_object"}})), Some(OutputFormat::JsonObject)));
+        assert!(matches!(f(json!({"response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": schema}}})),
+            Some(OutputFormat::JsonSchema(_))));
+        assert!(matches!(f(json!({"json_schema": schema})), Some(OutputFormat::JsonSchema(_))));
+        assert!(matches!(f(json!({"grammar": "root ::= \"a\""})), Some(OutputFormat::Grammar(_))));
+        assert!(output_format(&json!({"grammar": "root ::= \"a\"", "json_schema": schema})).is_err());
+        assert!(output_format(&json!({"response_format": {"type": "json_schema"}})).is_err());
+        assert!(output_format(&json!({"response_format": {"type": "xml"}})).is_err());
+    }
+
+    #[test]
+    fn stop_accepts_a_string_or_a_list() {
+        assert_eq!(stop_strings(&json!({"stop": "\n\n"})).unwrap(), vec!["\n\n"]);
+        assert_eq!(stop_strings(&json!({"stop": ["a", "b"]})).unwrap(), vec!["a", "b"]);
+        assert!(stop_strings(&json!({})).unwrap().is_empty());
+        assert!(stop_strings(&json!({"stop": 3})).is_err());
     }
 
     /// llama.cpp clients send `prompt` as an array of token ids; that has to

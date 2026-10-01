@@ -122,3 +122,40 @@ mod tests {
         assert_eq!(Detok::default().finish(), "");
     }
 }
+
+/// Detokenized output with stop strings applied: the text a frontend may show.
+pub struct TextStream {
+    detok: Detok,
+    stop: ojas_infer::StopMatcher,
+    stopped: bool,
+}
+
+impl TextStream {
+    pub fn new(stops: &[String]) -> Self {
+        TextStream { detok: Detok::default(), stop: ojas_infer::StopMatcher::new(stops.iter().cloned()), stopped: false }
+    }
+
+    /// Add one token. Returns the text now safe to show and whether a stop string
+    /// ended the output; the stop string itself is never shown.
+    pub fn push(&mut self, bpe: &Bpe, id: u32) -> (String, bool) {
+        if self.stopped { return (String::new(), true); }
+        let piece = self.detok.push(bpe, id);
+        let (out, hit) = self.stop.push(&piece);
+        self.stopped = hit;
+        (out, hit)
+    }
+
+    /// End of generation: whatever was held back for a possible stop string or an
+    /// unfinished character.
+    pub fn finish(&mut self) -> String {
+        if self.stopped { return String::new(); }
+        let tail = self.detok.finish();
+        let (mut out, hit) = self.stop.push(&tail);
+        self.stopped = hit;
+        if !hit { out.push_str(&self.stop.finish()); }
+        out
+    }
+
+    /// Whether a stop string ended the output.
+    pub fn stopped(&self) -> bool { self.stopped }
+}

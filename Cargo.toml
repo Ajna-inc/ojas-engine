@@ -13,6 +13,7 @@ members = [
     "crates/ojas-cpu",
     "crates/ojas-tokenize",
     "crates/ojas-infer",
+    "crates/ojas-grammar",
     "crates/ojas-cuda",
     "crates/ojas-vulkan",
     "crates/ojas-vision",
