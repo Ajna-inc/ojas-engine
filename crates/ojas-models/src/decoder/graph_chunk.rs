@@ -1,6 +1,5 @@
 #![allow(clippy::too_many_arguments)]
 use super::*;
-use objc::{msg_send, sel, sel_impl};
 use metal::MTLSize;
 use std::ffi::c_void;
  // re-export
@@ -113,7 +112,8 @@ impl<'a> DecoderGpu<'a> {
             enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(256, 1, 1));
     }
 
-    /// One qwen35 prefill chunk (M ≤ MAXM tokens) in a single command buffer.
+    /// One qwen35 prefill chunk (M ≤ MAXM tokens), split across command buffers every
+    /// `prefill_cb_layers` layers.
     /// Mirrors the qwen35 branch of encode_forward with M-token batched kernels;
     /// activations are [M, dim] row-major throughout.
     pub(crate) fn forward_chunk(&self, tokens: &[u32], base_pos: usize, verify: bool) {
@@ -202,9 +202,15 @@ impl<'a> DecoderGpu<'a> {
         // concurrent dispatch (reference-style): independent kernels within a stage
         // overlap; bar() marks the real data dependencies (this path is qwen35-only,
         // so bar() is always active here).
-        let cb = if ext.is_none() { Some(self.gpu.command_buffer()) } else { None };
-        let enc_owned = cb.as_ref().map(|c| c.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent));
-        let enc: &metal::ComputeCommandEncoderRef = match ext { Some(e) => e, None => enc_owned.as_ref().unwrap() };
+        // Without an external encoder the chunk owns its command buffers, split by
+        // layer (`pass.rs`).
+        let mut pass = ext.is_none().then(|| super::pass::SplitPass::new(self.gpu, !self.cfg.serial, self.cfg.prefill_cb_layers, m));
+        let mut enc = match ext {
+            Some(e) => e.to_owned(),
+            None => pass.as_mut().unwrap().open(),
+        };
+        // Named stage boundaries for `OJAS_PREFILL_PROFILE`; free otherwise.
+        macro_rules! stage { ($label:expr) => { if let Some(p) = pass.as_mut() { p.stage($label, &mut enc); } } }
         let ints = |enc: &metal::ComputeCommandEncoderRef, vals: &[(u64, u32)]| {
             for (idx, v) in vals { enc.set_bytes(*idx, 4, v as *const u32 as *const c_void); }
         };
@@ -223,7 +229,7 @@ impl<'a> DecoderGpu<'a> {
                 enc.dispatch_thread_groups(MTLSize::new(((d + 63)/64) as u64, 1, 1), MTLSize::new(64, 1, 1));
                 continue;
             }
-            self.embed_named_off(enc, "token_embd.weight", t, d, (i as u64)*(d as u64)*f4);
+            self.embed_named_off(&enc, "token_embd.weight", t, d, (i as u64)*(d as u64)*f4);
         }
         self.bar(&enc); // x (embeddings) ready
         // The M-row projection and norm dispatches live as methods (`chunk_gemm`,
@@ -236,11 +242,14 @@ impl<'a> DecoderGpu<'a> {
             self.rmsnorm_rows(enc, m, w)
         };
         for l in 0..self.arch.n_layers {
+            if let Some(pass) = pass.as_mut() { pass.layer(l, &mut enc); }
             let p = |s: &str| format!("blk.{l}.{s}");
             let lp = self.arch.layers[l];
+            stage!("attn_norm");
             rmsnorm_m(&enc, &self.wt.w32[&p("attn_norm.weight")]);
             self.bar(&enc); // h ready for the projections
             if lp.is_ssm {
+                stage!("ssm_proj");
                 let (s_st, hk, hv) = (sc.d_state, sc.n_group, sc.dt_rank);
                 let d_inner = sc.d_inner; let conv_ch = d_inner + 2*hk*s_st; let conv_k = sc.conv_kernel;
                 let head_v = d_inner / hv;
@@ -249,6 +258,7 @@ impl<'a> DecoderGpu<'a> {
                 gemm(&enc, false, &p("ssm_alpha.weight"), &self.st.h, &self.st.ssm_gate, d, hv);
                 gemm(&enc, false, &p("ssm_beta.weight"), &self.st.h, &self.st.ssm_beta, d, hv);
                 self.bar(&enc); // qkv/z/alpha/beta projections done (ran concurrently)
+                stage!("ssm_conv");
                 self.enc_reduce(&enc, "ssm_ab", &[(&self.st.ssm_gate, 0), (&self.st.ssm_beta, 1), (&self.wt.w32[&p("ssm_dt.bias")], 2), (&self.wt.w32[&p("ssm_a")], 3)], &[(4, m*hv), (5, hv)], &[], ((m*hv + 63)/64) as u64, 64);
                 {
                     enc.set_compute_pipeline_state(&self.p["conv1d_prefill"]);
@@ -262,6 +272,15 @@ impl<'a> DecoderGpu<'a> {
                     enc.dispatch_thread_groups(MTLSize::new(((conv_ch + 63)/64) as u64, 1, 1), MTLSize::new(64, 1, 1));
                 }
                 self.bar(&enc); // ssm_ab + conv done (ran concurrently)
+                stage!("deltanet");
+                // q/k normalized once per (head, token) rather than in each of a head's
+                // S state columns; the recurrence then reads them as given (l2_mode 2).
+                enc.set_compute_pipeline_state(&self.p["qk_l2norm_heads"]);
+                enc.set_buffer(0, Some(&self.st.ssm_qkv), 0);
+                ints(&enc, &[(1, s_st), (2, hk), (3, conv_ch), (5, 0)]);
+                enc.set_bytes(4, 4, &self.arch.eps as *const f32 as *const c_void);
+                enc.dispatch_thread_groups(MTLSize::new((2*hk) as u64, m as u64, 1), MTLSize::new(32, 1, 1));
+                self.bar(&enc); // q/k normalized
                 enc.set_compute_pipeline_state(&self.p["deltanet_fused"]);
                 enc.set_buffer(0, Some(&self.st.ssm_state[l]), ssm_o(l));
                 enc.set_buffer(1, Some(&self.st.ssm_qkv), 0);
@@ -274,9 +293,10 @@ impl<'a> DecoderGpu<'a> {
                                 if verify { 0 } else { ssm_o(l) });
                 // OJAS_KMAP_DIV=1 selects the grouped value->key head mapping.
                 ints(&enc, &[(12, if verify { 0 } else { u32::MAX }),
-                             (13, self.cfg.moe_kmap_div as u32), (14, 0)]);
+                             (13, self.cfg.moe_kmap_div as u32), (14, 2)]);
                 enc.dispatch_thread_groups(MTLSize::new((s_st/4) as u64, hv as u64, 1), MTLSize::new(128, 1, 1));
                 self.bar(&enc); // deltanet done
+                stage!("ssm_norm");
                 enc.set_compute_pipeline_state(&self.p["gated_rmsnorm"]);
                 enc.set_buffer(0, Some(&self.st.ssm_o), 0);
                 enc.set_buffer(1, Some(&self.wt.w32[&p("ssm_norm.weight")]), 0);
@@ -285,14 +305,17 @@ impl<'a> DecoderGpu<'a> {
                 enc.set_bytes(4, 4, &self.arch.eps as *const f32 as *const c_void);
                 enc.dispatch_thread_groups(MTLSize::new(hv as u64, m as u64, 1), MTLSize::new(32, 1, 1));
                 self.bar(&enc); // gated norm done
+                stage!("ssm_out");
                 gemm(&enc, true, &p("ssm_out.weight"), &self.st.ssm_o, &self.st.x, d_inner, d);
             } else {
                 let (hd, kvdim, qdim) = (lp.head_dim, lp.kvdim, lp.qdim);
                 let group = lp.n_head / lp.n_kv.max(1);
+                stage!("attn_qkv");
                 gemm(&enc, false, &p("attn_q.weight"), &self.st.h, &self.st.ssm_qkv, d, 2*qdim);
                 gemm(&enc, false, &p("attn_k.weight"), &self.st.h, &self.st.k, d, kvdim);
                 gemm(&enc, false, &p("attn_v.weight"), &self.st.h, &self.st.v, d, kvdim);
                 self.bar(&enc); // q/k/v projections done (ran concurrently)
+                stage!("attn_rope");
                 self.enc_reduce(&enc, "qgate_split", &[(&self.st.ssm_qkv, 0), (&self.st.q, 1)], &[(2, hd), (3, qdim), (4, m)], &[], ((m*qdim + 63)/64) as u64, 64);
                 let (nq, nk) = (lp.n_head, lp.n_kv);
                 self.bar(&enc); // q split done
@@ -320,6 +343,7 @@ impl<'a> DecoderGpu<'a> {
                     &[(5, hd), (6, base_pos as u32), (8, aq), (9, ak), (10, kvdim), (11, m), (12, neox_arg), (13, sc.n_rot)], &[(7, lp.rope_base)],
                     ((m*(aq + ak + kvdim) + 63)/64) as u64, 64);
                 self.bar(&enc); // rope + cache store done
+                stage!("attention");
                 if self.arch.sparse_budget.is_some() {
                     // keep page min/max metadata current for the pages this chunk touched
                     let pg0 = (base_pos / ojas_metal::kernels::attn::PAGE) as u32;
@@ -330,7 +354,11 @@ impl<'a> DecoderGpu<'a> {
                         npg as u64, 256);
                     self.bar(&enc); // metadata current before attention reads scores
                 }
-                if base_pos + tokens.len() <= 512 || (hd <= 256 && hd % 64 != 0) {
+                // The MMA kernel serves every context length; the scalar
+                // `attention_m_short` serves only the head dims it cannot tile. At hd 256 the scalar
+                // kernel runs at 0.35 TFLOPS, 48.6 of 523 ms in a 512-token chunk of
+                // Qwen3.5 4B, and the MMA kernel takes pp512 from 946 to 1033 tok/s (M2 Max).
+                if hd <= 256 && hd % 64 != 0 {
                     self.enc_reduce_off(&enc, "attention_m_short",
                         &[(&self.st.q, 0, 0), (&self.st.kcache[l], 1, kv_o(l)), (&self.st.vcache[l], 2, kv_o(l)), (&self.st.attn, 3, 0)],
                         &[(4, hd), (5, kvdim), (6, base_pos as u32), (7, group), (9, lp.n_head)], &[(8, lp.scale)],
@@ -358,10 +386,12 @@ impl<'a> DecoderGpu<'a> {
                 self.bar(&enc); // attention done
                 self.enc_reduce(&enc, "gate_mul_sigmoid", &[(&self.st.attn, 0), (&self.st.ssm_qkv, 1)], &[(2, hd), (3, qdim), (4, m)], &[], ((m*qdim + 63)/64) as u64, 64);
                 self.bar(&enc); // gate applied
+                stage!("attn_out");
                 gemm(&enc, true, &p("attn_output.weight"), &self.st.attn, &self.st.x, qdim, d);
             }
             // FFN: post_attention_norm pre-norm, SwiGLU via two GEMMs + silu_mul
             self.bar(&enc); // mixer residual in x
+            stage!("ffn_norm");
             rmsnorm_m(&enc, &self.wt.w32[&p("post_attention_norm.weight")]);
             self.bar(&enc); // h ready for FFN
             if let Some(mo) = self.arch.moe {
@@ -435,15 +465,19 @@ impl<'a> DecoderGpu<'a> {
             // a silu-in-up epilogue and a dual-stream gate+up MMA kernel measured
             // 320/322 against 343 tok/s, because the fusions either serialize the
             // projections or double accumulator pressure.
+            stage!("ffn_gate_up");
             gemm(&enc, false, &p("ffn_gate.weight"), &self.st.h, &self.st.gate, d, nffn);
             gemm(&enc, false, &p("ffn_up.weight"), &self.st.h, &self.st.up, d, nffn);
             self.bar(&enc); // gate + up done (ran concurrently)
+            stage!("ffn_act");
             self.enc_reduce(&enc, "silu_mul", &[(&self.st.gate, 0), (&self.st.up, 1), (&self.st.act, 2)], &[(3, m*nffn)], &[], ((m*nffn + 63)/64) as u64, 64);
             self.bar(&enc); // SwiGLU act ready
+            stage!("ffn_down");
             gemm(&enc, true, &p("ffn_down.weight"), &self.st.act, &self.st.x, nffn, d);
             self.bar(&enc); // layer output in x
             }
         }
+        if self.sp.mtp.is_some() || verify { stage!("tail"); }
         if self.sp.mtp.is_some() {
             self.bar(&enc);
             self.enc_reduce(&enc, "copy_buf", &[(&self.sp.mtp_h, 0), (&self.st.x, 1)], &[(2, m*d)], &[], ((m*d + 63)/64) as u64, 64);
@@ -465,13 +499,12 @@ impl<'a> DecoderGpu<'a> {
                 enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(self.tune.max_tg.min(1024), 1, 1));
             }
         }
-        if let Some(cb) = cb {
-            enc.end_encoding();
-            let _ = ojas_metal::commit_and_wait_checked(cb, "chunked prefill");
-            let (gs, ge): (f64, f64) = unsafe { (msg_send![&*cb, GPUStartTime], msg_send![&*cb, GPUEndTime]) };
-            self.gpu_s.set(self.gpu_s.get() + (ge - gs));
+        if let Some(pass) = pass {
+            let cbs = pass.command_buffers();
+            let gpu = pass.finish(&enc, "chunked prefill");
+            self.gpu_s.set(self.gpu_s.get() + gpu);
             if self.cfg.prefill_dbg {
-                tracing::trace!(target: "prefill", "chunk M={} gpu={:.1}ms", m, (ge - gs) * 1e3);
+                tracing::trace!(target: "prefill", "chunk M={} command buffers={} gpu={:.1}ms", m, cbs, gpu * 1e3);
             }
         }
     }

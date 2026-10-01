@@ -206,15 +206,14 @@ impl<'a> DecoderGpu<'a> {
     pub fn vision_proj_dim(&self) -> Option<usize> { self.arch.vision.map(|v| v.proj_dim as usize) }
 
     /// Whether the tower's weights are resident in the mmproj's own f16 rather than
-    /// requantized at load.
+    /// requantized at load. The loader keeps them in f16 at every precision.
     ///
     /// Decides whether a comparison against `ojas_cpu::CpuVit` means anything: the
-    /// oracle reads the GGUF's f16 directly, so at a requantizing precision (prec 1
-    /// and 3 put these tensors through `quantize_row_i8`) the two sides run
-    /// different weights and the measured cosine prices the requantizer, not the
-    /// encoder. Measured on surya-2 at 36 patches: prec 4 gives a projector cosine
-    /// of 0.999999, prec 1 gives 0.998657 with layer 0 already at 0.999930 — a
-    /// weight difference, which no per-layer trace can localize to a kernel.
+    /// oracle reads the GGUF's f16 directly, so a requantized tower would run
+    /// different weights and the measured cosine would price the requantizer, not
+    /// the encoder. On surya-2 at 36 patches, a tower requantized through
+    /// `quantize_row_i8` gives a projector cosine of 0.998657 against 0.999999 in
+    /// f16, with layer 0 already at 0.999930.
     pub fn vision_weights_f16(&self) -> bool {
         self.arch.vision.is_some() && self.wt.repr("v.blk.0.attn_qkv.weight") == Repr::F16
     }
@@ -256,19 +255,13 @@ impl<'a> DecoderGpu<'a> {
         let (pw, ph) = (width / pp, height / pp);
         let n_pos = pw * ph;
 
-        // `projm` picks its weight map from one global flag (`wt.q8`). Check the
-        // mmproj landed where that flag says before dispatching, rather than
-        // panicking on a missing key inside the encoder. `Weights::repr` is the only
-        // legal probe order.
-        let want = if self.wt.q8 { Repr::Q8 } else { Repr::F16 };
+        // The loader keeps every tower weight in its f16 (`load.rs`). Check that held
+        // before dispatching, rather than panicking on a missing key inside the
+        // encoder. `Weights::repr` is the only legal probe order.
         for n in ["v.blk.0.attn_qkv.weight", VIT_PATCH_FOLD, "mm.0.weight", "mm.2.weight"] {
             let got = self.wt.repr(n);
-            ensure!(got == want,
-                "vision weight {n} resolved to {got:?} but projm reads {want:?} at this precision. \
-                 The mmproj is f16 and no K-quant branch claims it, so it lands in w16 at prec 0/4/5 \
-                 and in w8 at prec 1/3 — all four match projm. Only prec 2 (q4mode) moves it into \
-                 w4, which projm does not read at all (it is not a vision-specific limit: \
-                 `forward_diffusion_range` cannot run at prec 2 either). Use prec 4, the default.");
+            ensure!(got == Repr::F16,
+                "vision weight {n} resolved to {got:?}; the tower is loaded in f16 at every precision");
         }
 
         let (nh, hd, ffn) = (v.n_head as usize, v.hd as usize, v.ffn as usize);

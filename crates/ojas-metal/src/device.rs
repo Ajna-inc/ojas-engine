@@ -315,6 +315,16 @@ pub fn commit_and_wait_checked(
     context: &str,
 ) -> Result<(), ojas_core::device_fault::DeviceError> {
     cb.commit();
+    wait_checked(cb, context)
+}
+
+/// [`commit_and_wait_checked`] for a command buffer that is already committed: waits
+/// for it, then reports and latches its error the same way. A pass split across
+/// several command buffers commits them as it encodes and checks each one here.
+pub fn wait_checked(
+    cb: &metal::CommandBufferRef,
+    context: &str,
+) -> Result<(), ojas_core::device_fault::DeviceError> {
     cb.wait_until_completed();
     if cb.status() != metal::MTLCommandBufferStatus::Error {
         return Ok(());
@@ -324,7 +334,7 @@ pub fn commit_and_wait_checked(
     let description = match code {
         1 => "Internal", 2 => "Timeout", 3 => "PageFault", 4 => "Blacklisted",
         7 => "NotPermitted", 8 => "OutOfMemory", 9 => "InvalidResource",
-        10 => "Memoryless", 11 => "DeviceRemoved", _ => "Unknown",
+        10 => "Memoryless", 11 => "DeviceRemoved", 12 => "StackOverflow", _ => "Unknown",
     };
     // The code alone does not say what happened: "Internal" covers a watchdog
     // timeout, an address fault and a recovery victim alike, and only the

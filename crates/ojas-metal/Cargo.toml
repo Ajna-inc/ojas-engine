@@ -36,3 +36,5 @@ device = []
 # depend on ojas-metal, so this is not a cycle.
 [dev-dependencies]
 ojas-cpu = { path = "../ojas-cpu" }
+# `tests/gemm_f16.rs` decodes K-quant rows with the GGUF loader's own dequantizer.
+ojas-formats = { path = "../ojas-formats" }

@@ -222,29 +222,28 @@ kernel void gemm_mm_q4l_fat(device const float* x [[buffer(0)]], device const uc
 
 
 
-// f16-weight GEMM, the encoders' projection (`projm` at f16): y[tok][row] =
-// x[tok][k] . w16[row][k], w16 raw half [N][K] row-major.
+// Fat GEMM over weights read in place: y[tok][row] = x[tok][k] . W[row][k].
 //
-// The Q4L split-K fat kernel's structure with a copy in place of its dequant: 64x64
+// The Q4L split-K fat kernel's structure with the weight format factored out: 64x64
 // tile, four simdgroups of 16 register fragments, the weight tile double-buffered
 // in threadgroup memory (one barrier per K slab), and activation fragments loaded
 // straight from device, where the slab stays L2-resident across N-tiles. Each lane's
 // token row is clamped to M-1, so a partial tile reads valid rows whose results the
 // store guard discards, and `x` needs no row padding.
 //
+// `Fill` is the only per-format part: `Fill::fill(dst, w, aux, row, K, k0)` writes the
+// 16 weights W[row][k0..k0+16] as half to dst[0], dst[72], ..., dst[15*72]. k0 is a
+// multiple of 16, so a run never crosses a 256-weight K-quant super-block. `aux` is
+// buffer 5, a side array for formats that keep one (Q8's per-row scales).
+//
 // Split-K on grid.z (`nsplit` > 1, 32-aligned partitions): plain fp32 partials at
 // y + z*M*N, reduced by `splitk_accum`, which owns `accum`. It supplies threadgroups
 // a short request cannot: at M=115, N=1024 the tile grid is 32 threadgroups for 38
-// cores. N % 64 == 0, K % 32 == 0.
-kernel void gemm_mm_f16_fat(device const float* x [[buffer(0)]], device const half* w16 [[buffer(1)]],
-    device float* y [[buffer(2)]], constant uint& K [[buffer(3)]], constant uint& N [[buffer(4)]],
-    constant uint& accum [[buffer(6)]], constant uint& M [[buffer(7)]],
-    constant uint& nsplit [[buffer(9)]],
-    uint3 tgpig [[threadgroup_position_in_grid]],
-    ushort tiitg [[thread_index_in_threadgroup]],
-    ushort sgitg [[simdgroup_index_in_threadgroup]],
-    ushort lane [[thread_index_in_simdgroup]]) {
-    threadgroup half sa[2][32*72];
+// cores. N % 64 == 0, K % 32 == 0 (K % 256 == 0 for the K-quant fills).
+template <typename Fill>
+METAL_FUNC void gemm_fat_body(device const float* x, device const uchar* w, device const float* aux,
+    device float* y, uint K, uint N, uint accum, uint M, uint nsplit,
+    uint3 tgpig, ushort tiitg, ushort sgitg, ushort lane, threadgroup half (*sa)[32*72]) {
     const uint r0 = tgpig.y*64u;   // output rows
     const uint t0 = tgpig.x*64u;   // tokens
     uint kper = ((K / nsplit) / 32u) * 32u;
@@ -254,7 +253,6 @@ kernel void gemm_mm_f16_fat(device const float* x [[buffer(0)]], device const ha
     // Weight fill: 128 threads, a thread pair per weight row, 16 k each.
     uint lr = tiitg/2u;
     uint il = tiitg%2u;
-    device const half* arow = w16 + (ulong)(r0+lr)*(ulong)K;
 
     ushort2 mo = morton_order(lane);
     uint row0 = (uint(sgitg) % 2u) * 32u;
@@ -274,19 +272,11 @@ kernel void gemm_mm_f16_fat(device const float* x [[buffer(0)]], device const ha
         for (short r = 0; r < 4; r++) { c[t][r] = simdgroup_matrix_storage<float>(float2(0)); }
     }
 
-#define F16FAT_FILL(BUF, LK) { \
-            device const half4* ap = (device const half4*)(arow + (LK)) + il*4u; \
-            threadgroup half* dst = (BUF) + il*16u*72u + lr; \
-            for (short q = 0; q < 4; q++) { \
-                half4 a = ap[q]; \
-                dst[(q*4+0)*72] = a.x; dst[(q*4+1)*72] = a.y; \
-                dst[(q*4+2)*72] = a.z; dst[(q*4+3)*72] = a.w; } }
-
-    F16FAT_FILL(sa[0], kbeg)
+    Fill::fill(sa[0] + il*16u*72u + lr, w, aux, r0 + lr, K, kbeg + il*16u);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint lk = kbeg; lk < kend; lk += 32u) {
         uint cur = ((lk - kbeg)/32u) & 1u;
-        if (lk + 32u < kend) { F16FAT_FILL(sa[1u-cur], lk + 32u) }
+        if (lk + 32u < kend) { Fill::fill(sa[1u-cur] + il*16u*72u + lr, w, aux, r0 + lr, K, lk + 32u + il*16u); }
         const threadgroup half* sa_m = simdgroup_matrix_storage<half>::apply_offset(sa[cur], 72, ushort2(mo.x, mo.y));
 #pragma clang loop unroll(full)
         for (short ko = 0; ko < 4; ko++) {
@@ -306,7 +296,6 @@ kernel void gemm_mm_f16_fat(device const float* x [[buffer(0)]], device const ha
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-#undef F16FAT_FILL
     bool add = accum != 0u && nsplit == 1u;
     device float* ybase = simdgroup_matrix_storage<float>::apply_offset(yz, N, uint2(r0 + row0 + mo.x, mo.y));
 #pragma clang loop unroll(full)
@@ -325,6 +314,90 @@ kernel void gemm_mm_f16_fat(device const float* x [[buffer(0)]], device const ha
         }
     }
 }
+
+// Raw half [N][K] row-major: the encoders' projection (`projm` at f16).
+struct FatFillF16 {
+    static METAL_FUNC void fill(threadgroup half* dst, device const uchar* w, device const float*, uint row, uint K, uint k0) {
+        device const half4* ap = (device const half4*)((device const half*)w + (ulong)row*(ulong)K + k0);
+        for (short q = 0; q < 4; q++) {
+            half4 a = ap[q];
+            dst[(q*4+0)*72] = a.x; dst[(q*4+1)*72] = a.y;
+            dst[(q*4+2)*72] = a.z; dst[(q*4+3)*72] = a.w;
+        }
+    }
+};
+
+// GGUF Q4_K rows as stored: 144-byte super-blocks of 256 weights, {d, dmin} half,
+// 12 bytes of packed 6-bit scales and mins, 128 bytes of nibbles. Sub-block j (32
+// weights) is the low (j even) or high (j odd) nibble of qs[32*(j/2) ..], valued
+// d*sc_j*q - dmin*m_j.
+struct FatFillQ4K {
+    static METAL_FUNC void fill(threadgroup half* dst, device const uchar* w, device const float*, uint row, uint K, uint k0) {
+        device const uchar* b = w + ((ulong)row*(ulong)(K/256u) + k0/256u)*144ul;
+        uint io = k0 % 256u, j = io / 32u, l0 = io % 32u;
+        device const uchar* s = b + 4u;
+        uint sc, mn;
+        if (j < 4u) { sc = s[j] & 63u; mn = s[j+4u] & 63u; }
+        else { sc = (s[j+4u] & 0xFu) | ((s[j-4u] >> 6u) << 4u); mn = (s[j+4u] >> 4u) | ((s[j] >> 6u) << 4u); }
+        float d = float(*(device const half*)b) * float(sc);
+        float m = float(*(device const half*)(b + 2u)) * float(mn);
+        device const uchar* q = b + 16u + 32u*(j/2u) + l0;
+        uint sh = (j & 1u) * 4u;
+        for (short i = 0; i < 16; i++) { dst[i*72] = half(d * float((q[i] >> sh) & 0xFu) - m); }
+    }
+};
+
+// GGUF Q6_K rows as stored: 210-byte super-blocks of 256 weights, ql[128], qh[64],
+// 16 int8 scales, d half. The weight at offset io sits in half h = io/128 at
+// quarter q = (io%128)/32, its low nibble in ql[64h + 32(q&1) + l] (upper half
+// for q >= 2) and its two high bits at 2q in qh[32h + l], scaled by
+// scales[8h + l/16 + 2q].
+struct FatFillQ6K {
+    static METAL_FUNC void fill(threadgroup half* dst, device const uchar* w, device const float*, uint row, uint K, uint k0) {
+        device const uchar* b = w + ((ulong)row*(ulong)(K/256u) + k0/256u)*210ul;
+        uint io = k0 % 256u, h = io / 128u, r = io % 128u, q = r / 32u, l0 = r % 32u;
+        float sc = float(*(device const half*)(b + 208u)) * float(((device const char*)(b + 192u))[h*8u + l0/16u + 2u*q]);
+        device const uchar* ql = b + h*64u + (q & 1u)*32u + l0;
+        device const uchar* qh = b + 128u + h*32u + l0;
+        uint shl = (q >= 2u) ? 4u : 0u, shh = 2u*q;
+        for (short i = 0; i < 16; i++) {
+            int v = int(((ql[i] >> shl) & 0xFu) | (((qh[i] >> shh) & 3u) << 4u)) - 32;
+            dst[i*72] = half(sc * float(v));
+        }
+    }
+};
+
+// Q8 as the loader requantizes it: int8 rows [N][K], one f32 scale per row in `aux`.
+struct FatFillQ8 {
+    static METAL_FUNC void fill(threadgroup half* dst, device const uchar* w, device const float* aux, uint row, uint K, uint k0) {
+        device const char4* p = (device const char4*)(w + (ulong)row*(ulong)K + k0);
+        float s = aux[row];
+        for (short q = 0; q < 4; q++) {
+            char4 c = p[q];
+            dst[(q*4+0)*72] = half(float(c.x) * s); dst[(q*4+1)*72] = half(float(c.y) * s);
+            dst[(q*4+2)*72] = half(float(c.z) * s); dst[(q*4+3)*72] = half(float(c.w) * s);
+        }
+    }
+};
+
+#define GEMM_FAT_ENTRY(NAME, FILL) \
+kernel void NAME(device const float* x [[buffer(0)]], device const uchar* w [[buffer(1)]], \
+    device float* y [[buffer(2)]], constant uint& K [[buffer(3)]], constant uint& N [[buffer(4)]], \
+    device const float* aux [[buffer(5)]], \
+    constant uint& accum [[buffer(6)]], constant uint& M [[buffer(7)]], \
+    constant uint& nsplit [[buffer(9)]], \
+    uint3 tgpig [[threadgroup_position_in_grid]], \
+    ushort tiitg [[thread_index_in_threadgroup]], \
+    ushort sgitg [[simdgroup_index_in_threadgroup]], \
+    ushort lane [[thread_index_in_simdgroup]]) { \
+    threadgroup half sa[2][32*72]; \
+    gemm_fat_body<FILL>(x, w, aux, y, K, N, accum, M, nsplit, tgpig, tiitg, sgitg, lane, sa); \
+}
+GEMM_FAT_ENTRY(gemm_mm_f16_fat, FatFillF16)
+GEMM_FAT_ENTRY(gemm_mm_q4k_fat, FatFillQ4K)
+GEMM_FAT_ENTRY(gemm_mm_q6k_fat, FatFillQ6K)
+GEMM_FAT_ENTRY(gemm_mm_q8_fat, FatFillQ8)
+#undef GEMM_FAT_ENTRY
 
 
 kernel void gemm_mm_q4l_fat8(device const float* x [[buffer(0)]], device const uchar* w4 [[buffer(1)]],

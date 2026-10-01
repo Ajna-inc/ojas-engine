@@ -157,17 +157,13 @@ fn main() -> Result<()> {
     anyhow::ensure!(m.has_vision(), "the decoder loaded without a vision tower — the mmproj was not attached");
     println!("  loaded  cpu oracle {cpu_load_s:.1}s / gpu decoder {load_s:.1}s (prec {prec})");
     // A requirement, for the same reason `embed_inject_gate` has one: the oracle reads the
-    // mmproj's f16 straight out of the GGUF, so a precision that requantizes the tower (prec 1
-    // and 3 send it through `quantize_row_i8`) makes the two sides run different weights, and
-    // the number this gate prints would be the requantizer's error, not the encoder's.
-    // Measured: prec 1 at 36 patches lands on a projector cosine of 0.998657 with layer 0
-    // already at 0.999930 — finite, plausible, and meaningless as a kernel gate.
+    // mmproj's f16 straight out of the GGUF, so a requantized tower would make the two sides
+    // run different weights, and the number this gate prints would be the requantizer's
+    // error, not the encoder's (see `vision_weights_f16`).
     if !m.vision_weights_f16() {
-        println!("\n  The vision weights were requantized at prec {prec}, so they are not the \
-                  weights the CPU oracle reads. Any cosine measured here prices the requantizer, \
-                  not the encoder. Re-run at prec 4 (the CLI default), 0, or 5 — all three keep \
-                  the mmproj in the file's own f16. `repr_gate` prints where each tensor landed.");
-        println!("\nGATE: VISION FAIL (wrong precision for a meaningful comparison)");
+        println!("\n  The vision weights were not loaded in f16 at prec {prec}, so they are not the \
+                  weights the CPU oracle reads. `repr_gate` prints where each tensor landed.");
+        println!("\nGATE: VISION FAIL (tower not in f16)");
         std::process::exit(1);
     }
 

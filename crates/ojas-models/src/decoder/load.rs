@@ -297,7 +297,50 @@ impl TextEncoderConfig {
     }
 }
 
+/// The precision argument that asks [`DecoderGpu::load`] to choose the tier for the
+/// file (see [`DecoderGpu::auto_precision`]).
+pub const PRECISION_AUTO: u8 = u8::MAX;
+
 impl<'a> DecoderGpu<'a> {
+    /// The tier [`PRECISION_AUTO`] resolves to for this file, and why.
+    ///
+    /// Precision 4 streams mixture-of-experts weights from disk, and to do so keeps
+    /// every other quantized tensor in the file's own format behind the native
+    /// kernels. For a dense model that buys nothing, since all of it is resident
+    /// anyway. M2 Max, precision 3 against 4:
+    ///
+    /// | file                       | decode tok/s  | prompt               |
+    /// |----------------------------|---------------|----------------------|
+    /// | Qwen3.5 4B Q4_K_M          | 82.7 vs 81.8  | 1082 vs 901 tok/s    |
+    /// | Ornith 9B Q4_K_M           | 49.2 vs 48.9  | 621 vs 521 tok/s     |
+    /// | Qwen3.5 4B F16, 591 tok    | 55.4 vs 33.1  | 0.72 s vs 0.69 s     |
+    /// | Qwen3 0.6B F16             | 202 vs 125    | 0.02 s vs 0.12 s     |
+    /// | Qwen2.5 0.5B Q8_0          | 249 vs 201    | 0.02 s vs 0.07 s     |
+    ///
+    /// (Q4_K_M rows: 512-token prompt and 128-token decode; the others: first token
+    /// of a 591-token prompt.) On a K-quant file the two decode alike, since precision
+    /// 4 reads the file's own Q4_K and Q6_K bytes through native kernels as fast as
+    /// precision 3's relayout, and precision 4 loads in 0.1 s against 1.1; precision
+    /// 3's tuned Q4L tiles process prompts ~20% faster. Prompts outweigh replies in
+    /// the workloads this engine serves (page context, OCR), and on F16 and Q8_0 files
+    /// precision 3 wins outright, so dense decoders take precision 3.
+    ///
+    /// Precision 3 stores F16 and Q8_0 matrices as Q8 and Q4_K as its Q4L relayout;
+    /// `--precision 4` (or 0 for f16) keeps a file exact. It cannot overcommit
+    /// memory: when its requantized weights would exceed the device budget, the loader
+    /// keeps the file's format for every tensor instead (the fit check below). A
+    /// vision tower keeps its f16 weights at every precision (`vision_weights_f16`).
+    /// Precision 4 stays for models with experts, which is what streaming is for.
+    pub fn auto_precision(g: &Gguf) -> Result<(u8, &'static str)> {
+        let arch = g.arch();
+        let experts = g.tensors.keys().any(|n| n.contains("_exps."))
+            || g.meta_u32(&format!("{arch}.expert_count")).unwrap_or(0) > 0;
+        if experts {
+            return Ok((4, "mixture-of-experts weights stream from disk"));
+        }
+        Ok((3, "dense decoder: tuned kernels, weights requantized where they fit"))
+    }
+
     /// `kv_gb` / `expert_cache_gb` are per-load overrides for the KV↔experts
     /// memory split (the app's slider). `None` falls back to the `OJAS_KV_GB` /
     /// `OJAS_EXPERT_CACHE_GB` env knobs read via `EngineConfig`. Both are GiB.
@@ -310,6 +353,11 @@ impl<'a> DecoderGpu<'a> {
         expert_cache_gb: Option<f64>,
     ) -> Result<Self> {
         let ecfg = EngineConfig::current(); // all OJAS_* knobs, read once
+        let prec = if prec == PRECISION_AUTO {
+            let (p, why) = Self::auto_precision(g)?;
+            tracing::info!(target: "arch", "precision {p} ({why})");
+            p
+        } else { prec };
         let mut max_seq = max_seq;
         // gpt-oss: force Q8 requant — its huge Q5_1 experts can't dequant to f16 (~38GB),
         // and the moe_*_q8_oai gather kernels consume Q8 (w8/scale8). Biases/sinks are f32→w32.
@@ -1108,6 +1156,19 @@ impl<'a> DecoderGpu<'a> {
                 // against f16's ~186, at a quarter of the bytes.
                 if let Some(info) = g.tensors.get(name) {
                     let ty = info.ggml_type;
+                    // A Q6_K token table stays in its blocks: `embed_q6k` gathers from
+                    // them, and a tied head reads them through the native Q6_K GEMV at
+                    // half the bytes of the f16 copy it would otherwise get (Qwen3.5 4B
+                    // Q4_K_M: 636 MB/token instead of 1271).
+                    if ty == 14 && name == "token_embd.weight" {
+                        if let Some((part, abs, rawlen, _)) = g.tensor_meta(name) {
+                            let (buf, off) = mg.buffer(gpu, part, abs, rawlen);
+                            if off > 0 { w_off.insert(name.clone(), off); }
+                            w6k.insert(name.clone(), buf);
+                            skeleton_bytes += rawlen;
+                            continue;
+                        }
+                    }
                     let wpb = ojas_metal::kernels::nat::nat_wpb(ty).unwrap_or(0) as u64;
                     // Flash's shared experts use generic matmul dispatch and its Q8
                     // embedding has a native gather, so both keep their source values:
@@ -1467,6 +1528,14 @@ impl<'a> DecoderGpu<'a> {
                 if ty == 1 { w16.insert(name.clone(), newbuf(&bytes)); } else { w32.insert(name.clone(), newbuf(&bytes)); }
                 continue;
             }
+            // The vision tower (the mmproj's `v.*`/`mm.*`) stays in its f16 at every
+            // precision: it runs once per image, so Q8 saves nothing that matters, and
+            // requantized it drifts from the reference (surya-2 projector cosine
+            // 0.998657 against 0.999999 in f16; see `vision_weights_f16`).
+            if ty == 1 && ojas_formats::mmproj::keep_tensor(name) {
+                w16.insert(name.clone(), newbuf(&bytes));
+                continue;
+            }
             if ty == 1 {
                 // rows = product of dims[1..]: 2D [K,N] → N; 3D expert tensors
                 // [K, ffn_exp, n_expert] → ffn_exp*n_expert stacked expert blocks.
@@ -1560,16 +1629,8 @@ impl<'a> DecoderGpu<'a> {
                 folded[2 * i + 1] = bits[1];
             }
             let n = v.d as usize;
-            // Mirror the upload loop's own decision for an f16 tensor so `projm`
-            // finds the fold in whichever map it is about to look in (`wt.q8`).
-            if quant {
-                let (q, sc) = quantize_row_i8(&folded, n, k);
-                w8.insert(VIT_PATCH_FOLD.into(),
-                    newbuf(unsafe { std::slice::from_raw_parts(q.as_ptr() as *const u8, q.len()) }));
-                scale8.insert(VIT_PATCH_FOLD.into(), newbuf(bytemuck_f32(&sc)));
-            } else {
-                w16.insert(VIT_PATCH_FOLD.into(), newbuf(&folded));
-            }
+            // f16, as the upload loop keeps every other tower weight.
+            w16.insert(VIT_PATCH_FOLD.into(), newbuf(&folded));
             wshape.insert(VIT_PATCH_FOLD.into(), (k as u32, v.d));
             tracing::info!(target: "vision", "folded v.patch_embd.weight + .weight.1 -> {VIT_PATCH_FOLD} [{k} x {n}]");
         }

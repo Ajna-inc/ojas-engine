@@ -109,7 +109,7 @@ pub fn with_model<R>(
     path: &str,
     device: Device,
     context: usize,
-    precision: u8,
+    precision: Option<u8>,
     f: impl FnOnce(&dyn Model, &Bpe, &ModelInfo) -> Result<R>,
 ) -> Result<R> {
     let mut g = Gguf::open(path).with_context(|| format!("opening {path}"))?;
@@ -142,7 +142,7 @@ pub fn with_model<R>(
         // of magnitude slower is worse than an error.
         match ojas_metal::MetalGpu::new() {
             Ok(gpu) => match ojas_models::decoder::DecoderGpu::load(
-                &gpu, &mut g, context, precision, None, None,
+                &gpu, &mut g, context, precision.unwrap_or(ojas_models::decoder::PRECISION_AUTO), None, None,
             ) {
                 Ok(m) => {
                     info.backend = "metal";

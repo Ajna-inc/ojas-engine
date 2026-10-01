@@ -259,6 +259,12 @@ impl<'a> DecoderGpu<'a> {
         let chunk_sz: usize = self.cfg.prefill_m.min(MAXM);
         for chunk in tokens.chunks(chunk_sz) {
             self.forward_chunk(chunk, pos, false);
+            if ojas_core::device_fault::is_faulted() {
+                // A failed chunk leaves the cache and recurrent state undefined: stop
+                // here, and record nothing a later request could reuse or restore.
+                self.mark_span_unreusable();
+                return;
+            }
             self.qwen35_mtp_catchup(chunk, pos);
             self.sp.hrow.set(chunk.len()-1);
             pos += chunk.len();

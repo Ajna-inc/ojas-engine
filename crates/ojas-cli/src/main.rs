@@ -88,7 +88,8 @@ runtime flags:
   -s,    --seed N         sampler seed
          --device D       auto | metal | cpu
   -ngl,  --n-gpu-layers N 0 selects the CPU backend
-         --precision N    Metal decoder precision tier (default 4)
+         --precision N    Metal decoder precision tier (default: 3 for dense models,
+                          4 for models with experts)
          --host H --port P   serve address (default 127.0.0.1:8080)
   -r,    --reps N         bench repetitions (default 3)
          --conf N --iou N  vision thresholds (detect/plate)

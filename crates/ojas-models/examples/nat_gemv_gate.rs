@@ -48,6 +48,12 @@ fn main() -> Result<()> {
         let (tag, ty) = (f.tag, &f.ty);
         let (bb, wpb) = (f.block_bytes as usize, f.weights as usize);
         if k % wpb != 0 { continue; }
+        // MXFP4 has no synthetic blocks or `dequant_to_f16` arm; `ojas_formats::mxfp4`'s
+        // own tests cover its decode.
+        if synth::block_shape(*ty).is_none() {
+            println!("  {tag:<9}{ty:>6}  skipped: no synthetic blocks for this type");
+            continue;
+        }
         let nblk = k / wpb;
         let raw = synth::blocks(*ty, nblk * n);
         assert_eq!(raw.len(), nblk * n * bb);

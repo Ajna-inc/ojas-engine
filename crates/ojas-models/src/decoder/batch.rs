@@ -154,7 +154,6 @@ impl<'a> DecoderGpu<'a> {
             std::ptr::copy_nonoverlapping(tokens.as_ptr(), tokbuf.contents() as *mut u32, tokens.len());
         }
 
-        let cb = self.gpu.command_buffer();
         // Concurrent dispatch for the dense batch path, barriers only at true
         // dependency edges. Measured by ablation on the reference binary: disabling
         // concurrency alone drops its pp512 from 1429 to 1176 (-18%), and with fusion
@@ -165,9 +164,9 @@ impl<'a> DecoderGpu<'a> {
         // waves — are free throughput. gpt-oss stays serial: its MoE helpers assume
         // ordering.
         let conc = !self.arch.gpt_oss;
-        let enc = if conc {
-            cb.compute_command_encoder_with_dispatch_type(metal::MTLDispatchType::Concurrent)
-        } else { cb.new_compute_command_encoder() };
+        // Split by layer across command buffers (`pass.rs`).
+        let mut pass = super::pass::SplitPass::new(self.gpu, conc, self.cfg.prefill_cb_layers, m);
+        let mut enc = pass.open();
         let eb = |e: &metal::ComputeCommandEncoderRef| { if conc { self.barc(e); } };
         // embed
         if let Some(w) = self.wt.w6k.get("token_embd.weight") {
@@ -185,6 +184,7 @@ impl<'a> DecoderGpu<'a> {
         }
 
         for l in 0..self.arch.n_layers {
+            pass.layer(l, &mut enc);
             let p = |s: &str| format!("blk.{l}.{s}");
             eb(&enc); // x complete (embed, or the previous layer's ffn_down)
             self.enc_reduce(&enc, "rmsnorm_m", &[(&self.st.x, 0), (&self.wt.w32[&p("attn_norm.weight")], 1), (&self.st.h, 2)], &[(3, d)], &[(4, self.arch.eps)], m as u64, 256);
@@ -423,18 +423,22 @@ impl<'a> DecoderGpu<'a> {
             // MMA GEMM (vocab 152064 %64==0).
             let vocab = self.arch.vocab as u32;
             if let Some(w) = self.wt.w6k.get(&self.arch.lm_head) {
-                // Native Q6_K head. Requires a full 64-wide N tile and 256-aligned K
-                // (one super-block); every real vocab/hidden pair satisfies both.
-                enc.set_compute_pipeline_state(&self.p["gemm_mm_q6k"]);
-                enc.set_buffer(0, Some(&self.st.h), 0);
-                enc.set_buffer(1, Some(w), self.wt.w_off.get(&self.arch.lm_head).copied().unwrap_or(0));
-                enc.set_buffer(2, Some(&self.st.logits), 0);
-                enc.set_bytes(3, 4, &d as *const u32 as *const c_void);
-                enc.set_bytes(4, 4, &vocab as *const u32 as *const c_void);
-                let zero = 0u32;
-                enc.set_bytes(6, 4, &zero as *const u32 as *const c_void);
-                enc.set_bytes(7, 4, &m as *const u32 as *const c_void);
-                enc.dispatch_thread_groups(MTLSize::new(((m + 31) / 32) as u64, (vocab / 64) as u64, 1), MTLSize::new(128, 1, 1));
+                // Native Q6_K head: the fat GEMM at prefill widths, else the 32-row tile.
+                // Both need a full 64-wide N tile and 256-aligned K (one super-block);
+                // every real vocab/hidden pair satisfies both.
+                let off = self.wt.w_off.get(&self.arch.lm_head).copied().unwrap_or(0);
+                if !self.kquant_fat(14, &enc, &self.st.h, w, off, &self.st.logits, d, vocab, m, false) {
+                    enc.set_compute_pipeline_state(&self.p["gemm_mm_q6k"]);
+                    enc.set_buffer(0, Some(&self.st.h), 0);
+                    enc.set_buffer(1, Some(w), off);
+                    enc.set_buffer(2, Some(&self.st.logits), 0);
+                    enc.set_bytes(3, 4, &d as *const u32 as *const c_void);
+                    enc.set_bytes(4, 4, &vocab as *const u32 as *const c_void);
+                    let zero = 0u32;
+                    enc.set_bytes(6, 4, &zero as *const u32 as *const c_void);
+                    enc.set_bytes(7, 4, &m as *const u32 as *const c_void);
+                    enc.dispatch_thread_groups(MTLSize::new(((m + 31) / 32) as u64, (vocab / 64) as u64, 1), MTLSize::new(128, 1, 1));
+                }
             } else {
                 self.gemm8(&enc, &self.st.h, &self.wt.w8[&self.arch.lm_head], &self.wt.scale8[&self.arch.lm_head],
                     &self.st.logits, d, vocab, m, false);
@@ -447,10 +451,8 @@ impl<'a> DecoderGpu<'a> {
             self.enc_reduce(&enc, "argmax_m", &[(&self.st.logits, 0), (&self.st.tmp, 1)],
                 &[(2, vocab), (3, m)], &[], m as u64, self.tune.max_tg.min(1024));
         }
-        enc.end_encoding();
-        let _ = ojas_metal::commit_and_wait_checked(cb, "batched forward");
-        let (gs, ge): (f64, f64) = unsafe { (msg_send![cb, GPUStartTime], msg_send![cb, GPUEndTime]) };
-        self.gpu_s.set(self.gpu_s.get() + (ge - gs));
+        let gpu = pass.finish(&enc, "batched forward");
+        self.gpu_s.set(self.gpu_s.get() + gpu);
 
         // Ids-only callers stop here: the argmax is already in st.tmp and the
         // vocab*M logit block never crosses the bus.

@@ -55,10 +55,8 @@ pub struct Bpe {
     enc: HashMap<u8, char>,
     dec: HashMap<char, u8>,
     specials: Vec<(String, usize)>, // (literal string, id), longest first
-    /// Contraction matching of the GPT2-family pre-tokenizer. The original GPT-2
-    /// pattern (`'s|'t|'re|...`) is case-sensitive; the Llama-3/Qwen pattern wraps it
-    /// in `(?i:...)`. Selected from `tokenizer.ggml.pre`.
-    contractions: Contractions,
+    /// The pre-tokenizer pattern, selected from `tokenizer.ggml.pre`.
+    split: PreSplit,
     /// Ids of CONTROL(3)/USER_DEFINED(4) tokens. Their GGUF text is literal UTF-8
     /// rather than gpt2 byte-encoded, so it must not be mapped back through `dec`:
     /// a real 0x20 in the text has no `dec` entry (space is `\u{0120}` there) and is
@@ -108,8 +106,8 @@ impl Bpe {
         }
         specials.sort_by(|a, b| b.0.len().cmp(&a.0.len())); // longest first
         let (enc, dec) = byte_maps();
-        let contractions = Contractions::for_pre(&pre);
-        Bpe { tokens, vocab, ranks, scores, spm, g4, g4_prefix, g4_split, enc, dec, specials, contractions, literal }
+        let split = PreSplit::for_pre(&pre);
+        Bpe { tokens, vocab, ranks, scores, spm, g4, g4_prefix, g4_split, enc, dec, specials, split, literal }
     }
 
     pub fn encode(&self, text: &str) -> Vec<usize> {
@@ -217,7 +215,7 @@ impl Bpe {
     }
 
     fn encode_ordinary(&self, text: &str, out: &mut Vec<usize>) {
-        for word in pretokenize(text, self.contractions) {
+        for word in pretokenize(text, self.split) {
             // byte-encode the pre-token to the GPT2 byte-char alphabet
             let piece: String = word.bytes().map(|b| self.enc[&b]).collect();
             self.bpe_word(&piece, out);
@@ -291,33 +289,72 @@ impl Bpe {
     }
 }
 
-/// How the GPT2-family pre-tokenizer matches the contractions `'s 't 're 've 'm 'll 'd`.
+/// Which BPE pre-tokenizer pattern a vocabulary uses, selected from
+/// `tokenizer.ggml.pre`:
+///
+/// ```text
+/// GPT-2    's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)
+/// Llama-3  (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}
+///          | ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+/// Qwen2    Llama-3 with \p{N}: one digit per piece
+/// Qwen3.5  Qwen2 with [\p{L}\p{M}] wherever Qwen2 has \p{L}
+/// ```
+///
+/// The differences are not cosmetic. Qwen merges were trained on single digits, on a
+/// word keeping one leading punctuation character (`-call`) and on newline runs as one
+/// piece (`\n\n`); split any other way the model reads token sequences it never saw.
+/// Names not listed take the Llama-3 pattern, the common one among recent vocabularies.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Contractions {
-    /// `(?i:'s|'t|...)`: Llama-3, Qwen and most recent BPE vocabularies.
+pub enum PreSplit {
+    Gpt2,
     #[default]
-    CaseInsensitive,
-    /// `'s|'t|...`: the original GPT-2 pattern (llama.cpp `LLAMA_VOCAB_PRE_TYPE_GPT2`
-    /// and the pre-types that share its regex).
-    CaseSensitive,
+    Llama3,
+    Qwen2,
+    Qwen35,
 }
 
-impl Contractions {
-    /// Pre-tokenizer names whose regex is the case-sensitive GPT-2 pattern, following
-    /// the `tokenizer.ggml.pre` mapping in llama.cpp's `llama-vocab.cpp`.
-    const CASE_SENSITIVE_PRE: &'static [&'static str] = &[
+impl PreSplit {
+    const GPT2: &'static [&'static str] = &[
         "gpt-2", "phi-2", "modern-bert", "roberta-bpe", "olmo", "mpt", "jais", "trillion",
         "jina-es", "jina-de", "jina-v1-en", "jina-v2-es", "jina-v2-de", "jina-v2-code",
         "gigachat", "mellum", "exaone4", "a.x-4.0", "granite-docling",
     ];
+    const QWEN2: &'static [&'static str] = &[
+        "qwen2", "deepseek-r1-qwen", "kormo", "f2llmv2", "stablelm2", "hunyuan", "solar-open",
+    ];
 
     pub fn for_pre(pre: &str) -> Self {
-        if Self::CASE_SENSITIVE_PRE.contains(&pre) { Self::CaseSensitive } else { Self::CaseInsensitive }
+        if pre == "qwen35" { Self::Qwen35 }
+        else if Self::QWEN2.contains(&pre) { Self::Qwen2 }
+        else if Self::GPT2.contains(&pre) { Self::Gpt2 }
+        else { Self::Llama3 }
     }
 
+    /// `\p{L}`, or `[\p{L}\p{M}]` for Qwen3.5.
+    fn letter(self, c: char) -> bool {
+        use unicode_general_category::{get_general_category, GeneralCategory as G};
+        match get_general_category(c) {
+            G::UppercaseLetter | G::LowercaseLetter | G::TitlecaseLetter | G::ModifierLetter
+            | G::OtherLetter => true,
+            G::NonspacingMark | G::SpacingMark | G::EnclosingMark => self == Self::Qwen35,
+            _ => false,
+        }
+    }
+
+    /// `\p{N}`.
+    fn number(c: char) -> bool {
+        use unicode_general_category::{get_general_category, GeneralCategory as G};
+        matches!(get_general_category(c), G::DecimalNumber | G::LetterNumber | G::OtherNumber)
+    }
+
+    /// `[^\s\p{L}\p{N}]` (Qwen3.5: `[^\s\p{L}\p{M}\p{N}]`).
+    fn other(self, c: char) -> bool { !c.is_whitespace() && !self.letter(c) && !Self::number(c) }
+
     /// Length in chars of the contraction starting at `ch[i]` (an apostrophe), or 0.
-    fn match_len(self, ch: &[char], i: usize) -> usize {
-        let fold = |c: char| if self == Self::CaseInsensitive { c.to_ascii_lowercase() } else { c };
+    /// GPT-2 matches lowercase only; the others either case, and the piece keeps the
+    /// case it was written in.
+    fn contraction_len(self, ch: &[char], i: usize) -> usize {
+        let fold = |c: char| if self == Self::Gpt2 { c } else { c.to_ascii_lowercase() };
         let at = |k: usize| ch.get(i + k).copied().map(fold);
         match (at(1), at(2)) {
             (Some('l'), Some('l')) | (Some('r'), Some('e')) | (Some('v'), Some('e')) => 3,
@@ -325,51 +362,69 @@ impl Contractions {
             _ => 0,
         }
     }
+
+    /// Length in chars of the piece the pattern matches at `ch[i]`: its alternatives
+    /// tried in order, each greedy, as the regex engine would.
+    fn piece_len(self, ch: &[char], i: usize) -> usize {
+        let n = ch.len();
+        let run = |mut k: usize, f: &dyn Fn(char) -> bool| { while k < n && f(ch[k]) { k += 1; } k };
+        let newline = |c: char| c == '\r' || c == '\n';
+        let c = ch[i];
+        if c == '\'' {
+            let len = self.contraction_len(ch, i);
+            if len > 0 { return len; }
+        }
+        let letter = |c: char| self.letter(c);
+        let other = |c: char| self.other(c);
+        let space = |c: char| c.is_whitespace();
+        if self == Self::Gpt2 {
+            // ` ?\p{L}+`, ` ?\p{N}+`, ` ?[^\s\p{L}\p{N}]+`
+            let s = if c == ' ' && i + 1 < n { i + 1 } else { i };
+            for class in [&letter as &dyn Fn(char) -> bool, &Self::number, &other] {
+                if class(ch[s]) { return run(s, class) - i; }
+            }
+            // `\s+(?!\S)`; a lone space before a word matches nothing and stays
+            // its own piece, as unmatched text does.
+            let j = run(i, &space);
+            return if j == n || j - i < 2 { j - i } else { j - i - 1 };
+        }
+        // `[^\r\n\p{L}\p{N}]?\p{L}+`: the optional prefix excludes letters and numbers
+        // only, so under Qwen3.5 a mark may lead too (it also matches the run itself).
+        if letter(c) { return run(i, &letter) - i; }
+        let pure_letter = PreSplit::Qwen2.letter(c);
+        if !newline(c) && !pure_letter && !Self::number(c) && i + 1 < n && letter(ch[i + 1]) {
+            return run(i + 1, &letter) - i;
+        }
+        // `\p{N}{1,3}` / `\p{N}`
+        if Self::number(c) {
+            let max = if self == Self::Llama3 { 3 } else { 1 };
+            let mut k = i;
+            while k < n && k - i < max && Self::number(ch[k]) { k += 1; }
+            return k - i;
+        }
+        // ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+        let s = if c == ' ' { i + 1 } else { i };
+        if s < n && other(ch[s]) {
+            let k = run(s, &other);
+            return run(k, &newline) - i;
+        }
+        // Whitespace from here on. `\s*[\r\n]+` backtracks to the last newline in the
+        // run; `\s+(?!\S)` leaves the run's last character for the next word; `\s+`.
+        let j = run(i, &space);
+        if let Some(last) = (i..j).rev().find(|&k| newline(ch[k])) { return last + 1 - i; }
+        if j == n || j - i < 2 { j - i } else { j - i - 1 }
+    }
 }
 
-/// GPT2-family pre-tokenizer (hand-rolled; the `regex` crate lacks the lookahead
-/// the real pattern uses). Splits into: contractions, optional-single-leading-space
-/// + a same-category run (letters / digits / other), and whitespace runs (BPE then
-/// merges "ĠĠ…"). Good enough that prompt tokenization matches real BPE on ordinary text.
-fn pretokenize(text: &str, contractions: Contractions) -> Vec<String> {
+/// Split `text` into the pieces BPE merges within, by the vocabulary's pattern.
+fn pretokenize(text: &str, split: PreSplit) -> Vec<String> {
     let ch: Vec<char> = text.chars().collect();
-    let n = ch.len();
-    let cat = |c: char| -> u8 { if c.is_alphabetic() { 1 } else if c.is_numeric() { 2 } else { 3 } };
-    let mut out: Vec<String> = Vec::new();
+    let mut out = Vec::new();
     let mut i = 0;
-    while i < n {
-        let c = ch[i];
-        // A contraction is emitted as written: case folding only decides whether it
-        // matches, it never changes the text that reaches BPE.
-        if c == '\'' {
-            let len = contractions.match_len(&ch, i);
-            if len > 0 { out.push(ch[i..i + len].iter().collect()); i += len; continue; }
-        }
-        if c.is_whitespace() {
-            // maximal whitespace run; if followed by a non-ws char, the last ws char
-            // attaches to the next word as its single leading space (GPT2 ` ?`).
-            let s = i;
-            while i < n && ch[i].is_whitespace() { i += 1; }
-            let followed = i < n;
-            let run_end = if followed { i - 1 } else { i };
-            if run_end > s { out.push(ch[s..run_end].iter().collect()); }
-            if followed {
-                let lead = ch[run_end]; // the single attached space
-                let k = cat(ch[i]);
-                let ws_start = i;
-                while i < n && !ch[i].is_whitespace() && cat(ch[i]) == k { i += 1; }
-                let mut w = String::new();
-                w.push(lead);
-                w.extend(&ch[ws_start..i]);
-                out.push(w);
-            }
-            continue;
-        }
-        // non-space run of one category
-        let k = cat(c);
-        let s = i;
-        while i < n && !ch[i].is_whitespace() && cat(ch[i]) == k { i += 1; }
-        out.push(ch[s..i].iter().collect());
+    while i < ch.len() {
+        let len = split.piece_len(&ch, i).max(1);
+        out.push(ch[i..i + len].iter().collect());
+        i += len;
     }
     out
 }
@@ -599,33 +654,59 @@ pub fn eog_token_ids(g: &ojas_formats::gguf::Gguf, arch: &str) -> Vec<u32> {
 
 #[cfg(test)]
 mod pretokenize_tests {
-    use super::{pretokenize, Contractions};
+    use super::{pretokenize, PreSplit};
 
     #[test]
     fn contractions_keep_their_case() {
-        let got = pretokenize("THEY'RE here", Contractions::CaseInsensitive);
-        assert_eq!(got, ["THEY", "'RE", " here"]);
+        assert_eq!(pretokenize("THEY'RE here", PreSplit::Llama3), ["THEY", "'RE", " here"]);
     }
 
     #[test]
-    fn case_sensitive_pattern_only_matches_lowercase() {
-        assert_eq!(pretokenize("THEY'RE", Contractions::CaseSensitive), ["THEY", "'", "RE"]);
-        assert_eq!(pretokenize("they're", Contractions::CaseSensitive), ["they", "'re"]);
-        assert_eq!(pretokenize("don't I'll", Contractions::CaseSensitive), ["don", "'t", " I", "'ll"]);
+    fn gpt2_contractions_match_lowercase_only() {
+        assert_eq!(pretokenize("THEY'RE", PreSplit::Gpt2), ["THEY", "'", "RE"]);
+        assert_eq!(pretokenize("they're", PreSplit::Gpt2), ["they", "'re"]);
+        assert_eq!(pretokenize("don't I'll", PreSplit::Gpt2), ["don", "'t", " I", "'ll"]);
+    }
+
+    #[test]
+    fn gpt2_spaces_attach_only_as_a_literal_space() {
+        assert_eq!(pretokenize("a\nb  c ", PreSplit::Gpt2), ["a", "\n", "b", " ", " c", " "]);
+        assert_eq!(pretokenize("x 12 -y", PreSplit::Gpt2), ["x", " 12", " -", "y"]);
+    }
+
+    #[test]
+    fn qwen_keeps_newline_runs_leading_punctuation_and_single_digits() {
+        assert_eq!(pretokenize("a-call\n\nb 1440", PreSplit::Qwen2),
+            ["a", "-call", "\n\n", "b", " ", "1", "4", "4", "0"]);
+        assert_eq!(pretokenize("x  \n  y", PreSplit::Qwen2), ["x", "  \n", " ", " y"]);
+        assert_eq!(pretokenize("ok!!\n\tz", PreSplit::Qwen2), ["ok", "!!\n", "\tz"]);
+    }
+
+    #[test]
+    fn llama3_groups_digits_in_threes() {
+        assert_eq!(pretokenize("1440", PreSplit::Llama3), ["144", "0"]);
+    }
+
+    #[test]
+    fn qwen35_keeps_combining_marks_in_the_word() {
+        // नमस्ते: the virama and the vowel sign are marks, not letters.
+        assert_eq!(pretokenize("नमस्ते", PreSplit::Qwen35), ["नमस्ते"]);
+        assert_eq!(pretokenize("नमस्ते", PreSplit::Qwen2), ["नमस", "्त", "े"]);
     }
 
     #[test]
     fn pre_names_select_the_pattern() {
-        assert_eq!(Contractions::for_pre("modern-bert"), Contractions::CaseSensitive);
-        assert_eq!(Contractions::for_pre("gpt-2"), Contractions::CaseSensitive);
-        assert_eq!(Contractions::for_pre("llama-bpe"), Contractions::CaseInsensitive);
-        assert_eq!(Contractions::for_pre("qwen2"), Contractions::CaseInsensitive);
+        assert_eq!(PreSplit::for_pre("modern-bert"), PreSplit::Gpt2);
+        assert_eq!(PreSplit::for_pre("gpt-2"), PreSplit::Gpt2);
+        assert_eq!(PreSplit::for_pre("llama-bpe"), PreSplit::Llama3);
+        assert_eq!(PreSplit::for_pre("qwen2"), PreSplit::Qwen2);
+        assert_eq!(PreSplit::for_pre("qwen35"), PreSplit::Qwen35);
     }
 }
 
 #[cfg(test)]
 mod metaspace_tests {
-    use super::{byte_maps, Bpe, Contractions};
+    use super::{byte_maps, Bpe, PreSplit};
     use std::collections::HashMap;
 
     /// A vocabulary where the merges could join words if nothing stopped them:
@@ -638,7 +719,7 @@ mod metaspace_tests {
         let (enc, dec) = byte_maps();
         Bpe {
             tokens, vocab, ranks, scores: Vec::new(), spm: false, g4: true, g4_prefix: prefix, g4_split: split,
-            enc, dec, specials: Vec::new(), contractions: Contractions::default(), literal: Default::default(),
+            enc, dec, specials: Vec::new(), split: PreSplit::default(), literal: Default::default(),
         }
     }
 
