@@ -41,6 +41,66 @@ pub trait Device {
 
 // ================================ model ======================================
 
+/// Prompt-prefix cache occupancy and hit counts (`Model::prefix_cache_stats`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrefixCacheStats {
+    /// Cached blocks of prompt tokens, and how many carry a recurrent-state snapshot.
+    pub blocks: usize,
+    pub snapshots: usize,
+    /// Bytes held, and the budget they are evicted to stay within.
+    pub bytes: usize,
+    pub budget: usize,
+    /// Prompts looked up, prompts that reused a cached prefix, and the tokens reused.
+    pub lookups: u64,
+    pub hits: u64,
+    pub reused_tokens: u64,
+    /// Tokens per block.
+    pub block_tokens: usize,
+    /// Whether a cache directory backs the cache, and what it holds: blocks and
+    /// snapshots saved there, their bytes and cap, and payloads read back from it.
+    pub directory: bool,
+    pub disk_blocks: usize,
+    pub disk_snapshots: usize,
+    pub disk_bytes: usize,
+    pub disk_budget: usize,
+    pub disk_reads: u64,
+    /// Blocks pinned against eviction.
+    pub pinned_blocks: usize,
+    /// Payload copies evicted from RAM or the directory to make room.
+    pub evictions: u64,
+    /// The most recent prompt's lookup and restore.
+    pub last: PrefixRestore,
+    pub docs: DocCacheStats,
+}
+
+/// The document cache's occupancy and reuse (`--doc-cache-gb`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DocCacheStats {
+    pub docs: usize,
+    pub bytes: usize,
+    pub budget: usize,
+    /// Prompts that reused a document, and the tokens served from the cache.
+    pub hits: u64,
+    pub reused_tokens: u64,
+}
+
+/// What the prompt-prefix cache did for one prompt.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrefixRestore {
+    /// Leading tokens found in the cache. Far below the prompt's length on every
+    /// request, this shows a client whose prompts drift (a timestamp in the system
+    /// prompt, reordered tools).
+    pub matched_tokens: usize,
+    /// Tokens restored rather than processed: matched, up to the deepest snapshot.
+    pub reused_tokens: usize,
+    /// Tokens of marked documents served from the document cache at a new position:
+    /// close to, not identical with, processing them.
+    pub doc_reused_tokens: usize,
+    /// Payloads read from the cache directory rather than RAM.
+    pub disk_payloads: u64,
+    pub restore_us: u64,
+}
+
 /// Decode-time model interface (serving).
 pub trait Model {
     /// Maximum number of input positions the allocated state can hold.
@@ -131,6 +191,27 @@ pub trait Model {
     /// bit-identical to what a fresh prefill of the same tokens would write; the
     /// caller relies on that for correctness.
     fn reuse_prefix_len(&self, _full_prompt: &[u32]) -> usize { 0 }
+    /// Allow or forbid restoring cached prompt prefixes for the following requests.
+    /// Prefixes are still cached either way.
+    fn set_prefix_reuse(&self, _on: bool) {}
+    /// Token positions in the next prompt where later prompts are likely to diverge
+    /// from it (message boundaries). The prefix cache keeps state there, so such a
+    /// prompt resumes at the boundary instead of an earlier block.
+    fn set_prefix_marks(&self, _positions: &[usize]) {}
+    /// Token ranges `[start, end)` of the next prompt for the document cache: served
+    /// from it at their new position when `serve` is set and it holds them (opt-in,
+    /// approximate), otherwise added to it once processed.
+    fn set_prefix_docs(&self, _spans: &[(usize, usize)], _serve: bool) {}
+    /// Occupancy and hit counts of the prompt-prefix cache, when the model keeps one.
+    fn prefix_cache_stats(&self) -> Option<PrefixCacheStats> { None }
+    /// Finish writing the prompt-prefix cache's directory, when it has one.
+    fn save_prefix_cache(&self) {}
+    /// Process a prompt into the prompt-prefix cache without generating, pinning it
+    /// against eviction when `pin` is set. Returns the tokens cached, or `None` when
+    /// the model keeps no prefix cache.
+    fn warm_prefix(&self, _tokens: &[u32], _pin: bool) -> Option<usize> { None }
+    /// Release every pinned prefix.
+    fn unpin_prefix_cache(&self) {}
     /// Greedy-decode one token. u32::MAX = cancelled.
     fn forward_id(&self, token: u32, pos: usize) -> u32;
     fn forward_logits(&self, _token: u32, _pos: usize) -> Option<Vec<f32>> { None }
@@ -221,6 +302,22 @@ pub trait Model {
     /// `prefill_embeds`, including the meaning of `None` vs `Some(pos3)`.
     fn prefill_embeds_slot(&self, _s: usize, _tokens: &[u32], _x: &[f32], _base_pos: usize,
                            _pos3: Option<&[[u32; 4]]>) -> bool { false }
+    /// Run `f` with the sequence methods (`reuse_prefix_len`, `prefill`,
+    /// `set_prefix_marks`, `set_prefix_reuse`, `reset_session`) pointed at slot `s`,
+    /// prompt-prefix cache included; they return to slot 0 afterwards. Single-token
+    /// decode (`forward_id`, `forward_logits`) stays on slot 0: other slots decode
+    /// through [`Model::decode_slots`]. False, without running `f`, when this backend
+    /// cannot address slot `s`.
+    fn with_slot(&self, s: usize, f: &mut dyn FnMut()) -> bool {
+        if s == 0 { f(); }
+        s == 0
+    }
+    /// The logits of entry `i` of the last [`Model::decode_slots`] step, for a caller
+    /// that samples or constrains a slot's next token instead of taking its argmax.
+    fn slot_logits(&self, _i: usize) -> Option<Vec<f32>> { None }
+    /// Leading tokens of `tokens` the prompt-prefix cache could restore now, without
+    /// changing anything: how a scheduler ranks waiting requests.
+    fn cached_prefix_len(&self, _tokens: &[u32]) -> usize { 0 }
 
     /// Begin an unrelated sequence: drop recurrent (SSM/GDN) state, any MTP carry,
     /// and the cross-turn reuse bookkeeping.
@@ -257,6 +354,13 @@ impl<T: Model + ?Sized> Model for Box<T> {
         (**self).encode_image(img, w, h)
     }
     fn reuse_prefix_len(&self, full_prompt: &[u32]) -> usize { (**self).reuse_prefix_len(full_prompt) }
+    fn set_prefix_reuse(&self, on: bool) { (**self).set_prefix_reuse(on) }
+    fn set_prefix_marks(&self, positions: &[usize]) { (**self).set_prefix_marks(positions) }
+    fn set_prefix_docs(&self, spans: &[(usize, usize)], serve: bool) { (**self).set_prefix_docs(spans, serve) }
+    fn prefix_cache_stats(&self) -> Option<PrefixCacheStats> { (**self).prefix_cache_stats() }
+    fn save_prefix_cache(&self) { (**self).save_prefix_cache() }
+    fn warm_prefix(&self, tokens: &[u32], pin: bool) -> Option<usize> { (**self).warm_prefix(tokens, pin) }
+    fn unpin_prefix_cache(&self) { (**self).unpin_prefix_cache() }
     fn forward_id(&self, token: u32, pos: usize) -> u32 { (**self).forward_id(token, pos) }
     fn forward_logits(&self, token: u32, pos: usize) -> Option<Vec<f32>> { (**self).forward_logits(token, pos) }
     fn forward_batch_logits(&self, tokens: &[u32], base_pos: usize) -> Option<Vec<Vec<f32>>> {
@@ -280,6 +384,9 @@ impl<T: Model + ?Sized> Model for Box<T> {
         (**self).decode_slots(steps)
     }
     fn reset_slot(&self, s: usize) { (**self).reset_slot(s) }
+    fn with_slot(&self, s: usize, f: &mut dyn FnMut()) -> bool { (**self).with_slot(s, f) }
+    fn slot_logits(&self, i: usize) -> Option<Vec<f32>> { (**self).slot_logits(i) }
+    fn cached_prefix_len(&self, tokens: &[u32]) -> usize { (**self).cached_prefix_len(tokens) }
     fn prefill_slot(&self, s: usize, tokens: &[u32], base_pos: usize) -> bool {
         (**self).prefill_slot(s, tokens, base_pos)
     }
@@ -307,6 +414,13 @@ impl<T: Model + ?Sized> Model for &T {
         (**self).encode_image(img, w, h)
     }
     fn reuse_prefix_len(&self, full_prompt: &[u32]) -> usize { (**self).reuse_prefix_len(full_prompt) }
+    fn set_prefix_reuse(&self, on: bool) { (**self).set_prefix_reuse(on) }
+    fn set_prefix_marks(&self, positions: &[usize]) { (**self).set_prefix_marks(positions) }
+    fn set_prefix_docs(&self, spans: &[(usize, usize)], serve: bool) { (**self).set_prefix_docs(spans, serve) }
+    fn prefix_cache_stats(&self) -> Option<PrefixCacheStats> { (**self).prefix_cache_stats() }
+    fn save_prefix_cache(&self) { (**self).save_prefix_cache() }
+    fn warm_prefix(&self, tokens: &[u32], pin: bool) -> Option<usize> { (**self).warm_prefix(tokens, pin) }
+    fn unpin_prefix_cache(&self) { (**self).unpin_prefix_cache() }
     fn forward_id(&self, token: u32, pos: usize) -> u32 { (**self).forward_id(token, pos) }
     fn forward_logits(&self, token: u32, pos: usize) -> Option<Vec<f32>> { (**self).forward_logits(token, pos) }
     fn forward_batch_logits(&self, tokens: &[u32], base_pos: usize) -> Option<Vec<Vec<f32>>> {
@@ -330,6 +444,9 @@ impl<T: Model + ?Sized> Model for &T {
         (**self).decode_slots(steps)
     }
     fn reset_slot(&self, s: usize) { (**self).reset_slot(s) }
+    fn with_slot(&self, s: usize, f: &mut dyn FnMut()) -> bool { (**self).with_slot(s, f) }
+    fn slot_logits(&self, i: usize) -> Option<Vec<f32>> { (**self).slot_logits(i) }
+    fn cached_prefix_len(&self, tokens: &[u32]) -> usize { (**self).cached_prefix_len(tokens) }
     fn prefill_slot(&self, s: usize, tokens: &[u32], base_pos: usize) -> bool {
         (**self).prefill_slot(s, tokens, base_pos)
     }

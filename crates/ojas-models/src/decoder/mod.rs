@@ -655,10 +655,45 @@ pub(crate) struct SpecState {
 
 pub(crate) struct Session {
     pub(crate) model_name: String,
+    /// Prompt-prefix blocks shared by every slot (`prefix_cache`).
+    pub(crate) cache: std::cell::RefCell<prefix_cache::PrefixCache>,
+    /// Spans reusable at any position (`doc_cache`), shared by every slot.
+    pub(crate) docs: std::cell::RefCell<doc_cache::DocCache>,
+    /// Each slot's sequence, indexed by slot.
+    pub(crate) seqs: Vec<SeqState>,
+}
+
+/// What the decoder tracks about the sequence one slot holds.
+pub(crate) struct SeqState {
     pub(crate) session_tokens: std::cell::RefCell<Vec<u32>>,
     pub(crate) last_prefill_reused: std::cell::Cell<usize>,
     pub(crate) snap_pos: std::cell::RefCell<Vec<usize>>,
     pub(crate) snap_buf: std::cell::RefCell<Vec<Vec<u8>>>,
+    /// What the prefill in progress may add to the prefix cache.
+    pub(crate) cache_plan: std::cell::RefCell<Option<prefix_cache::Plan>>,
+    /// Whether requests may restore from the prefix cache (they always add to it).
+    pub(crate) cache_reuse: std::cell::Cell<bool>,
+    /// Token positions of boundaries in the next prompt, kept as snapshot points.
+    pub(crate) cache_marks: std::cell::RefCell<Vec<usize>>,
+    /// What the cache did for the most recent prompt.
+    pub(crate) cache_last: std::cell::Cell<ojas_core::PrefixRestore>,
+    /// Token ranges of the next prompt for the document cache, and whether it may
+    /// serve them.
+    pub(crate) cache_docs: std::cell::RefCell<Vec<(usize, usize)>>,
+    pub(crate) docs_serve: std::cell::Cell<bool>,
+    /// Ranges of the prompt in progress to add to the document cache once processed.
+    pub(crate) docs_pending: std::cell::RefCell<Vec<(usize, usize)>>,
+}
+
+impl Default for SeqState {
+    fn default() -> Self {
+        SeqState {
+            session_tokens: Default::default(), last_prefill_reused: Default::default(), snap_pos: Default::default(),
+            snap_buf: Default::default(), cache_plan: Default::default(), cache_reuse: std::cell::Cell::new(true),
+            cache_marks: Default::default(), cache_last: Default::default(), cache_docs: Default::default(),
+            docs_serve: Default::default(), docs_pending: Default::default(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1141,6 +1176,9 @@ mod load;
 pub use load::PRECISION_AUTO;
 mod moe_stream;
 mod pass;
+mod doc_cache;
+mod prefix_cache;
+mod prefix_disk;
 mod ple;
 mod prefill_session;
 mod profile;
@@ -1235,6 +1273,8 @@ impl<'a> DecoderGpu<'a> {
     // The same four for whichever slot the single-sequence graphs are currently
     // pointed at. `cur_slot` rests at 0, so an untouched decoder answers 0.
     pub(crate) fn kv_off(&self, l: usize) -> u64 { self.kv_slot_off(l, self.cur_slot.get()) }
+    /// The sequence state of the slot the single-sequence paths point at.
+    pub(crate) fn seq(&self) -> &SeqState { &self.sess.seqs[self.cur_slot.get()] }
     pub(crate) fn conv_off(&self, l: usize) -> u64 { self.conv_slot_off(l, self.cur_slot.get()) }
     pub(crate) fn ssm_off(&self, l: usize) -> u64 { self.ssm_slot_off(l, self.cur_slot.get()) }
 

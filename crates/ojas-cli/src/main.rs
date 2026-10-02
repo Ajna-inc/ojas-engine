@@ -62,6 +62,16 @@ engine flags (llama.cpp names where one exists):
   -cram, --cache-ram N    expert cache budget, MiB
   -b,    --batch-size N   prefill chunk, tokens
   -ub,   --ubatch-size N  tokens per physical pass (sizes the streamed expert scratch)
+         --prefix-cache-gb N  memory for cached prompt prefixes (0 disables)
+         --doc-cache-gb N  memory for documents reused at any position (approximate; 0 disables)
+  -np,   --parallel N     serve: requests run at once, up to 4 (qwen35; each holds its own KV and state)
+         --prefix-cache-dir PATH  keep cached prefixes in PATH across runs
+         --prefix-cache-readonly  use PATH's prefixes without changing it
+         --prefix-cache-disk-gb N  size cap for PATH (default 20, at most a quarter of free space)
+         --prefix-cache-reserve-gb N  free space PATH always leaves (default 10)
+         --prefix-cache-save reused|always  when a prefix is written to PATH (default reused)
+         --prefix-cache-disk-int8  store KV in PATH as int8: half the size, restores no longer exact
+         --prefix-cache-pin FILE  serve: process and pin the system prompt in FILE at startup
   -md,   --spec-draft-model FNAME  MTP draft head
          --mmproj FNAME   vision projector GGUF (ocr; defaults to *mmproj*.gguf beside the model)
          --top-k-experts N  MoE experts per token (NOT sampling top-k)

@@ -1,5 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 use super::*;
+use super::prefix_cache::{self, Plan, BLOCK};
+use super::prefix_disk;
  // re-export
 
 /// Cross-turn dense KV-prefix reuse gate: a shared prefix shorter than this
@@ -35,8 +37,9 @@ impl<'a> DecoderGpu<'a> {
         // 256-token chunks. Decide recurrent reuse now; a chunk alone is too short
         // to discover the useful shared prefix and would reset the state.
         if self.arch.ssm.is_some() && full.len() > 1 {
+            if self.uses_prefix_cache() { return self.cache_resume(&full[..full.len() - 1]); }
             let n = self.reuse_prefix(&full[..full.len()-1]);
-            if n > 0 { self.sess.session_tokens.borrow_mut().truncate(n); }
+            if n > 0 { self.seq().session_tokens.borrow_mut().truncate(n); }
             return n;
         }
         if self.arch.ssm.is_some() { return 0; }
@@ -48,12 +51,12 @@ impl<'a> DecoderGpu<'a> {
         if self.cfg.no_prefix_reuse {
             // Kill-switch / A-B control: force a full re-prefill from 0. Clear the
             // token log so the fresh sequence tracks cleanly from position 0.
-            self.sess.session_tokens.borrow_mut().clear();
+            self.seq().session_tokens.borrow_mut().clear();
             PREFILLED_HI.with(|c| c.set(0));
             return 0;
         }
         let raw_start = {
-            let prev = self.sess.session_tokens.borrow();
+            let prev = self.seq().session_tokens.borrow();
             let lcp = prev.iter().zip(full.iter()).take_while(|(a, b)| a == b).count();
             if lcp < REUSE_MIN_LCP { 0 } else { lcp - REUSE_SLACK }
         };
@@ -67,7 +70,7 @@ impl<'a> DecoderGpu<'a> {
         } else {
             raw_start
         };
-        self.sess.session_tokens.borrow_mut().truncate(start);
+        self.seq().session_tokens.borrow_mut().truncate(start);
         // Lower the high-water mark to the reused extent. Without this, a shorter or
         // diverged re-prefix leaves the mark stale-high from an earlier, longer
         // sequence, and the cap above then fails to exclude this sequence's
@@ -84,7 +87,7 @@ impl<'a> DecoderGpu<'a> {
     /// the per-token path records via `forward_id`'s own append.
     fn record_prefilled(&self, base_pos: usize, toks: &[u32]) {
         {
-            let mut st = self.sess.session_tokens.borrow_mut();
+            let mut st = self.seq().session_tokens.borrow_mut();
             if base_pos == 0 {
                 st.clear();
                 st.extend_from_slice(toks);
@@ -109,21 +112,22 @@ impl<'a> DecoderGpu<'a> {
     /// conversation must not reuse the previous one's KV. (SSM state is zeroed by
     /// `reset_state`; this clears the dense token log + high-water mark.)
     pub(crate) fn reset_dense_reuse(&self) {
-        self.sess.session_tokens.borrow_mut().clear();
+        self.seq().session_tokens.borrow_mut().clear();
         PREFILLED_HI.with(|c| c.set(0));
     }
 
     /// Number of leading tokens restored by the most recent recurrent prefill.
-    pub fn last_prefill_reused(&self) -> usize { self.sess.last_prefill_reused.get() }
+    pub fn last_prefill_reused(&self) -> usize { self.seq().last_prefill_reused.get() }
 
     pub fn prefill(&self, tokens: &[u32], base_pos: usize) {
         assert!(base_pos.checked_add(tokens.len()).is_some_and(|n| n <= self.st.max_seq)
             && tokens.iter().all(|&t| (t as usize) < self.arch.vocab), "prefill exceeds model bounds");
-        self.sess.last_prefill_reused.set(0);
-        if base_pos == 0 && self.arch.ssm.is_some()
+        self.seq().last_prefill_reused.set(0);
+        if base_pos == 0 && self.arch.ssm.is_some() && !self.uses_prefix_cache()
             && (tokens.len() <= 1 || (self.arch.qwen4exp.is_none() && (!self.wt.q4 || self.cfg.no_prefill))) {
             // These paths do not restore a recurrent snapshot. A new prompt
             // must start from zero rather than inherit the previous request.
+            // The prefix-cache path resets in `cache_resume`, after its lookup.
             self.reset_session();
         }
         // gpt-oss: batched Q8 chunked prefill (MoE + sinks + SwiGLU-OAI) — no SSM,
@@ -184,10 +188,10 @@ impl<'a> DecoderGpu<'a> {
             } else { 0 };
             if base_pos == 0 && reused == 0 {
                 self.reset_state();
-                self.sess.snap_pos.borrow_mut().clear();
-                self.sess.snap_buf.borrow_mut().clear();
+                self.seq().snap_pos.borrow_mut().clear();
+                self.seq().snap_buf.borrow_mut().clear();
             }
-            self.sess.last_prefill_reused.set(reused);
+            self.seq().last_prefill_reused.set(reused);
             let cap = if self.strm.stream { self.strm.ubatch } else { MAXM };
             let chunk_sz = self.cfg.prefill_m.clamp(1, cap);
             // Before the loop, not after: the PLE layer hashes an n-gram of the token
@@ -220,7 +224,16 @@ impl<'a> DecoderGpu<'a> {
         let full = tokens;
         let input_base = base_pos;
         let (mut tokens, mut base_pos) = (tokens, base_pos);
-        if base_pos == 0 {
+        let cached = self.uses_prefix_cache();
+        if cached {
+            if base_pos == 0 {
+                let n = self.cache_start(full);
+                tokens = &full[n..];
+                base_pos = n;
+            } else {
+                self.cache_continue(base_pos, tokens);
+            }
+        } else if base_pos == 0 {
             // In-memory prefix reuse: if the new prompt shares a leading run with
             // the sequence already in the KV cache, roll the SSM state back to the
             // nearest snapshot at/before the divergence and prefill only the tail.
@@ -236,24 +249,24 @@ impl<'a> DecoderGpu<'a> {
                 let n = self.try_restore_session(reusable);
                 if n == 0 {
                     self.reset_state();
-                    self.sess.snap_pos.borrow_mut().clear();
-                    self.sess.snap_buf.borrow_mut().clear();
+                    self.seq().snap_pos.borrow_mut().clear();
+                    self.seq().snap_buf.borrow_mut().clear();
                 }
                 if n > 0 {
                     tracing::info!(target: "session", "restored {n} tokens — prefilling {} new", full.len() - n);
                     tokens = &full[n..];
                     base_pos = n;
                     // seed the in-memory snapshot ladder from the restored prefix
-                    self.sess.snap_pos.borrow_mut().clear();
-                    self.sess.snap_buf.borrow_mut().clear();
+                    self.seq().snap_pos.borrow_mut().clear();
+                    self.seq().snap_buf.borrow_mut().clear();
                     self.capture_snapshot(n);
                 }
             }
         }
         let mut pos = base_pos;
-        if pos == 0 && !self.sess.snap_pos.borrow().iter().any(|&p| p == 0) {
-            self.sess.snap_pos.borrow_mut().clear();
-            self.sess.snap_buf.borrow_mut().clear();
+        if !cached && pos == 0 && !self.seq().snap_pos.borrow().contains(&0) {
+            self.seq().snap_pos.borrow_mut().clear();
+            self.seq().snap_buf.borrow_mut().clear();
             self.capture_snapshot(0); // state at position 0 is the zeroed init
         }
         let chunk_sz: usize = self.cfg.prefill_m.min(MAXM);
@@ -268,11 +281,17 @@ impl<'a> DecoderGpu<'a> {
             self.qwen35_mtp_catchup(chunk, pos);
             self.sp.hrow.set(chunk.len()-1);
             pos += chunk.len();
-            self.maybe_snapshot(pos);
+            if cached {
+                self.cache_capture(pos);
+                self.doc_capture(pos);
+            } else {
+                self.maybe_snapshot(pos);
+            }
         }
+        if cached { self.sess.cache.borrow_mut().sync(); }
         // record the exact token sequence now represented by the KV cache + state
         self.record_prefilled(input_base, full);
-        if !tokens.is_empty() {
+        if !tokens.is_empty() && !cached {
             self.save_session(pos);
         }
     }
@@ -295,7 +314,9 @@ impl<'a> DecoderGpu<'a> {
     /// across a restart either.
     fn mark_span_unreusable(&self) {
         self.reset_dense_reuse();     // session_tokens.clear() + PREFILLED_HI = 0
-        self.sess.last_prefill_reused.set(0);
+        self.seq().last_prefill_reused.set(0);
+        // Nor may the prefix cache store blocks under these ids.
+        *self.seq().cache_plan.borrow_mut() = None;
     }
 
     /// Prefill a span from precomputed residual rows instead of token ids — the seam a
@@ -422,21 +443,282 @@ impl<'a> DecoderGpu<'a> {
         true
     }
 
-    /// Bytes-per-full-SSM-snapshot layout: for each SSM layer, conv_state then
-    /// ssm_state (host copies), followed by the draft carry when MTP is loaded.
-    /// Attention layers reuse their addressable KV state in place.
-    pub(crate) fn snapshot_bytes(&self) -> usize {
-        let mut n = 0;
-        for l in 0..self.arch.n_layers {
-            if self.arch.layers[l].is_ssm {
-                // One slot's worth. `buffer.length()` is every slot's state at once,
-                // which would size the snapshot B times too large and make it describe
-                // sequences it has no business carrying.
-                n += self.conv_region(l).1 + self.ssm_region(l).1;
+    /// Whether prefill goes through the prompt-prefix cache: the qwen35 chunk graph,
+    /// whose chunks tile a cache block exactly, with a cache budget set.
+    pub(crate) fn uses_prefix_cache(&self) -> bool {
+        self.arch.ssm.is_some() && self.arch.qwen4exp.is_none()
+            && !(self.arch.moe.is_some() && !self.wt.q4) && !self.cfg.no_prefill && !self.cfg.no_prefix_reuse
+            && BLOCK.is_multiple_of(self.cfg.prefill_m.clamp(1, MAXM))
+            && self.sess.cache.borrow().enabled()
+    }
+
+    /// The current slot's KV rows for positions `[p0, p0 + BLOCK)` of every
+    /// attention layer, the draft block's included: K then V per layer.
+    fn kv_block_parts(&self, p0: usize) -> Vec<(*mut u8, usize)> { self.kv_rows_parts(p0, BLOCK) }
+
+    /// Every layer with an attention KV cache, the draft block's included.
+    fn kv_layers(&self) -> Vec<usize> {
+        let draft = self.sp.mtp.map(|m| m.layer);
+        (0..self.arch.n_layers).filter(|&l| !self.arch.layers[l].is_ssm).chain(draft).collect()
+    }
+
+    /// The current slot's KV rows for positions `[p0, p0 + n)`: K then V for each of
+    /// `kv_layers`.
+    fn kv_rows_parts(&self, p0: usize, n: usize) -> Vec<(*mut u8, usize)> {
+        let mut parts = Vec::new();
+        for l in self.kv_layers() {
+            let row = self.arch.layers[l].kvdim as usize * 2;
+            for cache in [&self.st.kcache[l], &self.st.vcache[l]] {
+                parts.push((unsafe { self.kv_ptr(cache, l).add(p0 * row) }, n * row));
             }
         }
-        if self.sp.mtp.is_some() { n += self.sp.mtp.map(|m| m.hnorm_len * 4).unwrap_or(0); }
+        parts
+    }
+
+    /// Start a new sequence from the longest cached prefix of `prompt` (every token
+    /// before the one whose logits are wanted) and plan what this prefill adds to
+    /// the cache. With reuse forbidden nothing is restored, but the lookup still
+    /// tells the plan where the prompt branches. Returns the positions restored, a
+    /// multiple of `BLOCK`.
+    pub(crate) fn cache_resume(&self, prompt: &[u32]) -> usize {
+        let t0 = std::time::Instant::now();
+        let reads = self.sess.cache.borrow().stats().disk_reads;
+        let keys = prefix_cache::block_keys(prompt);
+        let reuse = self.seq().cache_reuse.get();
+        // A block that fails to load from the cache directory is dropped, so the
+        // next lookup stops short of it.
+        let (hit, used, (kv, snapshot)) = loop {
+            let mut cache = self.sess.cache.borrow_mut();
+            let mut hit = cache.lookup(prompt, &keys, true);
+            let used = if reuse { hit.blocks } else { 0 };
+            hit.resume = hit.resume.min(used);
+            if let Some(payloads) = cache.load(&keys[..hit.resume]) { break (hit, used, payloads); }
+        };
+        self.reset_session();
+        let n = hit.resume * BLOCK;
+        self.sess.cache.borrow_mut().record(&keys[..used], hit.resume);
+        if n > 0 {
+            for (b, bytes) in kv.iter().enumerate() {
+                write_parts(&self.kv_block_parts(b * BLOCK), bytes);
+            }
+            self.set_state_bytes(&snapshot.expect("a resume block carries a snapshot"));
+            self.rebuild_page_meta(n);
+            self.seq().session_tokens.borrow_mut().extend_from_slice(&prompt[..n]);
+        }
+        let disk_payloads = self.sess.cache.borrow().stats().disk_reads - reads;
+        let restore_us = t0.elapsed().as_micros() as u64;
+        self.seq().last_prefill_reused.set(n);
+        *self.seq().cache_plan.borrow_mut() =
+            Some(Plan::new(prompt.to_vec(), keys, hit, &self.seq().cache_marks.take()));
+        let (resumed, doc_reused_tokens) = self.place_docs(prompt, n);
+        self.seq().cache_last.set(ojas_core::PrefixRestore {
+            matched_tokens: hit.blocks * BLOCK, reused_tokens: n, doc_reused_tokens, disk_payloads, restore_us,
+        });
+        resumed
+    }
+
+    /// Serve the requested document spans of `prompt` from the document cache, past
+    /// the `n` tokens restored exactly. A span found there is placed at its new
+    /// position: the text before it and its first `doc_recompute` tokens are
+    /// processed, its middle comes from the cache with keys rotated, and its last
+    /// `doc_tail` share is processed again to rebuild the recurrent state. Spans not
+    /// found, or not to be served, are added once processed. Returns the position
+    /// processing resumes at, and the tokens served from the cache.
+    fn place_docs(&self, prompt: &[u32], n: usize) -> (usize, usize) {
+        let mut spans: Vec<(usize, usize)> = self.seq().cache_docs.take().into_iter()
+            .filter(|&(s, e)| s < e && e <= prompt.len()).collect();
+        spans.sort_unstable();
+        self.seq().docs_pending.borrow_mut().clear();
+        if !self.sess.docs.borrow().enabled() { return (n, 0); }
+        let serve = self.seq().docs_serve.get();
+        let (mut pos, mut reused) = (n, 0);
+        for (s, e) in spans {
+            if s < pos { continue; }
+            let len = e - s;
+            let recompute = self.cfg.doc_recompute.min(len);
+            let tail = ((len as f64 * self.cfg.doc_tail).ceil() as usize).max(1);
+            let found = if serve {
+                self.sess.docs.borrow_mut().get(&prompt[s..e]).map(|(kv, base)| (kv.to_vec(), base))
+            } else {
+                None
+            };
+            let Some((kv, base)) = found.filter(|_| recompute + tail < len) else {
+                self.seq().docs_pending.borrow_mut().push((s, e));
+                continue;
+            };
+            let (head, body_end) = (s + recompute, e - tail);
+            if head > pos { self.prefill(&prompt[pos..head], pos); }
+            self.place_rows(&kv, len, recompute, len - tail, s as i64 - base as i64, head);
+            self.seq().session_tokens.borrow_mut().extend_from_slice(&prompt[head..body_end]);
+            if let Some(plan) = self.seq().cache_plan.borrow_mut().as_mut() { plan.exact = plan.exact.min(head); }
+            self.prefill(&prompt[body_end..e], body_end);
+            reused += body_end - head;
+            pos = e;
+        }
+        if reused > 0 { self.sess.docs.borrow_mut().record(reused); }
+        (pos, reused)
+    }
+
+    /// Write rows `[from, to)` of a cached span of `len` tokens to positions starting
+    /// at `at`, rotating keys by `delta` positions.
+    fn place_rows(&self, kv: &[u8], len: usize, from: usize, to: usize, delta: i64, at: usize) {
+        let rd = self.arch.ssm.as_ref().map_or(self.arch.hd, |s| s.n_rot as usize);
+        let mut off = 0;
+        for l in self.kv_layers() {
+            let lp = self.arch.layers[l];
+            let row = lp.kvdim as usize * 2;
+            let rope = super::doc_cache::Rope { hd: lp.head_dim as usize, rd, base: lp.rope_base };
+            let parts = [(&self.st.kcache[l], true), (&self.st.vcache[l], false)];
+            for (cache, is_key) in parts {
+                let mut rows = kv[off + from * row..off + to * row].to_vec();
+                if is_key { super::doc_cache::rotate_keys(&mut rows, lp.kvdim as usize, rope, delta); }
+                write_parts(&[(unsafe { self.kv_ptr(cache, l).add(at * row) }, rows.len())], &rows);
+                off += len * row;
+            }
+        }
+        self.rebuild_page_meta(at + (to - from));
+    }
+
+    /// After processing reached `pos`: add the pending document spans that end by
+    /// then, while the sequence is still exact, to the document cache.
+    fn doc_capture(&self, pos: usize) {
+        let ready: Vec<(usize, usize)> = self.seq().docs_pending.borrow().iter().copied().filter(|&(_, e)| e <= pos).collect();
+        if ready.is_empty() { return; }
+        self.seq().docs_pending.borrow_mut().retain(|&(_, e)| e > pos);
+        let plan = self.seq().cache_plan.borrow();
+        let Some(plan) = plan.as_ref() else { return };
+        for (s, e) in ready.into_iter().filter(|&(_, e)| e <= plan.exact) {
+            let kv = read_parts(&self.kv_rows_parts(s, e - s));
+            self.sess.docs.borrow_mut().insert(&plan.tokens[s..e], s, kv);
+        }
+    }
+
+    /// Where a prefill at position 0 starts. A plan `reuse_prefix_len` made for this
+    /// prompt and nothing has started yet already ran the lookup and reset the
+    /// state; anything else looks the prompt up now.
+    fn cache_start(&self, tokens: &[u32]) -> usize {
+        let fresh = self.seq().cache_plan.borrow_mut().as_mut().is_some_and(|p| {
+            let k = p.tokens.len().min(tokens.len());
+            let ok = !p.started && p.resume == 0 && p.tokens[..k] == tokens[..k];
+            p.started |= ok;
+            ok
+        });
+        if fresh { return 0; }
+        let n = self.cache_resume(&tokens[..tokens.len().saturating_sub(1)]);
+        if let Some(p) = self.seq().cache_plan.borrow_mut().as_mut() { p.started = true; }
         n
+    }
+
+    /// A prefill continuing at `base`: keep the plan only if it describes these tokens.
+    fn cache_continue(&self, base: usize, tokens: &[u32]) {
+        let mut plan = self.seq().cache_plan.borrow_mut();
+        let keep = plan.as_ref().is_some_and(|p| {
+            let end = (base + tokens.len()).min(p.tokens.len());
+            base <= end && p.tokens[base..end] == tokens[..end - base]
+        });
+        match plan.as_mut() {
+            Some(p) if keep => p.started = true,
+            _ => *plan = None,
+        }
+    }
+
+    /// After the prefill chunk that ended at `pos`: cache the block that ended
+    /// there, with a snapshot where the plan wants one.
+    fn cache_capture(&self, pos: usize) {
+        let mut plan = self.seq().cache_plan.borrow_mut();
+        let Some(plan) = plan.as_mut() else { return };
+        let b = pos / BLOCK;
+        if !pos.is_multiple_of(BLOCK) || b <= plan.resume || b > plan.keys.len() || pos > plan.exact { return; }
+        let key = plan.keys[b - 1];
+        let parent = if b > 1 { plan.keys[b - 2] } else { prefix_cache::ROOT };
+        let mut cache = self.sess.cache.borrow_mut();
+        if !cache.contains(key) {
+            let kv = read_parts(&self.kv_block_parts(pos - BLOCK));
+            if !cache.insert(parent, &plan.tokens[pos - BLOCK..pos], kv) { return; }
+        }
+        if plan.wants_snapshot(b, self.snap_interval()) && !cache.has_snapshot(key)
+            && cache.attach_snapshot(key, self.state_bytes()) {
+            plan.took_snapshot(b);
+        }
+    }
+
+    /// Occupancy and hit counts of the prompt-prefix cache.
+    pub(crate) fn prefix_cache_stats(&self) -> ojas_core::PrefixCacheStats {
+        let s = self.sess.cache.borrow().stats();
+        ojas_core::PrefixCacheStats {
+            blocks: s.blocks, snapshots: s.snapshots, bytes: s.bytes, budget: s.budget,
+            lookups: s.lookups, hits: s.hits, reused_tokens: s.reused_tokens, block_tokens: BLOCK,
+            directory: s.disk_budget > 0 || s.disk_blocks > 0, disk_blocks: s.disk_blocks,
+            disk_snapshots: s.disk_snapshots, disk_bytes: s.disk_bytes, disk_budget: s.disk_budget,
+            disk_reads: s.disk_reads, pinned_blocks: s.pinned, evictions: s.evictions, last: self.seq().cache_last.get(),
+            docs: { let d = self.sess.docs.borrow().stats(); ojas_core::DocCacheStats {
+                docs: d.docs, bytes: d.bytes, budget: d.budget, hits: d.hits, reused_tokens: d.reused_tokens } },
+        }
+    }
+
+    /// Process `tokens` into the prefix cache without generating: every full block
+    /// is cached, with a snapshot after the last, and pinned when `pin` is set.
+    /// Returns the tokens now cached.
+    pub(crate) fn warm_prefix(&self, tokens: &[u32], pin: bool) -> usize {
+        let prompt = &tokens[..tokens.len() / BLOCK * BLOCK];
+        if prompt.is_empty() || !self.uses_prefix_cache() { return 0; }
+        let reuse = self.seq().cache_reuse.replace(true);
+        let start = self.cache_resume(prompt);
+        if start < prompt.len() { self.prefill(&prompt[start..], start); }
+        self.seq().cache_reuse.set(reuse);
+        let keys = prefix_cache::block_keys(prompt);
+        let mut cache = self.sess.cache.borrow_mut();
+        if pin { cache.pin(&keys); }
+        cache.sync();
+        cache.lookup(prompt, &keys, true).resume * BLOCK
+    }
+
+    /// Back the prefix cache with `prefix_cache_dir`, when set. Blocks saved there by
+    /// any earlier run of this model build are reusable at once. The subdirectory is
+    /// chosen by the model's weights, `prec` and the state layout, so a different
+    /// build never reads them. A directory that cannot be opened leaves the cache in
+    /// RAM only.
+    pub(crate) fn open_prefix_dir(&self, model_files: &[std::path::PathBuf], prec: u8) {
+        let Some(root) = self.cfg.prefix_cache_dir.as_deref() else { return };
+        if !self.uses_prefix_cache() { return; }
+        if model_files.is_empty() {
+            tracing::warn!(target: "prefix", "the model was not opened from files; caching prompts in RAM only");
+            return;
+        }
+        let gb = |v: f64| (v.max(0.0) * 1e9) as u64;
+        let kv_len: usize = self.kv_block_parts(0).iter().map(|&(_, len)| len).sum();
+        let snapshot_len: usize = self.state_parts().iter().map(|&(_, len)| len).sum();
+        let kv = if self.cfg.prefix_cache_disk_int8 { prefix_disk::KvFormat::Q8 } else { prefix_disk::KvFormat::F16 };
+        let opened = prefix_disk::fingerprint(model_files).and_then(|weights| {
+            let build = [weights, u64::from(prec), self.cfg.prefill_m.clamp(1, MAXM) as u64, kv_len as u64,
+                snapshot_len as u64, BLOCK as u64, kv as u64];
+            let salt = prefix_disk::checksum(&build.iter().flat_map(|v| v.to_le_bytes())
+                .chain(env!("CARGO_PKG_VERSION").bytes()).collect::<Vec<u8>>());
+            let format = if kv == prefix_disk::KvFormat::Q8 { ", int8 KV" } else { "" };
+            let about = format!("{} at precision {prec}{format}\n", self.sess.model_name);
+            prefix_disk::Disk::open(root, salt, &about, prefix_disk::DiskOptions {
+                readonly: self.cfg.prefix_cache_readonly, reserve: gb(self.cfg.prefix_cache_reserve_gb),
+                block_tokens: BLOCK, kv,
+            })
+        });
+        let opened = match opened {
+            Ok(opened) => opened,
+            Err(e) => {
+                tracing::warn!(target: "prefix", "cache directory {}: {e}; caching prompts in RAM only", root.display());
+                return;
+            }
+        };
+        let budget = match self.cfg.prefix_cache_disk_gb {
+            Some(v) => gb(v),
+            None => gb(20.0).min(prefix_disk::free_space(opened.disk.dir()) / 4),
+        };
+        let (dir, blocks, writable) = (opened.disk.dir().display().to_string(), opened.records.len(), opened.disk.writable());
+        self.sess.cache.borrow_mut().attach_disk(opened, budget as usize, self.cfg.prefix_cache_save, kv_len, snapshot_len);
+        if writable {
+            tracing::info!(target: "prefix", "cache directory {dir}: {blocks} blocks, cap {:.1} GB", budget as f64 / 1e9);
+        } else {
+            tracing::info!(target: "prefix", "cache directory {dir}: {blocks} blocks, read-only");
+        }
     }
 
     /// Snapshot interval in tokens (env OJAS_SNAP; default 2048). Smaller =
@@ -445,30 +727,38 @@ impl<'a> DecoderGpu<'a> {
         self.cfg.snap_interval
     }
 
+    /// The current slot's recurrent state as bytes: for each SSM layer conv then
+    /// SSM state, then the draft carry when MTP is loaded. Attention layers keep
+    /// their state in addressable KV rows instead.
+    pub(crate) fn state_bytes(&self) -> Vec<u8> { read_parts(&self.state_parts()) }
+
+    /// Overwrite the current slot's recurrent state with bytes from `state_bytes`.
+    pub(crate) fn set_state_bytes(&self, bytes: &[u8]) { write_parts(&self.state_parts(), bytes) }
+
+    fn state_parts(&self) -> Vec<(*mut u8, usize)> {
+        let mut parts = Vec::new();
+        for l in 0..self.arch.n_layers {
+            if self.arch.layers[l].is_ssm {
+                parts.extend([self.conv_region(l), self.ssm_region(l)]);
+            }
+        }
+        if let Some(m) = self.sp.mtp {
+            let bytes = m.hnorm_len * 4;
+            parts.push((unsafe { (self.sp.mtp_hprev.contents() as *mut u8).add(MAXM * bytes) }, bytes));
+        }
+        parts
+    }
+
     /// Copy the current SSM/conv state into a host snapshot tagged with `pos`.
     pub(crate) fn capture_snapshot(&self, pos: usize) {
         if self.arch.ssm.is_none() { return; }
-        let mut buf = vec![0u8; self.snapshot_bytes()];
-        let mut off = 0;
-        for l in 0..self.arch.n_layers {
-            if !self.arch.layers[l].is_ssm { continue; }
-            for (ptr, len) in [self.conv_region(l), self.ssm_region(l)] {
-                unsafe { std::ptr::copy_nonoverlapping(ptr as *const u8, buf[off..].as_mut_ptr(), len); }
-                off += len;
-            }
-        }
-        if self.sp.mtp.is_some() {
-            let bytes = self.sp.mtp.map(|m| m.hnorm_len * 4).unwrap_or(0);
-            unsafe { std::ptr::copy_nonoverlapping(
-                (self.sp.mtp_hprev.contents() as *const u8).add(MAXM*bytes),
-                buf[off..].as_mut_ptr(), bytes); }
-        }
-        self.sess.snap_pos.borrow_mut().push(pos);
-        self.sess.snap_buf.borrow_mut().push(buf);
+        let buf = self.state_bytes();
+        self.seq().snap_pos.borrow_mut().push(pos);
+        self.seq().snap_buf.borrow_mut().push(buf);
         // bound memory: keep position 0 (anchor) + the most recent snapshots
         let cap = 24usize;
-        let mut sp = self.sess.snap_pos.borrow_mut();
-        let mut sb = self.sess.snap_buf.borrow_mut();
+        let mut sp = self.seq().snap_pos.borrow_mut();
+        let mut sb = self.seq().snap_buf.borrow_mut();
         while sp.len() > cap {
             let drop = if sp[0] == 0 { 1 } else { 0 }; // never drop the pos-0 anchor
             sp.remove(drop);
@@ -479,7 +769,7 @@ impl<'a> DecoderGpu<'a> {
     /// Snapshot at chunk boundaries that cross an interval multiple.
     pub(crate) fn maybe_snapshot(&self, pos: usize) {
         let iv = self.snap_interval();
-        let last = self.sess.snap_pos.borrow().last().copied().unwrap_or(0);
+        let last = self.seq().snap_pos.borrow().last().copied().unwrap_or(0);
         if pos >= last + iv {
             self.capture_snapshot(pos);
         }
@@ -487,21 +777,7 @@ impl<'a> DecoderGpu<'a> {
 
     /// Restore the SSM/conv state from snapshot index `idx`.
     pub(crate) fn restore_snapshot(&self, idx: usize) {
-        let sb = self.sess.snap_buf.borrow();
-        let buf = &sb[idx];
-        let mut off = 0;
-        for l in 0..self.arch.n_layers {
-            if !self.arch.layers[l].is_ssm { continue; }
-            for (ptr, len) in [self.conv_region(l), self.ssm_region(l)] {
-                unsafe { std::ptr::copy_nonoverlapping(buf[off..].as_ptr(), ptr, len); }
-                off += len;
-            }
-        }
-        if self.sp.mtp.is_some() {
-            let bytes = self.sp.mtp.map(|m| m.hnorm_len * 4).unwrap_or(0);
-            unsafe { std::ptr::copy_nonoverlapping(buf[off..].as_ptr(),
-                (self.sp.mtp_hprev.contents() as *mut u8).add(MAXM*bytes), bytes); }
-        }
+        self.set_state_bytes(&self.seq().snap_buf.borrow()[idx]);
     }
 
     /// If `tokens` shares a leading run with the sequence already in the KV cache,
@@ -509,12 +785,12 @@ impl<'a> DecoderGpu<'a> {
     /// return that position (KV for [0..pos] is reused in place). 0 = no reuse.
     pub(crate) fn reuse_prefix(&self, tokens: &[u32]) -> usize {
         if self.arch.ssm.is_none() || self.cfg.no_prefix_reuse { return 0; }
-        let prev = self.sess.session_tokens.borrow();
+        let prev = self.seq().session_tokens.borrow();
         // longest common prefix with what the cache currently holds
         let lcp = prev.iter().zip(tokens.iter()).take_while(|(a, b)| a == b).count();
         if lcp < 256 { return 0; } // not worth the snapshot restore + bookkeeping
         // largest snapshot position ≤ lcp
-        let sp = self.sess.snap_pos.borrow();
+        let sp = self.seq().snap_pos.borrow();
         let Some((idx, &pos)) = sp.iter().enumerate().filter(|(_, &p)| p <= lcp).max_by_key(|(_, &p)| p)
         else { return 0 };
         drop(sp);
@@ -529,10 +805,28 @@ impl<'a> DecoderGpu<'a> {
         if pos == 0 { return 0; }
         self.restore_snapshot(idx);
         // drop any snapshots after the reuse point — they belong to a diverged tail
-        let mut spm = self.sess.snap_pos.borrow_mut();
-        let mut sbm = self.sess.snap_buf.borrow_mut();
+        let mut spm = self.seq().snap_pos.borrow_mut();
+        let mut sbm = self.seq().snap_buf.borrow_mut();
         while spm.last().map_or(false, |&p| p > pos) { spm.pop(); sbm.pop(); }
         pos
+    }
+
+    /// Recompute page-sparse attention metadata for the first `n` cache rows after
+    /// they were restored rather than prefilled. A no-op without a sparse budget.
+    fn rebuild_page_meta(&self, n: usize) {
+        if self.arch.sparse_budget.is_none() || n == 0 { return; }
+        let cb = self.gpu.command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        let npg = n.div_ceil(ojas_metal::kernels::attn::PAGE) as u32;
+        for l in 0..self.arch.n_layers {
+            let p = self.arch.layers[l];
+            if p.is_ssm { continue; }
+            self.enc_reduce(enc, "page_minmax",
+                &[(&self.st.kcache[l], 0), (&self.st.pmeta[l], 1)],
+                &[(2, p.kvdim), (3, 0), (4, n as u32)], &[], npg as u64, 256);
+        }
+        enc.end_encoding();
+        let _ = ojas_metal::commit_and_wait_checked(cb, "prefill");
     }
 
     /// Sequence-state parts in a fixed layer order (session save/restore contract):
@@ -569,7 +863,7 @@ impl<'a> DecoderGpu<'a> {
     /// Save the current sequence state (position `n`, tokens recorded by prefill).
     pub(crate) fn save_session(&self, n: usize) {
         let Some((path, key)) = self.session_path_key() else { return };
-        let toks = self.sess.session_tokens.borrow();
+        let toks = self.seq().session_tokens.borrow();
         if toks.len() != n { return; } // only save states we fully tracked
         let parts = self.session_parts(n);
         let slices: Vec<&[u8]> = parts.iter()
@@ -585,8 +879,8 @@ impl<'a> DecoderGpu<'a> {
     /// If a saved session's tokens are a prefix of `tokens`, restore its state
     /// and return the restored position (0 = no usable session).
     pub(crate) fn try_restore_session(&self, tokens: &[u32]) -> usize {
-        self.sess.session_tokens.borrow_mut().clear();
-        self.sess.session_tokens.borrow_mut().extend_from_slice(tokens);
+        self.seq().session_tokens.borrow_mut().clear();
+        self.seq().session_tokens.borrow_mut().extend_from_slice(tokens);
         let Some((path, key)) = self.session_path_key() else { return 0 };
         let Some(mut loaded) = crate::session::open(&path, key) else { return 0 };
         let n = loaded.tokens.len();
@@ -599,23 +893,27 @@ impl<'a> DecoderGpu<'a> {
                 return 0; // states are zero-init; partial copy is harmless pre-prefill
             }
         }
-        // rebuild page-sparse metadata for the restored rows (not persisted)
-        if self.arch.sparse_budget.is_some() {
-            let cb = self.gpu.command_buffer();
-            let enc = cb.new_compute_command_encoder();
-            let npg = ((n + ojas_metal::kernels::attn::PAGE - 1) / ojas_metal::kernels::attn::PAGE) as u32;
-            for l in 0..self.arch.n_layers {
-                let p = self.arch.layers[l];
-                if p.is_ssm { continue; }
-                self.enc_reduce(&enc, "page_minmax",
-                    &[(&self.st.kcache[l], 0), (&self.st.pmeta[l], 1)],
-                    &[(2, p.kvdim), (3, 0), (4, n as u32)], &[], npg as u64, 256);
-            }
-            enc.end_encoding();
-            let _ = ojas_metal::commit_and_wait_checked(cb, "prefill");
-        }
+        self.rebuild_page_meta(n);
         tracing::info!(target: "session", "state restored in {:.2}s", t0.elapsed().as_secs_f32());
         n
     }
 
+}
+
+/// Concatenate the bytes behind `parts`.
+fn read_parts(parts: &[(*mut u8, usize)]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(parts.iter().map(|&(_, len)| len).sum());
+    for &(ptr, len) in parts {
+        buf.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr as *const u8, len) });
+    }
+    buf
+}
+
+/// Scatter `bytes` back over `parts`, in order; the inverse of `read_parts`.
+fn write_parts(parts: &[(*mut u8, usize)], bytes: &[u8]) {
+    let mut off = 0;
+    for &(ptr, len) in parts {
+        unsafe { std::ptr::copy_nonoverlapping(bytes[off..off + len].as_ptr(), ptr, len); }
+        off += len;
+    }
 }

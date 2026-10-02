@@ -2,6 +2,7 @@
 //! (prefill → decode loop, greedy or sampled). Sessions/spec/diffusion entries
 //! remain on the concrete model types.
 
+pub mod batch;
 mod stop;
 pub use stop::StopMatcher;
 
@@ -74,6 +75,10 @@ pub enum FinishReason {
 pub struct Generation {
     pub tokens: Vec<u32>,
     pub finish: FinishReason,
+    /// Prompt tokens restored exactly from a cache instead of processed.
+    pub cached_tokens: usize,
+    /// What the prompt-prefix cache did for the prompt, when the model keeps one.
+    pub prompt_cache: Option<ojas_core::PrefixRestore>,
 }
 
 /// xorshift64* — tiny deterministic RNG (no dependency, stable across builds).
@@ -169,6 +174,59 @@ fn pick_allowed(logits: &mut [f32], recent: &[u32], opts: Option<&SampleOpts>, r
         if r <= 0.0 { return Some(keep[i] as u32); }
     }
     Some(keep[n - 1] as u32)
+}
+
+/// Chooses a sequence's next token from its logits, the same way for a generation
+/// run alone and for one slot of a batch: suppressed ids, the logit processor, then
+/// a greedy or sampled choice with the repetition penalty over recent tokens.
+pub(crate) struct Picker {
+    opts: Option<SampleOpts>,
+    rng: Rng,
+    recent: Vec<u32>,
+}
+
+impl Picker {
+    pub(crate) fn new(prompt: &[u32], opts: Option<&SampleOpts>) -> Self {
+        Picker {
+            opts: opts.cloned(),
+            rng: Rng(opts.map(|o| o.seed).unwrap_or(42) | 1),
+            recent: opts.map(|o| prompt.iter().rev().take(o.repeat_window).copied().collect()).unwrap_or_default(),
+        }
+    }
+
+    /// Whether the next token is sampled rather than the argmax.
+    pub(crate) fn sampled(&self) -> bool { self.opts.as_ref().is_some_and(|o| o.temperature > 0.0) }
+
+    /// The next token from `logits`, or `None` when the constraints allow none.
+    pub(crate) fn pick(&mut self, logits: &mut [f32], banned: &[u32],
+                       processor: Option<&mut (dyn LogitProcessor + '_)>) -> Option<u32> {
+        if banned.is_empty() && processor.is_none() {
+            return match self.opts.as_ref().filter(|o| o.temperature > 0.0) {
+                Some(o) => Some(sample_logits(logits, &self.recent, o, &mut self.rng) as u32),
+                None => (0..logits.len()).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).map(|t| t as u32),
+            };
+        }
+        for &b in banned {
+            if let Some(l) = logits.get_mut(b as usize) { *l = f32::NEG_INFINITY; }
+        }
+        match processor {
+            Some(p) => {
+                p.process(logits);
+                let t = pick_allowed(logits, &self.recent, self.opts.as_ref(), &mut self.rng, &mut |t| p.allows(t))?;
+                p.accept(t);
+                Some(t)
+            }
+            None => pick_allowed(logits, &self.recent, self.opts.as_ref(), &mut self.rng, &mut |_| true),
+        }
+    }
+
+    /// Remember an emitted token for the repetition penalty.
+    pub(crate) fn note(&mut self, t: u32) {
+        if let Some(o) = &self.opts {
+            self.recent.push(t);
+            if self.recent.len() > o.repeat_window { self.recent.remove(0); }
+        }
+    }
 }
 
 /// The frontend decode/prefill host loop, generic over the model contract.
@@ -329,18 +387,17 @@ impl<M: Model> EngineCore<M> {
         on_prefill: &mut dyn FnMut(usize, usize),
         on_token: &mut dyn FnMut(u32) -> bool,
     ) -> Generation {
-        let ended = |tokens: Vec<u32>, finish: FinishReason| Generation { tokens, finish };
-        if prompt_ids.is_empty() || max_tokens == 0 { return ended(Vec::new(), FinishReason::Length); }
+        let ended = |tokens: Vec<u32>, finish: FinishReason, cached_tokens: usize, prompt_cache| {
+            Generation { tokens, finish, cached_tokens, prompt_cache }
+        };
+        if prompt_ids.is_empty() || max_tokens == 0 { return ended(Vec::new(), FinishReason::Length, 0, None); }
         let capacity = self.model.context_capacity();
         assert!(prompt_ids.len() <= capacity, "prompt exceeds allocated model context");
         let max_tokens = max_tokens.min(capacity.saturating_sub(prompt_ids.len()).saturating_add(1));
         let mut out = Vec::with_capacity(max_tokens.min(4096));
         STREAM_CANCEL.store(false, Ordering::Relaxed);
 
-        let mut rng = Rng(opts.map(|o| o.seed).unwrap_or(42) | 1);
-        let mut recent: Vec<u32> = opts.map(|o| {
-            prompt_ids.iter().rev().take(o.repeat_window).copied().collect()
-        }).unwrap_or_default();
+        let mut picker = Picker::new(prompt_ids, opts);
 
         // Cross-turn KV-prefix reuse: skip the leading tokens the cache already holds
         // from the previous turn (dense KV is positional and persistent). Computed on
@@ -351,6 +408,8 @@ impl<M: Model> EngineCore<M> {
         // model guarantees the reused rows are bit-identical to a fresh prefill.
         let pre = &prompt_ids[..prompt_ids.len() - 1];
         let start = self.model.reuse_prefix_len(pre).min(pre.len());
+        let prompt_cache = self.model.prefix_cache_stats().map(|s| s.last);
+        let cached_tokens = prompt_cache.map_or(start, |r| r.reused_tokens);
 
         let mut pos = 0usize;
         if prompt_ids.len() == 1 { self.model.prefill(&[], 0); }
@@ -364,7 +423,7 @@ impl<M: Model> EngineCore<M> {
             let mut done = start;
             while done < total {
                 if STREAM_CANCEL.load(Ordering::Relaxed) {
-                    return ended(out, FinishReason::Cancelled);
+                    return ended(out, FinishReason::Cancelled, cached_tokens, prompt_cache);
                 }
                 let end = (done + PREFILL_STEP).min(total);
                 self.model.prefill(&pre[done..end], done);
@@ -558,7 +617,7 @@ impl<M: Model> EngineCore<M> {
             if mtp_on && self.model.mtp_verify_width() <= capacity.saturating_sub(pos) && (mtp_probe || mtp_worthwhile) {
                 let tm0 = std::time::Instant::now();
                 if let Some(committed) = self.model.mtp_step_committed(cur, pos) {
-                    if STREAM_CANCEL.load(Ordering::Relaxed) { return ended(out, FinishReason::Cancelled); }
+                    if STREAM_CANCEL.load(Ordering::Relaxed) { return ended(out, FinishReason::Cancelled, cached_tokens, prompt_cache); }
                     // The first verification faults GPU resources into memory. Keep its
                     // output but exclude its cost, comparing steady state over the
                     // remaining probes, so startup does not disable useful MTP.
@@ -590,32 +649,24 @@ impl<M: Model> EngineCore<M> {
                     break;
                 };
                 if ojas_core::device_fault::is_faulted() { finish = FinishReason::Fault; break; }
-                for &b in &self.banned {
-                    if let Some(l) = logits.get_mut(b as usize) { *l = f32::NEG_INFINITY; }
-                }
-                if let Some(p) = processor.as_deref_mut() { p.process(&mut logits); }
-                let picked = match processor.as_deref_mut() {
-                    Some(p) => pick_allowed(&mut logits, &recent, opts, &mut rng, &mut |t| p.allows(t)),
-                    None => pick_allowed(&mut logits, &recent, opts, &mut rng, &mut |_| true),
+                let Some(t) = picker.pick(&mut logits, &self.banned, processor.as_deref_mut()) else {
+                    finish = FinishReason::NoAllowedToken;
+                    break;
                 };
-                let Some(t) = picked else { finish = FinishReason::NoAllowedToken; break; };
                 cur = t;
-                if let Some(p) = processor.as_deref_mut() { p.accept(cur); }
                 pos += 1;
                 out.push(cur);
                 if self.is_stop(cur) { finish = FinishReason::Stop; break; }
                 if !on_token(cur) { finish = FinishReason::Caller; break; }
                 if processor.as_deref().is_some_and(|p| p.finished()) { finish = FinishReason::Complete; break; }
-                if let Some(o) = opts {
-                    recent.push(cur);
-                    if recent.len() > o.repeat_window { recent.remove(0); }
-                }
+                picker.note(cur);
                 continue;
             }
-            let sampled = opts.filter(|o| o.temperature > 0.0).and_then(|o| {
-                self.model.forward_logits(cur, pos)
-                    .map(|mut lg| sample_logits(&mut lg, &recent, o, &mut rng) as u32)
-            });
+            let sampled = if picker.sampled() {
+                self.model.forward_logits(cur, pos).and_then(|mut lg| picker.pick(&mut lg, &[], None))
+            } else {
+                None
+            };
             cur = match sampled {
                 Some(t) => t,
                 None => {
@@ -642,10 +693,7 @@ impl<M: Model> EngineCore<M> {
             if spec_on { hist.push(cur); }
             if self.is_stop(cur) { finish = FinishReason::Stop; break; }
             if !on_token(cur) { finish = FinishReason::Caller; break; }
-            if let Some(o) = opts {
-                recent.push(cur);
-                if recent.len() > o.repeat_window { recent.remove(0); }
-            }
+            picker.note(cur);
         }
         if stats_on {
             let ts = if n_single > 0 { t_single / n_single as f64 * 1e3 } else { 0.0 };
@@ -668,7 +716,7 @@ impl<M: Model> EngineCore<M> {
                 eprintln!("[spec] mtp_calls={mtp_n} mtp_acc={mtp_acc:.0} mtp_t={:.3}ms", if mtp_n > 1 { mtp_t / (mtp_n - 1) as f64 * 1e3 } else { 0.0 });
             }
         }
-        ended(out, finish)
+        ended(out, finish, cached_tokens, prompt_cache)
     }
 }
 

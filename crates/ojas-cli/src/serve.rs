@@ -2,26 +2,29 @@
 //! model is served by `decide::serve` instead (`POST /v1/decide`), on the same
 //! connection loop, [`serve_http`].
 //!
-//! One slot, served on the thread that owns the model. `DecoderGpu` is `Send` but
-//! not `Sync` (it keeps interior-mutable decode state) and a single decoder has
-//! one KV cache, so requests are served sequentially, as llama.cpp's default
-//! `-np 1` does. Concurrency needs several model instances, not several threads.
+//! Requests are served on the thread that owns the model: `DecoderGpu` is `Send`
+//! but not `Sync`. With one sequence slot they run one at a time. With several
+//! (`--parallel`), up to that many run together through the decoder's slots, one
+//! token for each per batched decode step (`ojas_infer::batch`).
 //!
 //! Built on `std::net`: an async runtime would put an executor between the
 //! request and a blocking decode loop without buying any parallelism.
 
 use crate::backend::{with_model, ModelInfo};
-use crate::detok::TextStream;
-use ojas_grammar::{OutputFormat, TokenVocab};
-use std::sync::Arc;
+use ojas_grammar::OutputFormat;
 use crate::flags::RunOpts;
 use anyhow::{Context, Result};
 use ojas_core::Model;
+use ojas_infer::batch::{Batch, Event};
 use ojas_infer::{EngineCore, SampleOpts};
+use std::collections::{HashMap, VecDeque};
 use ojas_tokenize::Bpe;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+
+mod completion;
+use completion::Ctx;
 
 const MAX_BODY: usize = 32 * 1024 * 1024;
 
@@ -106,6 +109,71 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// The prompt-prefix cache's state for `/cache` and `/props`; `null` when the model
+/// keeps none.
+fn cache_json(stats: Option<ojas_core::PrefixCacheStats>) -> Value {
+    let Some(s) = stats else { return Value::Null };
+    json!({
+        "blocks": s.blocks, "snapshots": s.snapshots, "block_tokens": s.block_tokens,
+        "bytes": s.bytes, "budget_bytes": s.budget,
+        "lookups": s.lookups, "hits": s.hits, "reused_tokens": s.reused_tokens,
+        "directory": s.directory.then(|| json!({
+            "blocks": s.disk_blocks, "snapshots": s.disk_snapshots, "bytes": s.disk_bytes,
+            "budget_bytes": s.disk_budget, "reads": s.disk_reads,
+        })),
+        "pinned_blocks": s.pinned_blocks,
+        "evictions": s.evictions,
+        "documents": (s.docs.budget > 0).then(|| json!({
+            "docs": s.docs.docs, "bytes": s.docs.bytes, "budget_bytes": s.docs.budget,
+            "hits": s.docs.hits, "reused_tokens": s.docs.reused_tokens,
+        })),
+        "last": restore_json(&s.last),
+    })
+}
+
+/// Where a prompt's reused tokens came from, and what restoring them cost.
+fn restore_json(r: &ojas_core::PrefixRestore) -> Value {
+    let tier = match (r.reused_tokens, r.disk_payloads) {
+        (0, _) => "none",
+        (_, 0) => "ram",
+        _ => "disk",
+    };
+    json!({
+        "tier": tier, "matched_tokens": r.matched_tokens, "doc_reused_tokens": r.doc_reused_tokens,
+        "reused_tokens": r.reused_tokens, "restore_ms": r.restore_us as f64 / 1e3,
+    })
+}
+
+/// The tokens a warm request caches. A raw `prompt` is taken whole. For `messages`
+/// it is the part of the transcript every continuation shares: the transcript is
+/// rendered with two different next user turns and cut where they diverge, which
+/// holds for any chat template.
+fn warm_ids(body: &Value, bpe: &Bpe, info: &ModelInfo, opts: &RunOpts) -> Result<Vec<u32>> {
+    let Some(msgs) = body.get("messages").and_then(Value::as_array) else {
+        return prompt_ids(body, bpe, info, opts);
+    };
+    let render = |next: &str| {
+        let mut turns = msgs.clone();
+        turns.push(json!({"role": "user", "content": next}));
+        prompt_ids(&json!({ "messages": turns }), bpe, info, opts)
+    };
+    let (a, b) = (render("a")?, render("b")?);
+    let shared = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    Ok(a[..shared].to_vec())
+}
+
+/// Process and pin `--prefix-cache-pin`'s system prompt, when one is set.
+fn pin_startup_prompt(model: &dyn Model, bpe: &Bpe, info: &ModelInfo, opts: &RunOpts) -> Result<()> {
+    let Some(path) = ojas_core::config::EngineConfig::current().prefix_cache_pin else { return Ok(()) };
+    let system = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let ids = warm_ids(&json!({"messages": [{"role": "system", "content": system}]}), bpe, info, opts)?;
+    match model.warm_prefix(&ids, true) {
+        Some(n) => eprintln!("  pinned {n} of {} system-prompt tokens from {}", ids.len(), path.display()),
+        None => eprintln!("  {}: this model keeps no prompt-prefix cache; nothing pinned", path.display()),
+    }
+    Ok(())
+}
+
 /// Per-request sampling: whatever the body specifies, else the CLI defaults.
 /// `constrained` requests default to no repetition penalty, which fights the
 /// punctuation structured output repeats on every field.
@@ -179,21 +247,57 @@ fn prompt_ids(body: &Value, bpe: &Bpe, info: &ModelInfo, opts: &RunOpts) -> Resu
         }
     }
     if let Some(msgs) = body.get("messages").and_then(Value::as_array) {
-        let mut system = opts.system.clone();
-        let mut turns = Vec::new();
-        for m in msgs {
-            let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
-            let content = m.get("content").and_then(Value::as_str).unwrap_or("").to_string();
-            if role == "system" {
-                system = content;
-            } else {
-                turns.push((role.to_string(), content));
-            }
-        }
+        let (system, turns) = chat_turns(msgs, opts);
         let text = ojas_tokenize::chat_transcript(&info.arch, &system, &turns);
         return Ok(bpe.encode(&text).into_iter().map(|v| v as u32).collect());
     }
     anyhow::bail!("request needs either \"prompt\" or \"messages\"")
+}
+
+/// The system prompt and the (role, text) turns of a `messages` array.
+fn chat_turns(msgs: &[Value], opts: &RunOpts) -> (String, Vec<(String, String)>) {
+    let mut system = opts.system.clone();
+    let mut turns = Vec::new();
+    for m in msgs {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+        let content = m.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+        if role == "system" {
+            system = content;
+        } else {
+            turns.push((role.to_string(), content));
+        }
+    }
+    (system, turns)
+}
+
+/// Token ranges of a request's prompt the document cache may serve: the text of
+/// every chat message marked `"cache_doc": true`, or a raw prompt's `doc_spans`
+/// (`[[start, end], ...]` in tokens).
+fn prompt_docs(body: &Value, bpe: &Bpe, info: &ModelInfo, opts: &RunOpts) -> Vec<(usize, usize)> {
+    if let Some(spans) = body.get("doc_spans").and_then(Value::as_array) {
+        return spans.iter().filter_map(|s| {
+            let s = s.as_array()?;
+            Some((s.first()?.as_u64()? as usize, s.get(1)?.as_u64()? as usize))
+        }).collect();
+    }
+    let Some(msgs) = body.get("messages").and_then(Value::as_array) else { return Vec::new() };
+    let (system, turns) = chat_turns(msgs, opts);
+    let tokens = |text: &str| -> Vec<u32> { bpe.encode(text).into_iter().map(|v| v as u32).collect() };
+    msgs.iter().filter(|m| m.get("role").and_then(Value::as_str) != Some("system"))
+        .enumerate()
+        .filter(|(_, m)| m.get("cache_doc").and_then(Value::as_bool) == Some(true))
+        .map(|(k, _)| ojas_tokenize::transcript_span(&info.arch, &system, &turns, k, tokens))
+        .filter(|(s, e)| s < e)
+        .collect()
+}
+
+/// Message boundaries in a chat request's prompt, for the prefix cache to keep
+/// state at; none for a raw prompt.
+fn prompt_marks(body: &Value, bpe: &Bpe, info: &ModelInfo, opts: &RunOpts) -> Vec<usize> {
+    let Some(msgs) = body.get("messages").and_then(Value::as_array) else { return Vec::new() };
+    let (system, turns) = chat_turns(msgs, opts);
+    ojas_tokenize::transcript_boundaries(&info.arch, &system, &turns,
+        |text| bpe.encode(text).into_iter().map(|v| v as u32).collect())
 }
 
 fn stop_ids(bpe: &Bpe, info: &ModelInfo) -> (Option<u32>, Option<u32>) {
@@ -204,220 +308,6 @@ fn stop_ids(bpe: &Bpe, info: &ModelInfo) -> (Option<u32>, Option<u32>) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn handle_completion(
-    stream: &mut TcpStream,
-    core: &EngineCore<&dyn Model>,
-    bpe: &Bpe,
-    info: &ModelInfo,
-    opts: &RunOpts,
-    body: &Value,
-    chat: bool,
-    oai: bool,
-    secondary: Option<u32>,
-    vocab: &Arc<TokenVocab>,
-) {
-    // Refuse a poisoned session before the response shape is chosen, so the client
-    // gets an HTTP error rather than a stream it cannot trust.
-    if let Some(err) = ojas_core::device_fault::peek() {
-        return send_err(stream, "503 Service Unavailable",
-            &format!("device fault; this model session is no longer usable and must be \
-                      reloaded: {err}"));
-    }
-    let ids = match prompt_ids(body, bpe, info, opts) {
-        Ok(v) if !v.is_empty() => v,
-        Ok(_) => return send_err(stream, "400 Bad Request", "empty prompt"),
-        Err(e) => return send_err(stream, "400 Bad Request", &format!("{e:#}")),
-    };
-    if ids.len() >= info.context {
-        return send_err(
-            stream,
-            "400 Bad Request",
-            &format!("prompt is {} tokens; context holds {}", ids.len(), info.context),
-        );
-    }
-
-    let want = body
-        .get("n_predict")
-        .or_else(|| body.get("max_tokens"))
-        .and_then(Value::as_u64)
-        .map(|v| v as usize)
-        .unwrap_or(opts.n_predict)
-        .min(info.context - ids.len());
-    let stops = match stop_strings(body) {
-        Ok(v) => v,
-        Err(e) => return send_err(stream, "400 Bad Request", &format!("{e:#}")),
-    };
-    let mut constraint = match output_format(body).and_then(|f| crate::constrain::processor(f.as_ref(), vocab)) {
-        Ok(p) => p,
-        Err(e) => return send_err(stream, "400 Bad Request", &format!("{e:#}")),
-    };
-    let s = sampling_from(body, opts, constraint.is_some());
-    let sampling = if s.temperature <= 0.0 { None } else { Some(&s) };
-    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let id = format!("cmpl-{:x}", now());
-    let created = now();
-    let model_name = info.arch.clone();
-
-    let mut d = TextStream::new(&stops);
-    let mut text = String::new();
-    let mut n_out = 0usize;
-    let mut alive = true;
-    // Every emitted id, so a client can compare token sequences rather than
-    // decoded text: two engines can print the same string from different tokens.
-    let mut out_ids: Vec<u32> = Vec::with_capacity(want);
-    let return_tokens = body.get("return_tokens").and_then(Value::as_bool).unwrap_or(false);
-
-    if streaming {
-        begin_sse(stream);
-        // The first OpenAI chunk carries the role and no content.
-        if oai && chat {
-            alive = sse(stream, &json!({
-                "id": id, "object": "chat.completion.chunk", "created": created, "model": model_name,
-                "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
-            }));
-        }
-    }
-
-    let gen = core.generate_ex(&ids, want, sampling,
-        constraint.as_mut().map(|p| p as &mut dyn ojas_infer::LogitProcessor), &mut |_, _| {}, &mut |t| {
-        if Some(t) == secondary {
-            return false;
-        }
-        let (piece, stopped) = d.push(bpe, t);
-        n_out += 1;
-        out_ids.push(t);
-        text.push_str(&piece);
-        if !streaming {
-            return !stopped;
-        }
-        // Emit an event for every token, including one whose decoded piece is empty
-        // because the detokenizer is still holding a multi-byte character. Skipping
-        // those hides tokens from the client: counts come out short and the
-        // first/last arrival timestamps used for throughput span the wrong window.
-        let ev = if !oai {
-            let mut e = json!({"content": piece, "stop": false});
-            if return_tokens {
-                e["tokens"] = json!([t]);
-            }
-            e
-        } else if chat {
-            json!({
-                "id": id, "object": "chat.completion.chunk", "created": created, "model": model_name,
-                "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": null}]
-            })
-        } else {
-            json!({
-                "id": id, "object": "text_completion", "created": created, "model": model_name,
-                "choices": [{"index": 0, "text": piece, "finish_reason": null}]
-            })
-        };
-        alive = sse(stream, &ev);
-        // A disconnected client must stop the decode, not keep the slot busy
-        // generating into a closed socket.
-        alive && !stopped
-    });
-    // A model that does not expose logits cannot be constrained; it stops before
-    // emitting anything rather than produce unconstrained output.
-    if gen.finish == ojas_infer::FinishReason::NoLogits {
-        if streaming { return; }
-        return send_err(stream, "501 Not Implemented",
-            "this model's backend does not expose logits, which constrained output needs");
-    }
-    let tail = d.finish();
-    if !tail.is_empty() {
-        text.push_str(&tail);
-    }
-    let reason = crate::constrain::finish_reason(gen.finish);
-    // The /completion fields saying which way generation stopped.
-    let stopped = json!({
-        "stopped_eos": matches!(gen.finish, ojas_infer::FinishReason::Stop | ojas_infer::FinishReason::Complete),
-        "stopped_word": d.stopped(),
-        "stopped_limit": gen.finish == ojas_infer::FinishReason::Length,
-    });
-    let usage = json!({
-        "prompt_tokens": ids.len(),
-        "completion_tokens": n_out,
-        "total_tokens": ids.len() + n_out,
-    });
-
-    if streaming {
-        // A fault raised mid-stream means the tokens after it came out of undefined
-        // buffers. The 200 is already promised, so close with a terminal error
-        // event: never `finish_reason: stop` and never `[DONE]`, which both report
-        // success.
-        if let Some(err) = ojas_core::device_fault::peek() {
-            if alive {
-                let ev = if !oai {
-                    json!({"error": {"message": err.to_string(), "type": "device_error"},
-                           "stop": true, "truncated": true})
-                } else {
-                    json!({"error": {"message": err.to_string(), "type": "device_error"},
-                           "id": id, "object": if chat { "chat.completion.chunk" } else { "text_completion" },
-                           "created": created, "model": model_name,
-                           "choices": [{"index": 0, "delta": {}, "finish_reason": "error"}]})
-                };
-                sse(stream, &ev);
-            }
-            return;
-        }
-        if alive {
-            let done = if !oai {
-                let mut e = json!({"content": tail, "stop": true, "tokens_predicted": n_out, "tokens_evaluated": ids.len()});
-                for (k, v) in stopped.as_object().unwrap() { e[k] = v.clone(); }
-                e
-            } else if chat {
-                // Text held back to the end (an unfinished character, a possible
-                // stop string) goes out with the final chunk.
-                let delta = if tail.is_empty() { json!({}) } else { json!({"content": tail}) };
-                json!({
-                    "id": id, "object": "chat.completion.chunk", "created": created, "model": model_name,
-                    "choices": [{"index": 0, "delta": delta, "finish_reason": reason}], "usage": usage
-                })
-            } else {
-                json!({
-                    "id": id, "object": "text_completion", "created": created, "model": model_name,
-                    "choices": [{"index": 0, "text": tail, "finish_reason": reason}], "usage": usage
-                })
-            };
-            sse(stream, &done);
-            if oai {
-                let _ = stream.write_all(b"data: [DONE]\n\n");
-                let _ = stream.flush();
-            }
-        }
-        return;
-    }
-
-    if let Some(err) = ojas_core::device_fault::peek() {
-        return send_err(stream, "500 Internal Server Error",
-            &format!("device fault during generation; no output is returned because the \
-                      buffers it was read from are undefined: {err}"));
-    }
-    let out = if !oai {
-        let mut e = json!({"content": text, "stop": true, "model": model_name,
-               "tokens_predicted": n_out, "tokens_evaluated": ids.len()});
-        for (k, v) in stopped.as_object().unwrap() { e[k] = v.clone(); }
-        if return_tokens {
-            e["tokens"] = json!(out_ids);
-        }
-        e
-    } else if chat {
-        json!({
-            "id": id, "object": "chat.completion", "created": created, "model": model_name,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": reason}],
-            "usage": usage
-        })
-    } else {
-        json!({
-            "id": id, "object": "text_completion", "created": created, "model": model_name,
-            "choices": [{"index": 0, "text": text, "finish_reason": reason}],
-            "usage": usage
-        })
-    };
-    send_json(stream, "200 OK", &out);
-}
-
 pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
     #[cfg(target_os = "macos")]
     if crate::decide::is_laya(model) {
@@ -425,13 +315,14 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
     }
     with_model(model, opts.device, context, opts.precision, |m, bpe, info| {
         let (primary, secondary) = stop_ids(bpe, info);
-        let mut core = EngineCore::new(m);
-        core.eos = primary;
         // Token bytes for constrained requests, built once for the session.
         let vocab = crate::constrain::vocab(bpe, info);
+        pin_startup_prompt(m, bpe, info, opts)?;
+        let ctx = Ctx { bpe, info, opts, vocab: &vocab, primary, secondary, prefix_cache: m.prefix_cache_stats().is_some() };
 
         let addr = format!("{}:{}", opts.host, opts.port);
         let listener = TcpListener::bind(&addr).with_context(|| format!("binding {addr}"))?;
+        let slots = m.max_slots();
         eprintln!(
             "  {} | {} | ctx {} | MTP {} | loaded in {:.1}s",
             info.arch,
@@ -440,8 +331,11 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
             if info.has_mtp { "yes" } else { "no" },
             info.load_secs
         );
-        eprintln!("  listening on http://{addr}  (one request at a time)");
-        eprintln!("  POST /v1/chat/completions  POST /v1/completions  POST /completion  GET /health  GET /props  GET /v1/models");
+        match slots {
+            1 => eprintln!("  listening on http://{addr}  (one request at a time)"),
+            n => eprintln!("  listening on http://{addr}  ({n} requests at a time)"),
+        }
+        eprintln!("  POST /v1/chat/completions  POST /v1/completions  POST /completion  GET /health  GET /props  GET /cache  POST /cache/save|warm|unpin  GET /v1/models");
 
         let props = json!({
             "model": info.arch,
@@ -451,98 +345,216 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
             "hidden_dim": info.hidden_dim,
             "vocab_size": info.vocab,
             "mtp": info.has_mtp,
-            "concurrent_slots": 1,
+            "concurrent_slots": slots,
         });
-
-        serve_http(&listener, |stream, req, path| {
-            match (req.method.as_str(), path) {
-                ("GET", "/health") => match ojas_core::device_fault::peek() {
-                    // A process that cannot serve must not report healthy; the
-                    // recovery path is a restart by the orchestrator.
-                    Some(err) => send_json(stream, "503 Service Unavailable",
-                        &json!({"status": "error", "error": err.to_string()})),
-                    None => send_json(stream, "200 OK", &json!({"status": "ok"})),
-                },
-                ("GET", "/props") => send_json(stream, "200 OK", &props),
-                ("GET", "/v1/models") => send_json(stream, "200 OK", &json!({
-                    "object": "list",
-                    "data": [{"id": info.arch, "object": "model", "created": now(), "owned_by": "ojas"}]
-                })),
-                ("POST", p @ ("/completion" | "/completions" | "/v1/completions" | "/v1/chat/completions")) => {
-                    let body: Value = match serde_json::from_slice(&req.body) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            send_err(stream, "400 Bad Request", &format!("invalid JSON: {e}"));
-                            return;
-                        }
-                    };
-                    let oai = p.starts_with("/v1/");
-                    let chat = p == "/v1/chat/completions";
-                    // Each request is an independent sequence unless the client
-                    // opts into prompt caching. A recurrent model (Flash, qwen35)
-                    // carries SSM/GDN and MTP state forward, so without the reset the
-                    // second request continues from the middle of the first: fluent
-                    // nonsense, no error. Dense models are unaffected.
-                    if !body.get("cache_prompt").and_then(Value::as_bool).unwrap_or(false) {
-                        core.model().reset_session();
-                    }
-                    // `ignore_eos` makes a fixed-length benchmark possible: both
-                    // engines must emit exactly n_predict tokens, or the rates
-                    // describe different amounts of work. It applies per request and
-                    // cannot leak into the next one. As in llama.cpp it suppresses
-                    // the end-of-generation set from selection rather than merely
-                    // declining to stop: a model that emits its terminator and
-                    // carries on produces different text from that point, so a
-                    // benchmark row whose outputs diverge is not like-for-like.
-                    // `engine_bench.py` reports per-row output equality; treat a row
-                    // marked "NO" as invalid.
-                    let ignore_eos = body.get("ignore_eos").and_then(Value::as_bool).unwrap_or(false);
-                    core.eog = if ignore_eos { Vec::new() } else { info.eog.clone() };
-                    core.banned = if ignore_eos { info.eog.clone() } else { Vec::new() };
-                    core.eos = if ignore_eos { None } else { primary };
-                    let stop = if ignore_eos { None } else { secondary };
-                    handle_completion(stream, &core, bpe, info, opts, &body, chat, oai, stop, &vocab);
-                }
-                _ => send_err(stream, "404 Not Found", &format!("no route for {} {}", req.method, path)),
-            }
-        })
+        if slots > 1 { serve_batched(&listener, m, &ctx, &props) } else { serve_alone(&listener, m, &ctx, &props) }
     })
 }
 
+/// Serve one request at a time on the thread that owns the model, with speculative
+/// decoding available to every request.
+fn serve_alone(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &Value) -> Result<()> {
+    let mut core = EngineCore::new(model);
+    serve_http(listener, |stream, req, path| {
+        if let Some((body, chat, oai)) = completion_route(stream, req, path) {
+            if let Ok(stream) = stream.try_clone() { run_alone(&mut core, ctx, stream, &body, chat, oai); }
+        } else if !serve_other(stream, req, path, model, ctx, props, Some(0)) {
+            send_err(stream, "404 Not Found", &format!("no route for {} {}", req.method, path));
+        }
+    })
+}
+
+fn run_alone(core: &mut EngineCore<&dyn Model>, ctx: &Ctx, stream: TcpStream, body: &Value, chat: bool, oai: bool) {
+    let Some((mut job, mut reply)) = completion::start(stream, ctx, body, chat, oai) else { return };
+    let model = core.model();
+    model.set_prefix_reuse(job.reuse);
+    if !job.reuse { model.reset_session(); }
+    model.set_prefix_marks(&job.marks);
+    model.set_prefix_docs(&job.docs, job.reuse);
+    (core.eog, core.eos, core.banned) = (job.eog.clone(), job.eos, job.banned.clone());
+    let mut constraint = job.constraint.take();
+    let gen = core.generate_ex(&job.ids, job.want, job.sampling.as_ref(),
+        constraint.as_deref_mut().map(|p| p as &mut dyn ojas_infer::LogitProcessor), &mut |_, _| {},
+        &mut |t| reply.token(ctx.bpe, t));
+    reply.finish(&gen);
+}
+
+/// Waiting this long, a request is admitted before any whose prompt the prefix cache
+/// covers further.
+const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Serve up to `max_slots` requests together. Connections are read on their own
+/// thread; this thread owns the model and steps the batch: each step admits waiting
+/// requests, processes one prompt chunk, and decodes a token for every slot past its
+/// prompt, streaming each to its client.
+fn serve_batched(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &Value) -> Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let accepting = listener.try_clone()?;
+    std::thread::Builder::new().name("http-accept".into()).spawn(move || {
+        for conn in accepting.incoming() {
+            if let Some(parsed) = conn.ok().and_then(accept) {
+                if tx.send(parsed).is_err() { return; }
+            }
+        }
+    })?;
+    let mut batch = Batch::new(model, MAX_WAIT);
+    let mut replies: HashMap<u64, completion::Reply> = HashMap::new();
+    // Requests that need a slot of their own outside the batch (`/cache/warm`) wait
+    // here until one is free.
+    let mut needs_slot: VecDeque<(TcpStream, Request, String)> = VecDeque::new();
+    let mut next_id = 0u64;
+    loop {
+        let mut arrived: Vec<(TcpStream, Request, String)> = Vec::new();
+        if batch.is_idle() && needs_slot.is_empty() {
+            match rx.recv() {
+                Ok(c) => arrived.push(c),
+                Err(_) => return Ok(()),
+            }
+        }
+        arrived.extend(rx.try_iter());
+        for (mut stream, req, path) in arrived {
+            if let Some((body, chat, oai)) = completion_route(&mut stream, &req, &path) {
+                if let Some((job, reply)) = completion::start(stream, ctx, &body, chat, oai) {
+                    batch.submit(next_id, job.into_request());
+                    replies.insert(next_id, reply);
+                    next_id += 1;
+                }
+            } else if (req.method.as_str(), path.as_str()) == ("POST", "/cache/warm") {
+                needs_slot.push_back((stream, req, path));
+            } else if !serve_other(&mut stream, &req, &path, model, ctx, props, None) {
+                send_err(&mut stream, "404 Not Found", &format!("no route for {} {}", req.method, path));
+            }
+        }
+        if let Some(slot) = batch.free_slot() {
+            if let Some((mut stream, req, path)) = needs_slot.pop_front() {
+                serve_other(&mut stream, &req, &path, model, ctx, props, Some(slot));
+            }
+        }
+        batch.step(&mut |id, event| match event {
+            Event::Token(t) => replies.get_mut(&id).is_some_and(|r| r.token(ctx.bpe, t)),
+            Event::Prefill(..) => true,
+            Event::Done(gen) => {
+                if let Some(r) = replies.remove(&id) { r.finish(&gen); }
+                true
+            }
+        });
+    }
+}
+
+/// The body and response format of a completion request, answering a malformed body
+/// itself; `None` for any other route.
+fn completion_route(stream: &mut TcpStream, req: &Request, path: &str) -> Option<(Value, bool, bool)> {
+    let ("POST", "/completion" | "/completions" | "/v1/completions" | "/v1/chat/completions") = (req.method.as_str(), path)
+    else { return None };
+    match serde_json::from_slice(&req.body) {
+        Ok(body) => Some((body, path == "/v1/chat/completions", path.starts_with("/v1/"))),
+        Err(e) => {
+            send_err(stream, "400 Bad Request", &format!("invalid JSON: {e}"));
+            None
+        }
+    }
+}
+
+/// Every route but completions. `slot` is a slot free for a request that needs one
+/// (`/cache/warm`); `None` when none is. False when the route is unknown.
+#[allow(clippy::too_many_arguments)]
+fn serve_other(stream: &mut TcpStream, req: &Request, path: &str, model: &dyn Model, ctx: &Ctx, props: &Value,
+               slot: Option<usize>) -> bool {
+    match (req.method.as_str(), path) {
+        ("GET", "/health") => match ojas_core::device_fault::peek() {
+            // A process that cannot serve must not report healthy; the recovery path
+            // is a restart by the orchestrator.
+            Some(err) => send_json(stream, "503 Service Unavailable", &json!({"status": "error", "error": err.to_string()})),
+            None => send_json(stream, "200 OK", &json!({"status": "ok"})),
+        },
+        ("GET", "/props") => {
+            let mut p = props.clone();
+            p["prefix_cache"] = cache_json(model.prefix_cache_stats());
+            send_json(stream, "200 OK", &p)
+        }
+        ("GET", "/cache") => send_json(stream, "200 OK", &cache_json(model.prefix_cache_stats())),
+        ("POST", "/cache/save") => {
+            model.save_prefix_cache();
+            send_json(stream, "200 OK", &cache_json(model.prefix_cache_stats()))
+        }
+        ("POST", "/cache/warm") => {
+            let Some(slot) = slot else { return false };
+            let body: Value = match serde_json::from_slice(&req.body) {
+                Ok(v) => v,
+                Err(e) => {
+                    send_err(stream, "400 Bad Request", &format!("invalid JSON: {e}"));
+                    return true;
+                }
+            };
+            let pin = body.get("pin").and_then(Value::as_bool).unwrap_or(true);
+            let ids = match warm_ids(&body, ctx.bpe, ctx.info, ctx.opts) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    send_err(stream, "400 Bad Request", &e.to_string());
+                    return true;
+                }
+            };
+            let mut cached = None;
+            model.with_slot(slot, &mut || cached = model.warm_prefix(&ids, pin));
+            match cached {
+                Some(cached) => send_json(stream, "200 OK", &json!({
+                    "tokens": ids.len(), "cached_tokens": cached, "pinned": pin,
+                    "cache": cache_json(model.prefix_cache_stats()),
+                })),
+                None => send_err(stream, "400 Bad Request", "this model keeps no prompt-prefix cache"),
+            }
+        }
+        ("POST", "/cache/unpin") => {
+            model.unpin_prefix_cache();
+            send_json(stream, "200 OK", &cache_json(model.prefix_cache_stats()))
+        }
+        ("GET", "/v1/models") => send_json(stream, "200 OK", &json!({
+            "object": "list",
+            "data": [{"id": ctx.info.arch, "object": "model", "created": now(), "owned_by": "ojas"}]
+        })),
+        _ => return false,
+    }
+    true
+}
+
 /// Accept connections one at a time and hand each parsed request to `handle` with
-/// its path (query string removed). Answers CORS preflight itself, and a request that
-/// cannot be parsed with 400.
+/// its path (query string removed).
 pub(crate) fn serve_http(listener: &TcpListener, mut handle: impl FnMut(&mut TcpStream, &Request, &str)) -> Result<()> {
     for conn in listener.incoming() {
-        let mut stream = match conn {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("accept failed: {e}");
-                continue;
+        match conn {
+            Ok(stream) => {
+                if let Some((mut stream, req, path)) = accept(stream) { handle(&mut stream, &req, &path); }
             }
-        };
-        let req = {
-            let mut reader = BufReader::new(&stream);
-            match read_request(&mut reader) {
-                Ok(Some(r)) => r,
-                Ok(None) => continue,
-                Err(e) => {
-                    send_err(&mut stream, "400 Bad Request", &format!("{e:#}"));
-                    continue;
-                }
-            }
-        };
-        if req.method == "OPTIONS" {
-            let head = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n\
-                        Access-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-                        Content-Length: 0\r\nConnection: close\r\n\r\n";
-            let _ = stream.write_all(head.as_bytes());
-            continue;
+            Err(e) => tracing::warn!("accept failed: {e}"),
         }
-        let path = req.path.split('?').next().unwrap_or("").to_string();
-        handle(&mut stream, &req, &path);
     }
     Ok(())
+}
+
+/// Read one request from a new connection, with its path (query string removed).
+/// Answers CORS preflight itself, and a request that cannot be parsed with 400;
+/// `None` for those and for a connection closed before a request.
+fn accept(mut stream: TcpStream) -> Option<(TcpStream, Request, String)> {
+    let req = {
+        let mut reader = BufReader::new(&stream);
+        match read_request(&mut reader) {
+            Ok(Some(r)) => r,
+            Ok(None) => return None,
+            Err(e) => {
+                send_err(&mut stream, "400 Bad Request", &format!("{e:#}"));
+                return None;
+            }
+        }
+    };
+    if req.method == "OPTIONS" {
+        let head = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n\
+                    Access-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+                    Content-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(head.as_bytes());
+        return None;
+    }
+    let path = req.path.split('?').next().unwrap_or("").to_string();
+    Some((stream, req, path))
 }
 
 #[cfg(test)]

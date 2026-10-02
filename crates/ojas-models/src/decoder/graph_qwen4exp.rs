@@ -446,7 +446,7 @@ impl<'a> DecoderGpu<'a> {
         let stride = table.row_bytes * nh as usize;
         let offset = (layer * MAXM + row) * stride.div_ceil(4) * 4;
         assert!(offset + stride <= self.st.ple_rows.length() as usize);
-        let rows = q.ple_rows(token, pos, &self.sess.session_tokens.borrow());
+        let rows = q.ple_rows(token, pos, &self.seq().session_tokens.borrow());
         let dst = unsafe {
             std::slice::from_raw_parts_mut(
                 (self.st.ple_rows.contents() as *mut u8).add(offset),

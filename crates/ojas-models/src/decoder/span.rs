@@ -97,9 +97,10 @@ impl<'a> DecoderGpu<'a> {
             }
         }
         self.reset_dense_reuse();
-        self.sess.snap_pos.borrow_mut().clear();
-        self.sess.snap_buf.borrow_mut().clear();
-        self.sess.last_prefill_reused.set(0);
+        self.seq().snap_pos.borrow_mut().clear();
+        self.seq().snap_buf.borrow_mut().clear();
+        self.seq().last_prefill_reused.set(0);
+        *self.seq().cache_plan.borrow_mut() = None;
     }
 
     /// Read back the logits buffer (valid after a do_head forward/span).

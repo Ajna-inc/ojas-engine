@@ -111,6 +111,15 @@ impl DecoderGpu<'_> {
     }
 }
 
+/// Bytes for the prompt-prefix cache: `prefix_cache_gb` when set (0 disables it),
+/// else a sixteenth of physical memory, at most 4 GiB.
+fn prefix_cache_budget(cfg: &EngineConfig) -> usize {
+    match cfg.prefix_cache_gb {
+        Some(gb) => (gb.max(0.0) * (1u64 << 30) as f64) as usize,
+        None => (physical_ram_bytes() / 16).min(4 << 30) as usize,
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn physical_ram_bytes() -> u64 {
     let mut v: u64 = 0;
@@ -1816,7 +1825,7 @@ impl<'a> DecoderGpu<'a> {
         // byte-identical dispatches, and it keeps memory flat: KV is ~12 KB/token, so a
         // 4-slot 32k context would reserve 4x the largest allocation in the arena. A host
         // that wants the throughput opts in.
-        let slots: usize = std::env::var("OJAS_SLOTS").ok().and_then(|v| v.parse().ok())
+        let slots: usize = ecfg.parallel.or_else(|| std::env::var("OJAS_SLOTS").ok().and_then(|v| v.parse().ok()))
             .unwrap_or(1).clamp(1, MAX_SLOTS);
         if slots > 1 {
             tracing::info!(target: "ctx", "{slots} sequence slots: KV and recurrent state allocated {slots}x");
@@ -2106,10 +2115,9 @@ impl<'a> DecoderGpu<'a> {
             sess: Session {
                 model_name: std::path::Path::new(&g.path).file_stem()
                     .map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-                session_tokens: std::cell::RefCell::new(Vec::new()),
-                last_prefill_reused: std::cell::Cell::new(0),
-                snap_pos: std::cell::RefCell::new(Vec::new()),
-                snap_buf: std::cell::RefCell::new(Vec::new()),
+                cache: std::cell::RefCell::new(super::prefix_cache::PrefixCache::new(prefix_cache_budget(&ecfg))),
+                docs: std::cell::RefCell::new(super::doc_cache::DocCache::new((ecfg.doc_cache_gb.max(0.0) * 1e9) as usize)),
+                seqs: (0..slots).map(|_| super::SeqState::default()).collect(),
             },
             gpu, d,
             arch: Arch {
@@ -2371,6 +2379,7 @@ impl<'a> DecoderGpu<'a> {
                 tracing::info!(target: "stream", "expert mode: resident, {count} buffers, {:.3} GB requested; PLE remains CPU-only", actual as f64 / 1e9);
             }
         }
+        model.open_prefix_dir(&g.shard_paths(), prec);
         Ok(model)
     }
 

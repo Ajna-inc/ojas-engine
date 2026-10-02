@@ -198,6 +198,34 @@ pub fn take_engine_flags(args: &mut Vec<String>) -> Result<EngineConfig> {
                 let v = take(&mut i)?;
                 cfg.ubatch = v.parse::<usize>().with_context(|| format!("{a}: bad integer {v:?}"))?.max(1);
             }
+            "--prefix-cache-gb" => {
+                let v = take(&mut i)?;
+                cfg.prefix_cache_gb = Some(v.parse::<f64>().with_context(|| format!("{a}: bad number {v:?}"))?);
+            }
+            "--doc-cache-gb" => {
+                let v = take(&mut i)?;
+                cfg.doc_cache_gb = v.parse::<f64>().with_context(|| format!("{a}: bad number {v:?}"))?;
+            }
+            "-np" | "--parallel" => {
+                let v = take(&mut i)?;
+                cfg.parallel = Some(v.parse::<usize>().with_context(|| format!("{a}: bad integer {v:?}"))?.max(1));
+            }
+            "--prefix-cache-dir" => cfg.prefix_cache_dir = Some(take(&mut i)?.into()),
+            "--prefix-cache-readonly" => cfg.prefix_cache_readonly = true,
+            "--prefix-cache-disk-int8" => cfg.prefix_cache_disk_int8 = true,
+            "--prefix-cache-pin" => cfg.prefix_cache_pin = Some(take(&mut i)?.into()),
+            "--prefix-cache-disk-gb" => {
+                let v = take(&mut i)?;
+                cfg.prefix_cache_disk_gb = Some(v.parse::<f64>().with_context(|| format!("{a}: bad number {v:?}"))?);
+            }
+            "--prefix-cache-reserve-gb" => {
+                let v = take(&mut i)?;
+                cfg.prefix_cache_reserve_gb = v.parse::<f64>().with_context(|| format!("{a}: bad number {v:?}"))?;
+            }
+            "--prefix-cache-save" => {
+                let v = take(&mut i)?;
+                cfg.prefix_cache_save = v.parse().map_err(|e: String| anyhow::anyhow!("{a}: {e}"))?;
+            }
             "--mmap" => cfg.no_mmap = false,
             "--no-mmap" => cfg.no_mmap = true,
             "--mlock" => cfg.no_skel_lock = false,
