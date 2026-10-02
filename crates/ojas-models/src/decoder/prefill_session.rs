@@ -20,14 +20,16 @@ thread_local! {
     /// if prefill wrote it; this caps batched-arch reuse to the prefilled prefix,
     /// excluding the decoded tail. One decoder is resident per engine thread, and a
     /// fresh sequence (base_pos==0 prefill) resets it, so a model swap cannot leak a
-    /// stale mark.
+    /// stale mark. It is shared by all slots, which only recurrent models have, and
+    /// those never consult it.
     static PREFILLED_HI: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl<'a> DecoderGpu<'a> {
-    /// Cross-turn dense KV-prefix reuse decision. Returns how many leading tokens
-    /// of `full` are already valid in the cache from the previous turn; the caller
-    /// prefills only `[start, len)`. Leaves `session_tokens` holding exactly the
+    /// Cross-turn KV-prefix reuse decision. Returns how many leading tokens of
+    /// `full` the sequence already holds, restored from the prompt-prefix cache or
+    /// left by the previous turn; the caller prefills only `[start, len)`. With the
+    /// document cache, part of that may be approximate (`place_docs`). Leaves `session_tokens` holding exactly the
     /// reused prefix so the subsequent prefill/decode appends extend it cleanly.
     ///
     /// Recurrent decoders restore their snapshot and draft carry here, before the
@@ -36,12 +38,15 @@ impl<'a> DecoderGpu<'a> {
         // EngineCore passes the full prefix here before splitting progress into
         // 256-token chunks. Decide recurrent reuse now; a chunk alone is too short
         // to discover the useful shared prefix and would reset the state.
+        self.sess.cache_last.set(ojas_core::PrefixRestore::default());
         if self.arch.ssm.is_some() && full.len() > 1 {
             if self.uses_prefix_cache() { return self.cache_resume(&full[..full.len() - 1]); }
             let n = self.reuse_prefix(&full[..full.len()-1]);
             if n > 0 { self.seq().session_tokens.borrow_mut().truncate(n); }
             return n;
         }
+        self.seq().cache_marks.take();
+        self.seq().cache_docs.take();
         if self.arch.ssm.is_some() { return 0; }
         // gpt-oss prefills batched but decodes per-token (two kernels), and is not
         // `batched_dense_ok()`, so it would take the no-cap branch below and could reuse
@@ -122,7 +127,9 @@ impl<'a> DecoderGpu<'a> {
     pub fn prefill(&self, tokens: &[u32], base_pos: usize) {
         assert!(base_pos.checked_add(tokens.len()).is_some_and(|n| n <= self.st.max_seq)
             && tokens.iter().all(|&t| (t as usize) < self.arch.vocab), "prefill exceeds model bounds");
-        self.seq().last_prefill_reused.set(0);
+        // The prefix-cache path sets this in `cache_resume`, before the prefills
+        // that continue the same prompt.
+        if !self.uses_prefix_cache() { self.seq().last_prefill_reused.set(0); }
         if base_pos == 0 && self.arch.ssm.is_some() && !self.uses_prefix_cache()
             && (tokens.len() <= 1 || (self.arch.qwen4exp.is_none() && (!self.wt.q4 || self.cfg.no_prefill))) {
             // These paths do not restore a recurrent snapshot. A new prompt
@@ -478,8 +485,9 @@ impl<'a> DecoderGpu<'a> {
     /// Start a new sequence from the longest cached prefix of `prompt` (every token
     /// before the one whose logits are wanted) and plan what this prefill adds to
     /// the cache. With reuse forbidden nothing is restored, but the lookup still
-    /// tells the plan where the prompt branches. Returns the positions restored, a
-    /// multiple of `BLOCK`.
+    /// tells the plan where the prompt branches. Returns the position processing
+    /// resumes at: the positions restored, a multiple of `BLOCK`, or the end of the
+    /// last document `place_docs` served.
     pub(crate) fn cache_resume(&self, prompt: &[u32]) -> usize {
         let t0 = std::time::Instant::now();
         let reads = self.sess.cache.borrow().stats().disk_reads;
@@ -511,7 +519,7 @@ impl<'a> DecoderGpu<'a> {
         *self.seq().cache_plan.borrow_mut() =
             Some(Plan::new(prompt.to_vec(), keys, hit, &self.seq().cache_marks.take()));
         let (resumed, doc_reused_tokens) = self.place_docs(prompt, n);
-        self.seq().cache_last.set(ojas_core::PrefixRestore {
+        self.sess.cache_last.set(ojas_core::PrefixRestore {
             matched_tokens: hit.blocks * BLOCK, reused_tokens: n, doc_reused_tokens, disk_payloads, restore_us,
         });
         resumed
@@ -526,22 +534,24 @@ impl<'a> DecoderGpu<'a> {
     /// processing resumes at, and the tokens served from the cache.
     fn place_docs(&self, prompt: &[u32], n: usize) -> (usize, usize) {
         let mut spans: Vec<(usize, usize)> = self.seq().cache_docs.take().into_iter()
-            .filter(|&(s, e)| s < e && e <= prompt.len()).collect();
+            .map(|(s, e)| (s, e.min(prompt.len()))).filter(|&(s, e)| s < e).collect();
         spans.sort_unstable();
         self.seq().docs_pending.borrow_mut().clear();
         if !self.sess.docs.borrow().enabled() { return (n, 0); }
         let serve = self.seq().docs_serve.get();
         let (mut pos, mut reused) = (n, 0);
         for (s, e) in spans {
-            if s < pos { continue; }
+            if s < pos {
+                // Already restored exactly: cache it from the rows now in place.
+                if e <= n && !self.sess.docs.borrow().contains(&prompt[s..e]) {
+                    self.seq().docs_pending.borrow_mut().push((s, e));
+                }
+                continue;
+            }
             let len = e - s;
             let recompute = self.cfg.doc_recompute.min(len);
             let tail = ((len as f64 * self.cfg.doc_tail).ceil() as usize).max(1);
-            let found = if serve {
-                self.sess.docs.borrow_mut().get(&prompt[s..e]).map(|(kv, base)| (kv.to_vec(), base))
-            } else {
-                None
-            };
+            let found = if serve { self.sess.docs.borrow_mut().get(&prompt[s..e]) } else { None };
             let Some((kv, base)) = found.filter(|_| recompute + tail < len) else {
                 self.seq().docs_pending.borrow_mut().push((s, e));
                 continue;
@@ -556,6 +566,7 @@ impl<'a> DecoderGpu<'a> {
             pos = e;
         }
         if reused > 0 { self.sess.docs.borrow_mut().record(reused); }
+        self.doc_capture(n);
         (pos, reused)
     }
 
@@ -617,7 +628,12 @@ impl<'a> DecoderGpu<'a> {
             base <= end && p.tokens[base..end] == tokens[..end - base]
         });
         match plan.as_mut() {
-            Some(p) if keep => p.started = true,
+            Some(p) if keep => {
+                p.started = true;
+                // Chunks that start off the chunk grid run through different kernel
+                // shapes than a fresh prefill, so nothing after them is exact.
+                if !base.is_multiple_of(self.cfg.prefill_m.clamp(1, MAXM)) { p.exact = p.exact.min(base); }
+            }
             _ => *plan = None,
         }
     }
@@ -650,7 +666,7 @@ impl<'a> DecoderGpu<'a> {
             lookups: s.lookups, hits: s.hits, reused_tokens: s.reused_tokens, block_tokens: BLOCK,
             directory: s.disk_budget > 0 || s.disk_blocks > 0, disk_blocks: s.disk_blocks,
             disk_snapshots: s.disk_snapshots, disk_bytes: s.disk_bytes, disk_budget: s.disk_budget,
-            disk_reads: s.disk_reads, pinned_blocks: s.pinned, evictions: s.evictions, last: self.seq().cache_last.get(),
+            disk_reads: s.disk_reads, pinned_blocks: s.pinned, evictions: s.evictions, last: self.sess.cache_last.get(),
             docs: { let d = self.sess.docs.borrow().stats(); ojas_core::DocCacheStats {
                 docs: d.docs, bytes: d.bytes, budget: d.budget, hits: d.hits, reused_tokens: d.reused_tokens } },
         }
@@ -661,6 +677,8 @@ impl<'a> DecoderGpu<'a> {
     /// Returns the tokens now cached.
     pub(crate) fn warm_prefix(&self, tokens: &[u32], pin: bool) -> usize {
         let prompt = &tokens[..tokens.len() / BLOCK * BLOCK];
+        self.seq().cache_marks.take();
+        self.seq().cache_docs.take();
         if prompt.is_empty() || !self.uses_prefix_cache() { return 0; }
         let reuse = self.seq().cache_reuse.replace(true);
         let start = self.cache_resume(prompt);
@@ -673,6 +691,21 @@ impl<'a> DecoderGpu<'a> {
         cache.lookup(prompt, &keys, true).resume * BLOCK
     }
 
+    /// Everything besides the weights, precision and state layout that decides the
+    /// numbers a prefill computes: the engine version, every kernel's source, the
+    /// GPU, and the engine settings other than the cache and serving options.
+    fn numerics_identity(&self) -> String {
+        let mut cfg = self.cfg.clone();
+        (cfg.prefix_cache_gb, cfg.prefix_cache_dir, cfg.prefix_cache_readonly) = (None, None, false);
+        (cfg.prefix_cache_disk_gb, cfg.prefix_cache_reserve_gb) = (None, 0.0);
+        (cfg.prefix_cache_save, cfg.prefix_cache_disk_int8, cfg.prefix_cache_pin) = (Default::default(), false, None);
+        (cfg.parallel, cfg.doc_cache_gb, cfg.doc_recompute, cfg.doc_tail) = (None, 0.0, 0, 0.0);
+        let mut kernels: Vec<(&str, &str)> = ojas_metal::kernels::families().collect();
+        kernels.sort_unstable();
+        let source: Vec<u8> = kernels.iter().flat_map(|(name, src)| name.bytes().chain(src.bytes())).collect();
+        format!("{} {:016x} {} {cfg:?}", env!("CARGO_PKG_VERSION"), prefix_disk::checksum(&source), self.gpu.device.name())
+    }
+
     /// Back the prefix cache with `prefix_cache_dir`, when set. Blocks saved there by
     /// any earlier run of this model build are reusable at once. The subdirectory is
     /// chosen by the model's weights, `prec` and the state layout, so a different
@@ -680,7 +713,11 @@ impl<'a> DecoderGpu<'a> {
     /// RAM only.
     pub(crate) fn open_prefix_dir(&self, model_files: &[std::path::PathBuf], prec: u8) {
         let Some(root) = self.cfg.prefix_cache_dir.as_deref() else { return };
-        if !self.uses_prefix_cache() { return; }
+        if !self.uses_prefix_cache() {
+            tracing::warn!(target: "prefix", "this model and configuration keep no prompt-prefix cache; {} is not used",
+                root.display());
+            return;
+        }
         if model_files.is_empty() {
             tracing::warn!(target: "prefix", "the model was not opened from files; caching prompts in RAM only");
             return;
@@ -692,8 +729,9 @@ impl<'a> DecoderGpu<'a> {
         let opened = prefix_disk::fingerprint(model_files).and_then(|weights| {
             let build = [weights, u64::from(prec), self.cfg.prefill_m.clamp(1, MAXM) as u64, kv_len as u64,
                 snapshot_len as u64, BLOCK as u64, kv as u64];
-            let salt = prefix_disk::checksum(&build.iter().flat_map(|v| v.to_le_bytes())
-                .chain(env!("CARGO_PKG_VERSION").bytes()).collect::<Vec<u8>>());
+            let mut salt = build.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+            salt.extend_from_slice(self.numerics_identity().as_bytes());
+            let salt = prefix_disk::checksum(&salt);
             let format = if kv == prefix_disk::KvFormat::Q8 { ", int8 KV" } else { "" };
             let about = format!("{} at precision {prec}{format}\n", self.sess.model_name);
             prefix_disk::Disk::open(root, salt, &about, prefix_disk::DiskOptions {

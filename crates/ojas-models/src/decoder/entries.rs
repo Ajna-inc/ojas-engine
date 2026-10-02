@@ -220,6 +220,7 @@ impl<'a> DecoderGpu<'a> {
             && !(self.strm.stream && self.arch.moe.is_some())
             && self.arch.sparse_budget.is_none()
             && self.sp.mtp.is_none()
+            && !self.cfg.no_prefill
     }
 
     /// Decode one token for each of B independent sequences in one step.
@@ -283,11 +284,9 @@ impl<'a> DecoderGpu<'a> {
     /// included: slot 0 is the sequence every existing caller means.
     ///
     /// A non-zero slot takes a narrower path — the qwen35 chunk graph pointed at
-    /// that slot's state, and nothing else. The reuse machinery (`session_tokens`,
-    /// the snapshot ladder, the on-disk session cache) is keyed to one resident
-    /// sequence: `reuse_prefix` would match slot 2's prompt against slot 0's cached
-    /// ids and restore a snapshot belonging to neither. Skipping it costs only a
-    /// warm start.
+    /// that slot's state, and nothing else: no prompt-prefix cache and no reuse of
+    /// the slot's previous sequence. A host that wants those points `prefill` at the
+    /// slot with [`ojas_core::Model::with_slot`].
     pub fn prefill_slot(&self, s: usize, tokens: &[u32], base_pos: usize) -> bool {
         if s == 0 { self.prefill(tokens, base_pos); return true; }
         if !self.slots_ok() || s >= self.st.slots || self.cfg.no_prefill { return false; }
@@ -472,7 +471,7 @@ impl<'a> ojas_core::Model for DecoderGpu<'a> {
     }
     fn reset_slot(&self, s: usize) { DecoderGpu::reset_slot(self, s) }
     fn with_slot(&self, s: usize, f: &mut dyn FnMut()) -> bool {
-        if s >= self.max_slots() || (s > 0 && self.cfg.no_prefill) { return false; }
+        if s >= self.max_slots() { return false; }
         DecoderGpu::with_slot(self, s, f);
         true
     }

@@ -5,4 +5,4 @@ pub mod sentencepiece;
 pub mod tokenizer;
 
 pub use sentencepiece::Sp;
-pub use tokenizer::{byte_maps, chat_eos, chat_template, chat_transcript, chatml, eog_token_ids, transcript_boundaries, transcript_span, Bpe};
+pub use tokenizer::{byte_maps, chat_eos, chat_template, chat_transcript, chatml, eog_token_ids, shared_prefix, transcript_boundaries, transcript_span, Bpe};

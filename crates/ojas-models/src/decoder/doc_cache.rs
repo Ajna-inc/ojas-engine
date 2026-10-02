@@ -18,12 +18,13 @@
 
 use super::prefix_cache::{chain, ROOT};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 struct Doc {
     tokens: Box<[u32]>,
     /// Position of the span's first token when its rows were computed.
     base: usize,
-    kv: Vec<u8>,
+    kv: Arc<Vec<u8>>,
     last_used: u64,
 }
 
@@ -59,12 +60,16 @@ impl DocCache {
     }
 
     /// The rows cached for exactly `tokens`, and the position they were computed at.
-    pub(crate) fn get(&mut self, tokens: &[u32]) -> Option<(&[u8], usize)> {
+    pub(crate) fn get(&mut self, tokens: &[u32]) -> Option<(Arc<Vec<u8>>, usize)> {
         self.clock += 1;
         let clock = self.clock;
         let doc = self.docs.get_mut(&chain(ROOT, tokens)).filter(|d| *d.tokens == *tokens)?;
         doc.last_used = clock;
-        Some((&doc.kv, doc.base))
+        Some((doc.kv.clone(), doc.base))
+    }
+
+    pub(crate) fn contains(&self, tokens: &[u32]) -> bool {
+        self.docs.get(&chain(ROOT, tokens)).is_some_and(|d| *d.tokens == *tokens)
     }
 
     /// Count a reuse of `tokens` cached tokens.
@@ -85,7 +90,7 @@ impl DocCache {
         }
         self.clock += 1;
         self.used += kv.len();
-        self.docs.insert(key, Doc { tokens: tokens.into(), base, kv, last_used: self.clock });
+        self.docs.insert(key, Doc { tokens: tokens.into(), base, kv: Arc::new(kv), last_used: self.clock });
         true
     }
 }

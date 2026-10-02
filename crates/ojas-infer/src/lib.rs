@@ -68,6 +68,9 @@ pub enum FinishReason {
     Fault,
     /// Constrained decoding needs the model's logits, which it does not expose.
     NoLogits,
+    /// The model cannot run the request at all: its prompt exceeds the context, or
+    /// the model cannot address the sequence slot or batch it.
+    Refused,
 }
 
 /// The tokens [`EngineCore::generate_ex`] produced and why it stopped.
@@ -92,14 +95,23 @@ impl Rng {
     }
 }
 
-/// Temperature → repetition penalty → top-p nucleus sample over `logits`.
-fn sample_logits(logits: &mut [f32], recent: &[u32], o: &SampleOpts, rng: &mut Rng) -> usize {
-    if o.repeat_penalty > 1.0 {
-        for &t in recent {
-            let l = &mut logits[t as usize];
-            *l = if *l > 0.0 { *l / o.repeat_penalty } else { *l * o.repeat_penalty };
+/// Push down every token in `recent` once, however often it occurs there: divide a
+/// positive logit by `penalty`, multiply a negative one.
+fn penalize(logits: &mut [f32], recent: &[u32], penalty: f32) {
+    if penalty <= 1.0 { return; }
+    let mut seen = recent.to_vec();
+    seen.sort_unstable();
+    seen.dedup();
+    for t in seen {
+        if let Some(l) = logits.get_mut(t as usize) {
+            *l = if *l > 0.0 { *l / penalty } else { *l * penalty };
         }
     }
+}
+
+/// Temperature → repetition penalty → top-p nucleus sample over `logits`.
+fn sample_logits(logits: &mut [f32], recent: &[u32], o: &SampleOpts, rng: &mut Rng) -> usize {
+    penalize(logits, recent, o.repeat_penalty);
     let inv_t = 1.0 / o.temperature.max(1e-4);
     let mut idx: Vec<usize> = (0..logits.len()).collect();
     // partial top-256 selection is plenty for nucleus sampling
@@ -135,12 +147,7 @@ fn pick_allowed(logits: &mut [f32], recent: &[u32], opts: Option<&SampleOpts>, r
                 allows: &mut dyn FnMut(u32) -> bool) -> Option<u32> {
     let sampled = opts.filter(|o| o.temperature > 0.0);
     if let Some(o) = sampled {
-        if o.repeat_penalty > 1.0 {
-            for &t in recent {
-                let l = &mut logits[t as usize];
-                *l = if *l > 0.0 { *l / o.repeat_penalty } else { *l * o.repeat_penalty };
-            }
-        }
+        penalize(logits, recent, o.repeat_penalty);
     }
     // Greedy: the argmax is usually allowed, so try it before ranking anything.
     let arg = (0..logits.len()).max_by(|&a, &b| logits[a].total_cmp(&logits[b]))?;
@@ -190,7 +197,7 @@ impl Picker {
         Picker {
             opts: opts.cloned(),
             rng: Rng(opts.map(|o| o.seed).unwrap_or(42) | 1),
-            recent: opts.map(|o| prompt.iter().rev().take(o.repeat_window).copied().collect()).unwrap_or_default(),
+            recent: opts.map(|o| prompt[prompt.len().saturating_sub(o.repeat_window)..].to_vec()).unwrap_or_default(),
         }
     }
 
@@ -220,7 +227,8 @@ impl Picker {
         }
     }
 
-    /// Remember an emitted token for the repetition penalty.
+    /// Remember an emitted token for the repetition penalty, forgetting the oldest
+    /// once the window is full.
     pub(crate) fn note(&mut self, t: u32) {
         if let Some(o) = &self.opts {
             self.recent.push(t);

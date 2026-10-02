@@ -73,7 +73,7 @@ fn main() -> Result<()> {
             let q = "List every item above 500 units with its value, one per line.";
             let turns = vec![("user".to_string(), format!("{}\nQuestion: {q}", page(topic, seed + i)))];
             let text = ojas_tokenize::tokenizer::chat_transcript(&arch, &system, &turns);
-            (tokens(&text), ojas_tokenize::transcript_boundaries(&arch, &system, &turns, tokens))
+            (tokens(&text), ojas_tokenize::transcript_boundaries(&arch, &system, &turns, 6, tokens))
         }).collect()
     };
     let prompts = pages(["sales", "support", "hiring", "travel"], 0);

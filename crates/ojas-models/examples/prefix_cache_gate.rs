@@ -175,7 +175,7 @@ fn main() -> Result<()> {
     let tokens = |text: &str| -> Vec<u32> { bpe.encode(text).into_iter().map(|v| v as u32).collect() };
     let encode = |system: &str, turns: &Turns| Prompt {
         ids: tokens(&ojas_tokenize::tokenizer::chat_transcript(&arch, system, turns)),
-        marks: ojas_tokenize::transcript_boundaries(&arch, system, turns, tokens),
+        marks: ojas_tokenize::transcript_boundaries(&arch, system, turns, 6, tokens),
     };
     let decode = |ids: &[u32]| -> String {
         let bytes: Vec<u8> = ids.iter().flat_map(|&t| bpe.decode_bytes(t as usize)).collect();

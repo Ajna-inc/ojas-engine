@@ -25,7 +25,7 @@
 
 use super::prefix_disk::{Bytes, Disk, Opened, Part, Record, Wanted};
 use ojas_core::config::PrefixCacheSave;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Tokens per block. A multiple of the prefill chunk, so a run resumed at a block
@@ -35,6 +35,10 @@ pub(crate) const BLOCK: usize = 256;
 /// Prompts after which every use count halves. A prefix reused every few prompts
 /// stays ahead of new entries; one unused for a few hundred falls level with them.
 const HALF_LIFE: u64 = 128;
+
+/// Prompts between index writes that only update use counts. A change to what is
+/// on disk writes the index after the prompt that made it.
+const INDEX_EVERY: u64 = 32;
 
 /// Key of the empty prefix, the parent of every first block.
 pub(crate) const ROOT: u64 = 0xcbf2_9ce4_8422_2325;
@@ -100,10 +104,11 @@ impl Plan {
 
     /// Whether to keep a snapshot after the first `blocks` blocks: always at the
     /// branch point and at the end of the prompt; at marks and every `every` tokens
-    /// inside a long prompt, up to `EXTRA_SNAPSHOTS` of them.
+    /// (rounded down to whole blocks) inside a long prompt, up to `EXTRA_SNAPSHOTS`
+    /// of them.
     pub(crate) fn wants_snapshot(&self, blocks: usize, every: usize) -> bool {
         if blocks == self.branch || blocks == self.keys.len() { return true; }
-        self.extra < EXTRA_SNAPSHOTS && (self.marks.contains(&blocks) || (blocks * BLOCK).is_multiple_of(every.max(BLOCK)))
+        self.extra < EXTRA_SNAPSHOTS && (self.marks.contains(&blocks) || blocks.is_multiple_of((every / BLOCK).max(1)))
     }
 
     /// Count a snapshot taken after the first `blocks` blocks.
@@ -122,8 +127,9 @@ enum Tier {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Saved {
     No,
-    /// Handed to the writer; the writer holds the bytes until the file is complete.
-    Queued,
+    /// Handed to the writer as write number `n`; the writer holds the bytes until
+    /// the file is complete.
+    Queued(u64),
     Yes,
 }
 
@@ -230,8 +236,11 @@ struct DiskTier {
     room: Room,
     save: PrefixCacheSave,
     reads: u64,
-    /// Whether the saved index is behind the blocks on disk or their use counts.
+    /// Whether the saved index is behind what is on disk, or only behind its use
+    /// counts, and the prompt count when it was last written.
     dirty: bool,
+    counts_dirty: bool,
+    indexed_at: u64,
 }
 
 pub(crate) struct PrefixCache {
@@ -252,7 +261,8 @@ impl PrefixCache {
     /// Back the cache with an opened directory holding at most `budget` bytes. Its
     /// blocks become cached prefixes at once; records whose payload sizes are not
     /// `kv_len` and `snapshot_len`, or whose key does not match their tokens, are
-    /// left out and their files removed with the next index.
+    /// left out of the next index, and their files are removed the next time the
+    /// directory is opened.
     pub(crate) fn attach_disk(&mut self, opened: Opened, budget: usize, save: PrefixCacheSave, kv_len: usize,
                               snapshot_len: usize) {
         let Opened { disk, records, clock } = opened;
@@ -280,7 +290,9 @@ impl PrefixCache {
         }
         self.clock = self.clock.max(clock);
         let writable = disk.writable();
-        self.disk = Some(DiskTier { io: disk, room: Room { budget, used }, save, reads: 0, dirty: writable });
+        self.disk = Some(DiskTier {
+            io: disk, room: Room { budget, used }, save, reads: 0, dirty: writable, counts_dirty: false, indexed_at: 0,
+        });
         if writable {
             self.make_room(Tier::Disk, 0, None);
         }
@@ -326,10 +338,18 @@ impl PrefixCache {
         let Some(&last) = keys.last() else { return Some((Vec::new(), None)) };
         let mut wanted: Vec<(u64, Part)> = keys.iter().map(|&key| (key, Part::Kv)).collect();
         if self.blocks.get(&last)?.snapshot.is_some() { wanted.push((last, Part::Snapshot)); }
+        // RAM copies are taken first: keeping a payload read from disk can evict a
+        // later one's RAM copy, which would then be read again.
+        let in_ram: Vec<Option<Bytes>> = wanted.iter()
+            .map(|&(key, part)| self.blocks.get(&key).and_then(|b| b.part(part)).and_then(|p| p.ram.clone()))
+            .collect();
         let mut read = self.read_from_disk(&wanted);
         let mut payloads = Vec::with_capacity(wanted.len());
-        for (key, part) in wanted {
-            payloads.push(self.fetch(key, part, last, read.remove(&(key, part)))?);
+        for ((key, part), ram) in wanted.into_iter().zip(in_ram) {
+            payloads.push(match ram {
+                Some(bytes) => bytes,
+                None => self.fetch(key, part, last, read.remove(&(key, part)))?,
+            });
         }
         let snapshot = (payloads.len() > keys.len()).then(|| payloads.pop().unwrap());
         Some((payloads, snapshot))
@@ -343,7 +363,7 @@ impl PrefixCache {
         for &(key, part) in wanted {
             let Some((b, p)) = self.blocks.get(&key).and_then(|b| Some((b, b.part(part)?))) else { continue };
             if p.ram.is_some() { continue; }
-            queued |= p.disk == Saved::Queued;
+            queued |= matches!(p.disk, Saved::Queued(_));
             list.push(Wanted { key, part, parent: b.parent, tokens: &b.tokens, len: p.len });
         }
         if queued { d.io.flush(); }
@@ -354,8 +374,9 @@ impl PrefixCache {
     /// Count a prompt that started a sequence. `used` are the cached blocks it
     /// matched, and it resumed after the first `resume` of them, at that block's
     /// snapshot; both are empty when reuse was not allowed. Blocks evicted since
-    /// the lookup are skipped, with those after them. Under the `Reused`
-    /// policy, an entry is saved to the directory on its second use.
+    /// the lookup are skipped, with those after them. An entry is saved to the
+    /// directory on its second use under the `Reused` policy, and under `Always`
+    /// if an earlier save was skipped.
     pub(crate) fn record(&mut self, used: &[u64], resume: usize) {
         let used = &used[..used.iter().take_while(|key| self.blocks.contains_key(key)).count()];
         self.stats.lookups += 1;
@@ -377,11 +398,14 @@ impl PrefixCache {
             self.stats.reused_tokens += (resume * BLOCK) as u64;
         }
         let Some(d) = self.disk.as_mut() else { return };
-        d.dirty |= !used.is_empty();
-        if d.save != PrefixCacheSave::Reused { return; }
+        d.counts_dirty |= !used.is_empty();
+        let always = d.save == PrefixCacheSave::Always;
+        let Some(&chain_end) = used.last() else { return };
         for (i, &key) in used.iter().enumerate() {
-            if self.blocks[&key].uses >= 2 { self.save(key, Part::Kv); }
-            if i + 1 == resume && self.blocks[&key].snapshot_uses >= 2 { self.save(key, Part::Snapshot); }
+            let Some(b) = self.blocks.get(&key) else { break };
+            let (kv, snapshot) = (always || b.uses >= 2, i + 1 == resume && (always || b.snapshot_uses >= 2));
+            if kv { self.save(key, Part::Kv, chain_end); }
+            if snapshot { self.save(key, Part::Snapshot, chain_end); }
         }
     }
 
@@ -412,7 +436,7 @@ impl PrefixCache {
             parent, tokens: tokens.into(), depth, kv: Payload::in_ram(kv), snapshot: None,
             children: 0, disk_children: 0, last_used: self.clock, uses: 1, snapshot_uses: 0, pinned: false,
         });
-        if self.saves(PrefixCacheSave::Always) { self.save(key, Part::Kv); }
+        if self.saves(PrefixCacheSave::Always) { self.save(key, Part::Kv, key); }
         true
     }
 
@@ -424,7 +448,7 @@ impl PrefixCache {
         let b = self.blocks.get_mut(&key).unwrap();
         b.snapshot = Some(Payload::in_ram(snapshot));
         b.snapshot_uses = 1;
-        if self.saves(PrefixCacheSave::Always) { self.save(key, Part::Snapshot); }
+        if self.saves(PrefixCacheSave::Always) { self.save(key, Part::Snapshot, key); }
         true
     }
 
@@ -433,11 +457,12 @@ impl PrefixCache {
     /// blocks pinned.
     pub(crate) fn pin(&mut self, keys: &[u64]) -> usize {
         let keys = &keys[..keys.iter().take_while(|key| self.blocks.contains_key(key)).count()];
+        let Some(&last) = keys.last() else { return 0 };
         for &key in keys {
             self.blocks.get_mut(&key).unwrap().pinned = true;
-            self.save(key, Part::Kv);
+            self.save(key, Part::Kv, last);
         }
-        if let Some(&last) = keys.last() { self.save(last, Part::Snapshot); }
+        self.save(last, Part::Snapshot, last);
         if let Some(d) = self.disk.as_mut() { d.dirty = true; }
         keys.len()
     }
@@ -448,32 +473,40 @@ impl PrefixCache {
         if let Some(d) = self.disk.as_mut() { d.dirty = true; }
     }
 
-    /// Take in finished writes, and queue a new index if the directory's contents
-    /// or their use counts changed since the last one.
-    pub(crate) fn sync(&mut self) {
+    /// Take in finished writes, and queue a new index if what is on disk changed,
+    /// or if only use counts did and `INDEX_EVERY` prompts have passed.
+    pub(crate) fn sync(&mut self) { self.sync_index(false); }
+
+    fn sync_index(&mut self, always: bool) {
         let Some(d) = self.disk.as_mut() else { return };
         for w in d.io.written() {
-            let queued = self.blocks.get(&w.key).and_then(|b| b.part(w.part)).is_some_and(|p| p.disk == Saved::Queued);
-            if !queued { continue; }
-            if w.ok {
-                self.set_saved(w.key, w.part, Saved::Yes);
-            } else {
-                self.drop_copy(w.key, w.part, Tier::Disk);
+            let this_write = self.blocks.get(&w.key).and_then(|b| b.part(w.part))
+                .is_some_and(|p| p.disk == Saved::Queued(w.seq));
+            if !this_write { continue; }
+            match (w.ok, w.part) {
+                (true, _) => self.set_saved(w.key, w.part, Saved::Yes),
+                (false, Part::Kv) => self.unsave_tree(w.key),
+                (false, Part::Snapshot) => self.drop_copy(w.key, Part::Snapshot, Tier::Disk),
             }
         }
-        let Some(d) = self.disk.as_mut().filter(|d| d.dirty && d.io.writable()) else { return };
+        let lookups = self.stats.lookups;
+        let Some(d) = self.disk.as_mut().filter(|d| d.io.writable()) else { return };
+        let counts_due = d.counts_dirty && (always || lookups - d.indexed_at >= INDEX_EVERY);
+        if !d.dirty && !counts_due { return; }
         let mut saved: Vec<(&u64, &Block)> = self.blocks.iter().filter(|(_, b)| b.kv.held(Tier::Disk)).collect();
         saved.sort_by_key(|(_, b)| b.depth);
         let records: Vec<Record> = saved.into_iter().map(|(&key, b)| b.record(key)).collect();
         d.io.save_index(&records, self.clock);
-        d.dirty = false;
+        (d.dirty, d.counts_dirty, d.indexed_at) = (false, false, lookups);
     }
 
     /// Wait for every queued write and save the index, so the directory holds
-    /// everything cached so far.
+    /// everything cached so far. Two passes: the first queues an index and waits
+    /// for the writes before it, the second takes in their results and writes the
+    /// index that reflects them.
     pub(crate) fn flush(&mut self) {
         for _ in 0..2 {
-            self.sync();
+            self.sync_index(true);
             if let Some(d) = &self.disk { d.io.flush(); }
         }
     }
@@ -481,8 +514,9 @@ impl PrefixCache {
     fn saves(&self, policy: PrefixCacheSave) -> bool { self.disk.as_ref().is_some_and(|d| d.save == policy) }
 
     /// Queue a RAM payload for the directory, when there is room for it there and
-    /// the blocks it depends on are saved too.
-    fn save(&mut self, key: u64, part: Part) {
+    /// the blocks it depends on are saved too. `keep` (the payload's block or one
+    /// below it) and its ancestors are not evicted to make room.
+    fn save(&mut self, key: u64, part: Part, keep: u64) {
         if !self.disk.as_ref().is_some_and(|d| d.io.writable()) { return; }
         let b = &self.blocks[&key];
         let depends_saved = match part {
@@ -492,11 +526,11 @@ impl PrefixCache {
         let Some((len, Some(bytes))) = b.part(part).filter(|p| p.disk == Saved::No).map(|p| (p.len, p.ram.clone()))
         else { return };
         let stored = self.disk.as_ref().unwrap().io.stored_len(part, len);
-        if !depends_saved || !self.make_room(Tier::Disk, stored, Some(key)) { return; }
+        if !depends_saved || !self.make_room(Tier::Disk, stored, Some(keep)) { return; }
         let (b, d) = (&self.blocks[&key], self.disk.as_mut().unwrap());
-        if !d.io.write(key, part, b.parent, &b.tokens, bytes) { return; }
+        let Some(seq) = d.io.write(key, part, b.parent, &b.tokens, bytes) else { return };
         d.room.used += stored;
-        self.set_saved(key, part, Saved::Queued);
+        self.set_saved(key, part, Saved::Queued(seq));
     }
 
     /// The bytes of a payload: RAM's copy, or else the directory's (`read`, when
@@ -507,7 +541,7 @@ impl PrefixCache {
         let p = self.blocks.get(&key)?.part(part)?;
         if let Some(bytes) = &p.ram { return Some(bytes.clone()); }
         let (len, d) = (p.len, self.disk.as_mut()?);
-        if p.disk == Saved::Queued { d.io.flush(); }
+        if matches!(p.disk, Saved::Queued(_)) { d.io.flush(); }
         let b = &self.blocks[&key];
         match read.unwrap_or_else(|| d.io.read(key, part, b.parent, &b.tokens, len)) {
             Ok(data) => {
@@ -552,7 +586,7 @@ impl PrefixCache {
         };
         let Some(budget) = room(self).map(|r| r.budget) else { return false };
         if need > budget { return false; }
-        let protected: Vec<u64> = std::iter::successors(keep.filter(|&k| k != ROOT), |k| {
+        let protected: HashSet<u64> = std::iter::successors(keep.filter(|&k| k != ROOT), |k| {
             self.blocks.get(k).map(|b| b.parent).filter(|&p| p != ROOT)
         }).collect();
         while room(self).is_some_and(|r| r.used + need > budget) {
@@ -570,7 +604,7 @@ impl PrefixCache {
     /// childless, since a block is useful only while the blocks before it are kept.
     /// Protected and pinned blocks keep their directory copies, and their RAM
     /// copies unless the directory holds them too.
-    fn victim(&self, tier: Tier, protected: &[u64]) -> Option<(u64, Part)> {
+    fn victim(&self, tier: Tier, protected: &HashSet<u64>) -> Option<(u64, Part)> {
         self.blocks.iter().filter_map(|(&key, b)| {
             let (rank, part) = if b.snapshot.as_ref().is_some_and(|s| s.held(tier)) {
                 ((b.snapshot_uses, b.last_used), Part::Snapshot)
@@ -621,16 +655,35 @@ impl PrefixCache {
         }
     }
 
-    /// Remove a block and every block below it.
-    fn remove_tree(&mut self, key: u64) {
-        let mut doomed = vec![key];
+    /// `key` and every block below it, each before its children.
+    fn subtree(&self, key: u64) -> Vec<u64> {
+        let mut tree = vec![key];
         let mut i = 0;
-        while i < doomed.len() {
-            let k = doomed[i];
-            doomed.extend(self.blocks.iter().filter(|(_, b)| b.parent == k).map(|(&c, _)| c));
+        while i < tree.len() {
+            let k = tree[i];
+            if self.blocks.get(&k).is_some_and(|b| b.children > 0) {
+                tree.extend(self.blocks.iter().filter(|(_, b)| b.parent == k).map(|(&c, _)| c));
+            }
             i += 1;
         }
-        for k in doomed.into_iter().rev() {
+        tree
+    }
+
+    /// Drop the directory copies of a block, of its snapshot and of every block
+    /// below it: on disk they are useless without it.
+    fn unsave_tree(&mut self, key: u64) {
+        for k in self.subtree(key).into_iter().rev() {
+            for part in [Part::Snapshot, Part::Kv] {
+                if self.blocks.get(&k).and_then(|b| b.part(part)).is_some_and(|p| p.held(Tier::Disk)) {
+                    self.drop_copy(k, part, Tier::Disk);
+                }
+            }
+        }
+    }
+
+    /// Remove a block and every block below it.
+    fn remove_tree(&mut self, key: u64) {
+        for k in self.subtree(key).into_iter().rev() {
             let b = self.blocks.remove(&k).unwrap();
             self.release(k, Part::Kv, &b.kv);
             if let Some(s) = &b.snapshot { self.release(k, Part::Snapshot, s); }
@@ -947,6 +1000,41 @@ mod tests {
         let s = c.stats();
         assert_eq!((s.pinned, s.disk_blocks, s.disk_snapshots), (2, 2, 1));
         assert_eq!(c.lookup(&system, &block_keys(&system), true), Hit { blocks: 2, resume: 2 });
+        drop(c);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn saving_a_snapshot_never_evicts_the_rest_of_the_chain_being_recorded() {
+        let root = scratch("record-chain");
+        let mut c = open_dir(&root, 1 << 20, 40, PrefixCacheSave::Reused, false);
+        let p = prompt(4 * BLOCK, 9);
+        let keys = block_keys(&p);
+        fill(&mut c, &p, 10, 30, &[2]);
+        for _ in 0..2 {
+            let hit = c.lookup(&p, &keys, true);
+            assert_eq!(hit, Hit { blocks: 4, resume: 2 });
+            c.record(&keys[..hit.blocks], hit.resume);
+        }
+        c.flush();
+        let s = c.stats();
+        assert_eq!((s.disk_blocks, s.disk_snapshots), (4, 0), "the chain stays saved; the snapshot does not fit");
+        drop(c);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_failed_write_takes_back_everything_that_depends_on_it() {
+        let root = scratch("failed-write");
+        let mut c = PrefixCache::new(1 << 20);
+        let options = DiskOptions { readonly: false, reserve: u64::MAX / 2, block_tokens: BLOCK, kv: Default::default() };
+        c.attach_disk(Disk::open(&root, 7, "test", options).unwrap(), 1 << 20, PrefixCacheSave::Always, 10, 30);
+        let p = prompt(3 * BLOCK, 1);
+        fill(&mut c, &p, 10, 30, &[3]);
+        c.flush();
+        let s = c.stats();
+        assert_eq!((s.disk_blocks, s.disk_snapshots, s.disk_bytes), (0, 0, 0));
+        assert_eq!(c.lookup(&p, &block_keys(&p), true), Hit { blocks: 3, resume: 3 }, "RAM still holds it all");
         drop(c);
         let _ = std::fs::remove_dir_all(root);
     }

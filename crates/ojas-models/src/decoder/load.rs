@@ -112,11 +112,11 @@ impl DecoderGpu<'_> {
 }
 
 /// Bytes for the prompt-prefix cache: `prefix_cache_gb` when set (0 disables it),
-/// else a sixteenth of physical memory, at most 4 GiB.
+/// else a sixteenth of physical memory, at most 4 GB.
 fn prefix_cache_budget(cfg: &EngineConfig) -> usize {
     match cfg.prefix_cache_gb {
-        Some(gb) => (gb.max(0.0) * (1u64 << 30) as f64) as usize,
-        None => (physical_ram_bytes() / 16).min(4 << 30) as usize,
+        Some(gb) => (gb.max(0.0) * 1e9) as usize,
+        None => (physical_ram_bytes() / 16).min(4_000_000_000) as usize,
     }
 }
 
@@ -2117,6 +2117,7 @@ impl<'a> DecoderGpu<'a> {
                     .map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
                 cache: std::cell::RefCell::new(super::prefix_cache::PrefixCache::new(prefix_cache_budget(&ecfg))),
                 docs: std::cell::RefCell::new(super::doc_cache::DocCache::new((ecfg.doc_cache_gb.max(0.0) * 1e9) as usize)),
+                cache_last: std::cell::Cell::new(ojas_core::PrefixRestore::default()),
                 seqs: (0..slots).map(|_| super::SeqState::default()).collect(),
             },
             gpu, d,
@@ -2380,6 +2381,9 @@ impl<'a> DecoderGpu<'a> {
             }
         }
         model.open_prefix_dir(&g.shard_paths(), prec);
+        if ecfg.doc_cache_gb > 0.0 && !model.uses_prefix_cache() {
+            tracing::warn!(target: "prefix", "this model and configuration keep no prompt-prefix cache, so the document cache is not used");
+        }
         Ok(model)
     }
 

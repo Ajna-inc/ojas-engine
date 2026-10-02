@@ -148,7 +148,7 @@ pub struct EngineConfig {
     /// also keeps a snapshot at every multiple of it inside a long prompt.
     pub snap_interval: usize,
     /// `--prefix-cache-gb` / OJAS_PREFIX_CACHE_GB — memory for cached prompt
-    /// prefixes. Unset: a sixteenth of physical memory, at most 4 GiB. 0 disables.
+    /// prefixes. Unset: a sixteenth of physical memory, at most 4 GB. 0 disables.
     pub prefix_cache_gb: Option<f64>,
     /// `--doc-cache-gb` / OJAS_DOC_CACHE_GB — memory for the document cache, which
     /// reuses a marked span of a prompt at any position, approximately. 0 (the

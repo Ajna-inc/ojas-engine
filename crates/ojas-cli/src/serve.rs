@@ -70,15 +70,32 @@ fn read_request(stream: &mut BufReader<&TcpStream>) -> Result<Option<Request>> {
     Ok(Some(Request { method, path, body }))
 }
 
-pub(crate) fn send(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
-    let head = format!(
+/// A whole HTTP response.
+fn response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+    let mut out = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
          Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
         body.len()
-    );
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body);
-    let _ = stream.flush();
+    ).into_bytes();
+    out.extend_from_slice(body);
+    out
+}
+
+fn json_response(status: &str, v: &Value) -> Vec<u8> { response(status, "application/json", v.to_string().as_bytes()) }
+
+/// OpenAI's error envelope, so clients surface the text instead of a blank failure.
+fn error_response(status: &str, msg: &str) -> Vec<u8> {
+    json_response(status, &json!({"error": {"message": msg, "type": "invalid_request_error"}}))
+}
+
+/// The head of a server-sent event stream.
+const SSE_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
+                        Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
+
+fn sse_event(v: &Value) -> Vec<u8> { format!("data: {v}\n\n").into_bytes() }
+
+pub(crate) fn send(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
+    let _ = stream.write_all(&response(status, content_type, body)).and_then(|_| stream.flush());
 }
 
 pub(crate) fn send_json(stream: &mut TcpStream, status: &str, v: &Value) {
@@ -86,20 +103,7 @@ pub(crate) fn send_json(stream: &mut TcpStream, status: &str, v: &Value) {
 }
 
 pub(crate) fn send_err(stream: &mut TcpStream, status: &str, msg: &str) {
-    // OpenAI's error envelope, so clients surface the text instead of a blank failure.
-    send_json(stream, status, &json!({"error": {"message": msg, "type": "invalid_request_error"}}));
-}
-
-fn begin_sse(stream: &mut TcpStream) {
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
-                Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.flush();
-}
-
-fn sse(stream: &mut TcpStream, v: &Value) -> bool {
-    let chunk = format!("data: {}\n\n", v);
-    stream.write_all(chunk.as_bytes()).and_then(|_| stream.flush()).is_ok()
+    let _ = stream.write_all(&error_response(status, msg)).and_then(|_| stream.flush());
 }
 
 fn now() -> u64 {
@@ -158,8 +162,7 @@ fn warm_ids(body: &Value, bpe: &Bpe, info: &ModelInfo, opts: &RunOpts) -> Result
         prompt_ids(&json!({ "messages": turns }), bpe, info, opts)
     };
     let (a, b) = (render("a")?, render("b")?);
-    let shared = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-    Ok(a[..shared].to_vec())
+    Ok(a[..ojas_tokenize::shared_prefix(&a, &b)].to_vec())
 }
 
 /// Process and pin `--prefix-cache-pin`'s system prompt, when one is set.
@@ -291,12 +294,16 @@ fn prompt_docs(body: &Value, bpe: &Bpe, info: &ModelInfo, opts: &RunOpts) -> Vec
         .collect()
 }
 
+/// User turns, counted from the end, whose boundaries are marked: the decoder keeps
+/// at most this many snapshots per prompt besides its branch point and end.
+const MARKED_TURNS: usize = 6;
+
 /// Message boundaries in a chat request's prompt, for the prefix cache to keep
 /// state at; none for a raw prompt.
 fn prompt_marks(body: &Value, bpe: &Bpe, info: &ModelInfo, opts: &RunOpts) -> Vec<usize> {
     let Some(msgs) = body.get("messages").and_then(Value::as_array) else { return Vec::new() };
     let (system, turns) = chat_turns(msgs, opts);
-    ojas_tokenize::transcript_boundaries(&info.arch, &system, &turns,
+    ojas_tokenize::transcript_boundaries(&info.arch, &system, &turns, MARKED_TURNS,
         |text| bpe.encode(text).into_iter().map(|v| v as u32).collect())
 }
 
@@ -357,8 +364,13 @@ fn serve_alone(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &Val
     let mut core = EngineCore::new(model);
     serve_http(listener, |stream, req, path| {
         if let Some((body, chat, oai)) = completion_route(stream, req, path) {
-            if let Ok(stream) = stream.try_clone() { run_alone(&mut core, ctx, stream, &body, chat, oai); }
-        } else if !serve_other(stream, req, path, model, ctx, props, Some(0)) {
+            match stream.try_clone() {
+                Ok(stream) => run_alone(&mut core, ctx, stream, &body, chat, oai),
+                Err(e) => send_err(stream, "500 Internal Server Error", &format!("cannot answer this connection: {e}")),
+            }
+        } else if (req.method.as_str(), path) == ("POST", "/cache/warm") {
+            if let Some((ids, pin)) = warm_request(stream, req, ctx) { warm(stream, model, 0, &ids, pin); }
+        } else if !serve_other(stream, req, path, model, ctx, props) {
             send_err(stream, "404 Not Found", &format!("no route for {} {}", req.method, path));
         }
     })
@@ -366,6 +378,8 @@ fn serve_alone(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &Val
 
 fn run_alone(core: &mut EngineCore<&dyn Model>, ctx: &Ctx, stream: TcpStream, body: &Value, chat: bool, oai: bool) {
     let Some((mut job, mut reply)) = completion::start(stream, ctx, body, chat, oai) else { return };
+    if let Some(err) = ojas_core::device_fault::peek() { return reply.refuse("503 Service Unavailable", &fault_message(&err)); }
+    reply.begin();
     let model = core.model();
     model.set_prefix_reuse(job.reuse);
     if !job.reuse { model.reset_session(); }
@@ -379,66 +393,98 @@ fn run_alone(core: &mut EngineCore<&dyn Model>, ctx: &Ctx, stream: TcpStream, bo
     reply.finish(&gen);
 }
 
+/// Why a session with a latched device fault refuses requests.
+fn fault_message(err: &ojas_core::device_fault::DeviceError) -> String {
+    format!("device fault; this model session is no longer usable and must be reloaded: {err}")
+}
+
 /// Waiting this long, a request is admitted before any whose prompt the prefix cache
 /// covers further.
 const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Serve up to `max_slots` requests together. Connections are read on their own
+/// Requests that may wait for a slot; beyond it the server answers 503.
+const MAX_QUEUE: usize = 64;
+
+/// What a connection thread hands the engine thread.
+enum Arrival {
+    Completion(Box<(completion::Job, completion::Reply)>),
+    Warm(TcpStream, Vec<u32>, bool),
+    Other(TcpStream, Request, String),
+}
+
+/// Read and parse one connection: a completion is tokenized and checked here, off
+/// the engine thread, so a long transcript or a slow client never delays decoding.
+fn arrive(stream: TcpStream, ctx: &Ctx) -> Option<Arrival> {
+    let (mut stream, req, path) = accept(stream)?;
+    if let Some((body, chat, oai)) = completion_route(&mut stream, &req, &path) {
+        return completion::start(stream, ctx, &body, chat, oai).map(|r| Arrival::Completion(Box::new(r)));
+    }
+    if (req.method.as_str(), path.as_str()) == ("POST", "/cache/warm") {
+        let (ids, pin) = warm_request(&mut stream, &req, ctx)?;
+        return Some(Arrival::Warm(stream, ids, pin));
+    }
+    Some(Arrival::Other(stream, req, path))
+}
+
+/// Serve up to `max_slots` requests together. Each connection is read on its own
 /// thread; this thread owns the model and steps the batch: each step admits waiting
 /// requests, processes one prompt chunk, and decodes a token for every slot past its
 /// prompt, streaming each to its client.
 fn serve_batched(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &Value) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let accepting = listener.try_clone()?;
-    std::thread::Builder::new().name("http-accept".into()).spawn(move || {
-        for conn in accepting.incoming() {
-            if let Some(parsed) = conn.ok().and_then(accept) {
-                if tx.send(parsed).is_err() { return; }
-            }
-        }
-    })?;
-    let mut batch = Batch::new(model, MAX_WAIT);
-    let mut replies: HashMap<u64, completion::Reply> = HashMap::new();
-    // Requests that need a slot of their own outside the batch (`/cache/warm`) wait
-    // here until one is free.
-    let mut needs_slot: VecDeque<(TcpStream, Request, String)> = VecDeque::new();
-    let mut next_id = 0u64;
-    loop {
-        let mut arrived: Vec<(TcpStream, Request, String)> = Vec::new();
-        if batch.is_idle() && needs_slot.is_empty() {
-            match rx.recv() {
-                Ok(c) => arrived.push(c),
-                Err(_) => return Ok(()),
-            }
-        }
-        arrived.extend(rx.try_iter());
-        for (mut stream, req, path) in arrived {
-            if let Some((body, chat, oai)) = completion_route(&mut stream, &req, &path) {
-                if let Some((job, reply)) = completion::start(stream, ctx, &body, chat, oai) {
-                    batch.submit(next_id, job.into_request());
-                    replies.insert(next_id, reply);
-                    next_id += 1;
+    std::thread::scope(|scope| {
+        scope.spawn(move || accept_each(listener, scope, move |stream| arrive(stream, ctx), tx));
+        let mut batch = Batch::new(model, MAX_WAIT);
+        let mut replies: HashMap<u64, completion::Reply> = HashMap::new();
+        // `/cache/warm` needs a slot of its own outside the batch, and waits here
+        // until one is free.
+        let mut warms: VecDeque<(TcpStream, Vec<u32>, bool)> = VecDeque::new();
+        let mut next_id = 0u64;
+        loop {
+            let mut arrived: Vec<Arrival> = Vec::new();
+            if batch.is_idle() && warms.is_empty() {
+                match rx.recv() {
+                    Ok(a) => arrived.push(a),
+                    Err(_) => return Ok(()),
                 }
-            } else if (req.method.as_str(), path.as_str()) == ("POST", "/cache/warm") {
-                needs_slot.push_back((stream, req, path));
-            } else if !serve_other(&mut stream, &req, &path, model, ctx, props, None) {
-                send_err(&mut stream, "404 Not Found", &format!("no route for {} {}", req.method, path));
             }
+            arrived.extend(rx.try_iter());
+            for a in arrived {
+                match a {
+                    Arrival::Completion(request) => {
+                        let (job, mut reply) = *request;
+                        if let Some(err) = ojas_core::device_fault::peek() {
+                            reply.refuse("503 Service Unavailable", &fault_message(&err));
+                        } else if batch.load().1 >= MAX_QUEUE {
+                            reply.refuse("503 Service Unavailable", "the server is at capacity; retry shortly");
+                        } else {
+                            reply.begin();
+                            batch.submit(next_id, job.into_request());
+                            replies.insert(next_id, reply);
+                            next_id += 1;
+                        }
+                    }
+                    Arrival::Warm(stream, ids, pin) => warms.push_back((stream, ids, pin)),
+                    Arrival::Other(mut stream, req, path) => {
+                        if !serve_other(&mut stream, &req, &path, model, ctx, props) {
+                            send_err(&mut stream, "404 Not Found", &format!("no route for {} {}", req.method, path));
+                        }
+                    }
+                }
+            }
+            if let Some(slot) = batch.free_slot() {
+                if let Some((mut stream, ids, pin)) = warms.pop_front() { warm(&mut stream, model, slot, &ids, pin); }
+            }
+            batch.step(&mut |id, event| match event {
+                Event::Token(t) => replies.get_mut(&id).is_some_and(|r| r.token(ctx.bpe, t)),
+                Event::Prefill(..) => replies.get(&id).is_some_and(completion::Reply::connected),
+                Event::Done(gen) => {
+                    if let Some(r) = replies.remove(&id) { r.finish(&gen); }
+                    true
+                }
+            });
         }
-        if let Some(slot) = batch.free_slot() {
-            if let Some((mut stream, req, path)) = needs_slot.pop_front() {
-                serve_other(&mut stream, &req, &path, model, ctx, props, Some(slot));
-            }
-        }
-        batch.step(&mut |id, event| match event {
-            Event::Token(t) => replies.get_mut(&id).is_some_and(|r| r.token(ctx.bpe, t)),
-            Event::Prefill(..) => true,
-            Event::Done(gen) => {
-                if let Some(r) = replies.remove(&id) { r.finish(&gen); }
-                true
-            }
-        });
-    }
+    })
 }
 
 /// The body and response format of a completion request, answering a malformed body
@@ -455,11 +501,41 @@ fn completion_route(stream: &mut TcpStream, req: &Request, path: &str) -> Option
     }
 }
 
-/// Every route but completions. `slot` is a slot free for a request that needs one
-/// (`/cache/warm`); `None` when none is. False when the route is unknown.
-#[allow(clippy::too_many_arguments)]
-fn serve_other(stream: &mut TcpStream, req: &Request, path: &str, model: &dyn Model, ctx: &Ctx, props: &Value,
-               slot: Option<usize>) -> bool {
+/// The tokens and pin flag of a `/cache/warm` request, answering a malformed one
+/// itself.
+fn warm_request(stream: &mut TcpStream, req: &Request, ctx: &Ctx) -> Option<(Vec<u32>, bool)> {
+    let body: Value = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => {
+            send_err(stream, "400 Bad Request", &format!("invalid JSON: {e}"));
+            return None;
+        }
+    };
+    match warm_ids(&body, ctx.bpe, ctx.info, ctx.opts) {
+        Ok(ids) => Some((ids, body.get("pin").and_then(Value::as_bool).unwrap_or(true))),
+        Err(e) => {
+            send_err(stream, "400 Bad Request", &e.to_string());
+            None
+        }
+    }
+}
+
+/// Process `ids` into the prefix cache in `slot`, which no request holds.
+fn warm(stream: &mut TcpStream, model: &dyn Model, slot: usize, ids: &[u32], pin: bool) {
+    let mut cached = None;
+    if !model.with_slot(slot, &mut || cached = model.warm_prefix(ids, pin)) {
+        return send_err(stream, "500 Internal Server Error", &format!("slot {slot} cannot be addressed"));
+    }
+    match cached {
+        Some(cached) => send_json(stream, "200 OK", &json!({
+            "tokens": ids.len(), "cached_tokens": cached, "pinned": pin, "cache": cache_json(model.prefix_cache_stats()),
+        })),
+        None => send_err(stream, "400 Bad Request", "this model keeps no prompt-prefix cache"),
+    }
+}
+
+/// Every route but completions and `/cache/warm`. False when the route is unknown.
+fn serve_other(stream: &mut TcpStream, req: &Request, path: &str, model: &dyn Model, ctx: &Ctx, props: &Value) -> bool {
     match (req.method.as_str(), path) {
         ("GET", "/health") => match ojas_core::device_fault::peek() {
             // A process that cannot serve must not report healthy; the recovery path
@@ -477,33 +553,6 @@ fn serve_other(stream: &mut TcpStream, req: &Request, path: &str, model: &dyn Mo
             model.save_prefix_cache();
             send_json(stream, "200 OK", &cache_json(model.prefix_cache_stats()))
         }
-        ("POST", "/cache/warm") => {
-            let Some(slot) = slot else { return false };
-            let body: Value = match serde_json::from_slice(&req.body) {
-                Ok(v) => v,
-                Err(e) => {
-                    send_err(stream, "400 Bad Request", &format!("invalid JSON: {e}"));
-                    return true;
-                }
-            };
-            let pin = body.get("pin").and_then(Value::as_bool).unwrap_or(true);
-            let ids = match warm_ids(&body, ctx.bpe, ctx.info, ctx.opts) {
-                Ok(ids) => ids,
-                Err(e) => {
-                    send_err(stream, "400 Bad Request", &e.to_string());
-                    return true;
-                }
-            };
-            let mut cached = None;
-            model.with_slot(slot, &mut || cached = model.warm_prefix(&ids, pin));
-            match cached {
-                Some(cached) => send_json(stream, "200 OK", &json!({
-                    "tokens": ids.len(), "cached_tokens": cached, "pinned": pin,
-                    "cache": cache_json(model.prefix_cache_stats()),
-                })),
-                None => send_err(stream, "400 Bad Request", "this model keeps no prompt-prefix cache"),
-            }
-        }
         ("POST", "/cache/unpin") => {
             model.unpin_prefix_cache();
             send_json(stream, "200 OK", &cache_json(model.prefix_cache_stats()))
@@ -517,24 +566,49 @@ fn serve_other(stream: &mut TcpStream, req: &Request, path: &str, model: &dyn Mo
     true
 }
 
-/// Accept connections one at a time and hand each parsed request to `handle` with
-/// its path (query string removed).
+/// Hand each request to `handle` with its path (query string removed), one at a
+/// time on the calling thread, in the order they arrive. Each connection is read on
+/// its own thread, so a client slow to send its request delays no one else's.
 pub(crate) fn serve_http(listener: &TcpListener, mut handle: impl FnMut(&mut TcpStream, &Request, &str)) -> Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(move || accept_each(listener, scope, accept, tx));
+        for (mut stream, req, path) in rx { handle(&mut stream, &req, &path); }
+        Ok(())
+    })
+}
+
+/// Read every new connection on its own thread with `read`, and send what it
+/// returns to `tx`.
+fn accept_each<'scope, T: Send + 'scope>(listener: &'scope TcpListener, scope: &'scope std::thread::Scope<'scope, '_>,
+                                         read: impl Fn(TcpStream) -> Option<T> + Copy + Send + 'scope,
+                                         tx: std::sync::mpsc::Sender<T>) {
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
-                if let Some((mut stream, req, path)) = accept(stream) { handle(&mut stream, &req, &path); }
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    if let Some(item) = read(stream) { let _ = tx.send(item); }
+                });
             }
-            Err(e) => tracing::warn!("accept failed: {e}"),
+            Err(e) => {
+                tracing::warn!("accept failed: {e}");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
         }
     }
-    Ok(())
 }
+
+/// A client gets this long to send its request, and each write to it this long to
+/// complete, so an idle or stalled connection cannot hold a thread forever.
+const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Read one request from a new connection, with its path (query string removed).
 /// Answers CORS preflight itself, and a request that cannot be parsed with 400;
 /// `None` for those and for a connection closed before a request.
 fn accept(mut stream: TcpStream) -> Option<(TcpStream, Request, String)> {
+    let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
     let req = {
         let mut reader = BufReader::new(&stream);
         match read_request(&mut reader) {

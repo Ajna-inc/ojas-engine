@@ -102,16 +102,17 @@ pub(crate) struct Wanted<'a> {
     pub(crate) len: usize,
 }
 
-/// The outcome of a queued write.
+/// The outcome of a queued write, named by the number `Disk::write` gave it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Written {
     pub(crate) key: u64,
     pub(crate) part: Part,
+    pub(crate) seq: u64,
     pub(crate) ok: bool,
 }
 
 enum Job {
-    Put { key: u64, part: Part, parent: u64, tokens: Box<[u32]>, data: Bytes },
+    Put { key: u64, part: Part, seq: u64, parent: u64, tokens: Box<[u32]>, data: Bytes },
     Remove(PathBuf),
     Index,
     Flush(mpsc::Sender<()>),
@@ -123,6 +124,8 @@ struct Shared {
     reserve: u64,
     kv: KvFormat,
     pending: AtomicU64,
+    /// Number of the last write queued.
+    seq: AtomicU64,
     /// The newest index to write; older ones still queued are superseded.
     index: Mutex<Option<Vec<u8>>>,
     written: Mutex<Vec<Written>>,
@@ -166,7 +169,7 @@ impl Disk {
             .unwrap_or_default();
         let records = present(&dir, records, kv);
         let shared = Arc::new(Shared {
-            dir, reserve, kv, pending: AtomicU64::new(0), index: Mutex::new(None), written: Mutex::new(Vec::new()),
+            dir, reserve, kv, pending: AtomicU64::new(0), seq: AtomicU64::new(0), index: Mutex::new(None), written: Mutex::new(Vec::new()),
         });
         let writer = match lock {
             Some(_) => {
@@ -215,24 +218,28 @@ impl Disk {
             let handles: Vec<_> = wanted.chunks(per).map(|batch| scope.spawn(move || {
                 batch.iter().map(|w| self.read(w.key, w.part, w.parent, w.tokens, w.len)).collect::<Vec<_>>()
             })).collect();
-            for h in handles {
-                results.extend(h.join().unwrap_or_else(|_| vec![]));
+            for (h, batch) in handles.into_iter().zip(wanted.chunks(per)) {
+                match h.join() {
+                    Ok(read) => results.extend(read),
+                    Err(_) => results.extend(batch.iter().map(|_| Err(io::Error::other("read thread failed")))),
+                }
             }
         });
-        results.resize_with(wanted.len(), || Err(io::Error::other("read thread failed")));
         results
     }
 
-    /// Queue a payload for writing. False, queueing nothing, when the directory is
-    /// read-only or the queue is full.
-    pub(crate) fn write(&self, key: u64, part: Part, parent: u64, tokens: &[u32], data: Bytes) -> bool {
-        let Some((tx, _)) = &self.writer else { return false };
+    /// Queue a payload for writing, returning the number its `Written` will carry.
+    /// `None`, queueing nothing, when the directory is read-only or the queue is
+    /// full.
+    pub(crate) fn write(&self, key: u64, part: Part, parent: u64, tokens: &[u32], data: Bytes) -> Option<u64> {
+        let (tx, _) = self.writer.as_ref()?;
         let len = data.len() as u64;
         if self.shared.pending.fetch_add(len, Ordering::Relaxed) + len > MAX_PENDING {
             self.shared.pending.fetch_sub(len, Ordering::Relaxed);
-            return false;
+            return None;
         }
-        tx.send(Job::Put { key, part, parent, tokens: tokens.into(), data }).is_ok()
+        let seq = self.shared.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        tx.send(Job::Put { key, part, seq, parent, tokens: tokens.into(), data }).ok().map(|_| seq)
     }
 
     /// Delete a payload, after any write of it already queued.
@@ -296,13 +303,13 @@ impl Shared {
 fn run_writer(shared: &Shared, jobs: mpsc::Receiver<Job>) {
     for job in jobs {
         match job {
-            Job::Put { key, part, parent, tokens, data } => {
+            Job::Put { key, part, seq, parent, tokens, data } => {
                 let result = shared.put(key, part, parent, &tokens, &data);
                 if let Err(e) = &result {
                     tracing::warn!(target: "prefix", "could not save a cached block: {e}");
                 }
                 shared.pending.fetch_sub(data.len() as u64, Ordering::Relaxed);
-                shared.written.lock().unwrap().push(Written { key, part, ok: result.is_ok() });
+                shared.written.lock().unwrap().push(Written { key, part, seq, ok: result.is_ok() });
             }
             Job::Remove(path) => {
                 let _ = fs::remove_file(path);
@@ -325,7 +332,9 @@ fn run_writer(shared: &Shared, jobs: mpsc::Receiver<Job>) {
 /// Write `parts` to `path` through a temporary file, so readers see the old file
 /// or the complete new one.
 fn replace(path: &Path, parts: &[&[u8]]) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
     let mut file = File::create(&tmp)?;
     for part in parts {
         file.write_all(part)?;
@@ -461,6 +470,8 @@ fn lock(dir: &Path) -> io::Result<Option<File>> {
     Ok(held.then_some(file))
 }
 
+/// Without `flock` the directory is not locked: two processes writing it at once
+/// are not detected.
 #[cfg(not(unix))]
 fn lock(dir: &Path) -> io::Result<Option<File>> {
     File::options().create(true).truncate(false).write(true).open(dir.join("lock")).map(Some)
@@ -489,6 +500,7 @@ fn stored_len(kv: KvFormat, part: Part, len: usize) -> usize {
 /// Encode f16 values as Q8_0: per 32 values, an f16 scale and 32 signed bytes.
 /// The length must be a multiple of 64 bytes, as KV rows are.
 fn q8_encode(data: &[u8]) -> Vec<u8> {
+    debug_assert!(data.len().is_multiple_of(64), "KV rows are whole groups of 32 halves");
     let mut out = Vec::with_capacity(data.len() / 64 * 34);
     for group in data.as_chunks::<64>().0 {
         let (halves, _) = group.as_chunks::<2>();
@@ -621,9 +633,9 @@ pub(crate) mod tests {
         {
             let o = open(&root, false);
             assert!(o.records.is_empty() && o.disk.writable());
-            assert!(o.disk.write(a.key, Part::Kv, ROOT, &a.tokens, kv_a.clone()));
-            assert!(o.disk.write(a.key, Part::Snapshot, ROOT, &a.tokens, snap_a.clone()));
-            assert!(o.disk.write(b.key, Part::Kv, a.key, &b.tokens, kv_b.clone()));
+            assert!(o.disk.write(a.key, Part::Kv, ROOT, &a.tokens, kv_a.clone()).is_some());
+            assert!(o.disk.write(a.key, Part::Snapshot, ROOT, &a.tokens, snap_a.clone()).is_some());
+            assert!(o.disk.write(b.key, Part::Kv, a.key, &b.tokens, kv_b.clone()).is_some());
             o.disk.save_index(&[a.clone(), b.clone()], 5);
             o.disk.flush();
             assert_eq!(o.disk.written().len(), 3);
@@ -642,7 +654,7 @@ pub(crate) mod tests {
         let root = scratch("corrupt");
         let a = record(ROOT, 1, 64, 0);
         let o = open(&root, false);
-        assert!(o.disk.write(a.key, Part::Kv, ROOT, &a.tokens, Arc::new(vec![5u8; 64])));
+        assert!(o.disk.write(a.key, Part::Kv, ROOT, &a.tokens, Arc::new(vec![5u8; 64])).is_some());
         o.disk.flush();
         let path = o.disk.dir().join(format!("{:016x}.kv", a.key));
         let mut bytes = fs::read(&path).unwrap();
@@ -662,9 +674,9 @@ pub(crate) mod tests {
         {
             let o = open(&root, false);
             for (r, parent) in [(&a, ROOT), (&b, a.key), (&c, b.key)] {
-                assert!(o.disk.write(r.key, Part::Kv, parent, &r.tokens, Arc::new(vec![1; 64])));
+                assert!(o.disk.write(r.key, Part::Kv, parent, &r.tokens, Arc::new(vec![1; 64])).is_some());
             }
-            assert!(o.disk.write(a.key, Part::Snapshot, ROOT, &a.tokens, Arc::new(vec![2; 128])));
+            assert!(o.disk.write(a.key, Part::Snapshot, ROOT, &a.tokens, Arc::new(vec![2; 128])).is_some());
             o.disk.save_index(&[a.clone(), b.clone(), c.clone()], 1);
             o.disk.flush();
             fs::remove_file(o.disk.dir().join(format!("{:016x}.kv", b.key))).unwrap();
@@ -690,7 +702,7 @@ pub(crate) mod tests {
         let second = open(&root, false);
         assert!(first.disk.writable() && !second.disk.writable());
         let a = record(ROOT, 1, 4, 0);
-        assert!(!second.disk.write(a.key, Part::Kv, ROOT, &a.tokens, Arc::new(vec![0; 4])));
+        assert!(second.disk.write(a.key, Part::Kv, ROOT, &a.tokens, Arc::new(vec![0; 4])).is_none());
         drop((first, second));
         let ro = Disk::open(&root.join("absent"), 42, "", options(true, 0)).unwrap();
         assert!(!ro.disk.writable() && ro.records.is_empty() && !root.join("absent").exists());
@@ -702,9 +714,9 @@ pub(crate) mod tests {
         let root = scratch("reserve");
         let o = Disk::open(&root, 42, "", options(false, u64::MAX / 2)).unwrap();
         let a = record(ROOT, 1, 4, 0);
-        assert!(o.disk.write(a.key, Part::Kv, ROOT, &a.tokens, Arc::new(vec![0; 4])));
+        assert!(o.disk.write(a.key, Part::Kv, ROOT, &a.tokens, Arc::new(vec![0; 4])).is_some());
         o.disk.flush();
-        assert_eq!(o.disk.written(), vec![Written { key: a.key, part: Part::Kv, ok: false }]);
+        assert_eq!(o.disk.written(), vec![Written { key: a.key, part: Part::Kv, seq: 1, ok: false }]);
         drop(o);
         let _ = fs::remove_dir_all(root);
     }
@@ -734,8 +746,8 @@ pub(crate) mod tests {
         let snapshot: Vec<u8> = (0..64u8).collect();
         let o = Disk::open(&root, 42, "", DiskOptions { kv: KvFormat::Q8, ..options(false, 0) }).unwrap();
         assert_eq!(o.disk.stored_len(Part::Kv, 128), 68);
-        assert!(o.disk.write(a.key, Part::Kv, ROOT, &a.tokens, Arc::new(kv.clone())));
-        assert!(o.disk.write(a.key, Part::Snapshot, ROOT, &a.tokens, Arc::new(snapshot.clone())));
+        assert!(o.disk.write(a.key, Part::Kv, ROOT, &a.tokens, Arc::new(kv.clone())).is_some());
+        assert!(o.disk.write(a.key, Part::Snapshot, ROOT, &a.tokens, Arc::new(snapshot.clone())).is_some());
         o.disk.flush();
         let file = o.disk.dir().join(format!("{:016x}.kv", a.key));
         assert_eq!(fs::metadata(file).unwrap().len(), (68 + header_len(BLOCK)) as u64);

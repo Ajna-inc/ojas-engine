@@ -659,6 +659,8 @@ pub(crate) struct Session {
     pub(crate) cache: std::cell::RefCell<prefix_cache::PrefixCache>,
     /// Spans reusable at any position (`doc_cache`), shared by every slot.
     pub(crate) docs: std::cell::RefCell<doc_cache::DocCache>,
+    /// What the prefix cache did for the most recent prompt, on any slot.
+    pub(crate) cache_last: std::cell::Cell<ojas_core::PrefixRestore>,
     /// Each slot's sequence, indexed by slot.
     pub(crate) seqs: Vec<SeqState>,
 }
@@ -675,8 +677,6 @@ pub(crate) struct SeqState {
     pub(crate) cache_reuse: std::cell::Cell<bool>,
     /// Token positions of boundaries in the next prompt, kept as snapshot points.
     pub(crate) cache_marks: std::cell::RefCell<Vec<usize>>,
-    /// What the cache did for the most recent prompt.
-    pub(crate) cache_last: std::cell::Cell<ojas_core::PrefixRestore>,
     /// Token ranges of the next prompt for the document cache, and whether it may
     /// serve them.
     pub(crate) cache_docs: std::cell::RefCell<Vec<(usize, usize)>>,
@@ -690,7 +690,7 @@ impl Default for SeqState {
         SeqState {
             session_tokens: Default::default(), last_prefill_reused: Default::default(), snap_pos: Default::default(),
             snap_buf: Default::default(), cache_plan: Default::default(), cache_reuse: std::cell::Cell::new(true),
-            cache_marks: Default::default(), cache_last: Default::default(), cache_docs: Default::default(),
+            cache_marks: Default::default(), cache_docs: Default::default(),
             docs_serve: Default::default(), docs_pending: Default::default(),
         }
     }
@@ -1300,10 +1300,12 @@ impl<'a> DecoderGpu<'a> {
     /// would leave `cur_slot` at 2 and silently redirect the next plain `forward_id`,
     /// corrupting a whole sequence with no failing call anywhere near it.
     pub(crate) fn with_slot<R>(&self, s: usize, f: impl FnOnce() -> R) -> R {
-        let prev = self.cur_slot.replace(s);
-        let r = f();
-        self.cur_slot.set(prev);
-        r
+        struct Restore<'c>(&'c std::cell::Cell<usize>, usize);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) { self.0.set(self.1); }
+        }
+        let _restore = Restore(&self.cur_slot, self.cur_slot.replace(s));
+        f()
     }
 
     /// Every GPU buffer the decoder can touch, for `MTLResidencySet` membership.

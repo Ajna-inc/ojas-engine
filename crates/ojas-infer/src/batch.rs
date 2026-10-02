@@ -148,7 +148,7 @@ impl<'m, M: Model + ?Sized> Batch<'m, M> {
         let Waiting { id, mut req, .. } = w;
         let capacity = self.model.context_capacity();
         if req.prompt.is_empty() || req.max_tokens == 0 || req.prompt.len() > capacity {
-            let finish = if req.prompt.len() > capacity { FinishReason::NoLogits } else { FinishReason::Length };
+            let finish = if req.prompt.len() > capacity { FinishReason::Refused } else { FinishReason::Length };
             sink(id, Event::Done(Generation { tokens: Vec::new(), finish, cached_tokens: 0, prompt_cache: None }));
             return;
         }
@@ -165,7 +165,6 @@ impl<'m, M: Model + ?Sized> Batch<'m, M> {
             prompt_cache = model.prefix_cache_stats().map(|s| s.last);
             if pre.is_empty() { model.prefill(&[], 0); }
         });
-        assert!(addressed, "slot {slot} is within max_slots, so the model addresses it");
         let total = pre.len();
         let running = Running {
             id, picker: Picker::new(&req.prompt, req.opts.as_ref()),
@@ -174,7 +173,11 @@ impl<'m, M: Model + ?Sized> Batch<'m, M> {
             cached_tokens: prompt_cache.map_or(start, |r| r.reused_tokens), prompt_cache, req,
         };
         self.slots[slot] = Some(running);
-        if !sink(id, Event::Prefill(start, total)) { self.finish(slot, FinishReason::Caller, sink); }
+        if !addressed {
+            self.finish(slot, FinishReason::Refused, sink);
+        } else if !sink(id, Event::Prefill(start, total)) {
+            self.finish(slot, FinishReason::Caller, sink);
+        }
     }
 
     /// Process the next chunk of one prompt still in progress.
@@ -214,7 +217,7 @@ impl<'m, M: Model + ?Sized> Batch<'m, M> {
         for (i, &slot) in slots.iter().enumerate() {
             let outcome = match (&ids, faulted) {
                 (_, true) => Err(FinishReason::Fault),
-                (None, _) => Err(FinishReason::NoLogits),
+                (None, _) => Err(FinishReason::Refused),
                 (Some(ids), _) => self.choose(slot, i, ids[i]),
             };
             match outcome {
@@ -280,12 +283,14 @@ mod tests {
         state: RefCell<Vec<u64>>,
         cached: HashMap<usize, usize>,
         calls: RefCell<Vec<String>>,
+        /// Each entry's argmax in the last decode step.
+        last: RefCell<Vec<u32>>,
     }
 
     impl Mock {
         fn new(slots: usize) -> Self {
             Mock { slots, cur: Cell::new(0), state: RefCell::new(vec![0; slots]), cached: HashMap::new(),
-                   calls: RefCell::new(Vec::new()) }
+                   calls: RefCell::new(Vec::new()), last: RefCell::new(Vec::new()) }
         }
         fn next(state: u64) -> u32 { (state * 7 % 61) as u32 }
     }
@@ -313,15 +318,18 @@ mod tests {
         fn decode_slots(&self, steps: &[(usize, u32, usize)]) -> Option<Vec<u32>> {
             self.calls.borrow_mut().push(format!("decode {}", steps.len()));
             let mut state = self.state.borrow_mut();
-            Some(steps.iter().map(|&(s, t, _)| {
+            let ids: Vec<u32> = steps.iter().map(|&(s, t, _)| {
                 state[s] += t as u64;
                 Self::next(state[s])
-            }).collect())
+            }).collect();
+            *self.last.borrow_mut() = ids.clone();
+            Some(ids)
         }
+        /// Logits that depend on the entry's own state: a peak at its argmax over a
+        /// spread wide enough for sampling to stray from it.
         fn slot_logits(&self, i: usize) -> Option<Vec<f32>> {
-            let last = self.calls.borrow().iter().rev().find_map(|c| c.strip_prefix("decode ").map(str::to_owned));
-            assert!(last.is_some() && i < last.unwrap().parse::<usize>().unwrap());
-            Some((0..VOCAB).map(|t| -((t as f32) - 9.0).abs()).collect())
+            let top = *self.last.borrow().get(i)?;
+            Some((0..VOCAB as u32).map(|t| if t == top { 2.0 } else { (t % 7) as f32 * 0.2 }).collect())
         }
     }
 
@@ -419,6 +427,43 @@ mod tests {
     }
 
     #[test]
+    fn sampled_output_does_not_depend_on_what_else_is_running() {
+        let sampled = |p: Vec<u32>, seed: u64| {
+            let mut r = request(p, 40);
+            r.opts = Some(SampleOpts { temperature: 1.0, seed, ..SampleOpts::default() });
+            r
+        };
+        let alone: Vec<Vec<u32>> = prompts().into_iter().enumerate()
+            .map(|(i, p)| run(&Mock::new(4), vec![sampled(p, i as u64)]).remove(&0).unwrap().tokens)
+            .collect();
+        let together = run(&Mock::new(4), prompts().into_iter().enumerate().map(|(i, p)| sampled(p, i as u64)).collect());
+        for (id, tokens) in alone.iter().enumerate() {
+            assert_eq!(&together[&(id as u64)].tokens, tokens, "request {id}");
+        }
+        let greedy = run(&Mock::new(1), vec![request(prompts()[0].clone(), 40)]).remove(&0).unwrap().tokens;
+        assert_ne!(alone[0], greedy, "sampling strays from the argmax");
+    }
+
+    #[test]
+    fn a_prompt_past_the_context_is_refused_and_a_client_gone_mid_prompt_ends_its_request() {
+        let model = Mock::new(2);
+        let gens = run(&model, vec![request(vec![1; 5000], 4)]);
+        assert_eq!((gens[&0].finish, gens[&0].tokens.len()), (FinishReason::Refused, 0));
+        let mut batch = Batch::new(&model, Duration::from_secs(3600));
+        batch.submit(1, request((0..1000).map(|i| i % 9 + 1).collect(), 4));
+        let mut prefills = 0;
+        let mut done = None;
+        while !batch.is_idle() {
+            batch.step(&mut |_, e| match e {
+                Event::Prefill(..) => { prefills += 1; prefills < 2 }
+                Event::Done(g) => { done = Some(g.finish); true }
+                Event::Token(_) => true,
+            });
+        }
+        assert_eq!((done, prefills), (Some(FinishReason::Caller), 2), "processing stops at the first chunk after");
+    }
+
+    #[test]
     fn a_processor_constrains_through_the_slot_logits() {
         struct OnlyOdd(usize);
         impl LogitProcessor for OnlyOdd {
@@ -430,7 +475,7 @@ mod tests {
         let mut req = request(vec![1, 2, 3], 50);
         req.processor = Some(Box::new(OnlyOdd(0)));
         let gens = run(&model, vec![req, request(vec![9], 4)]);
-        assert_eq!(gens[&0].tokens, vec![9, 9, 9], "the logits peak at 9, which is odd");
+        assert!(gens[&0].tokens.len() == 3 && gens[&0].tokens.iter().all(|t| t % 2 == 1), "{:?}", gens[&0].tokens);
         assert_eq!(gens[&0].finish, FinishReason::Complete);
     }
 }

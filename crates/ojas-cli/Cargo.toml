@@ -24,6 +24,7 @@ ojas-cpu = { path = "../ojas-cpu" }
 ojas-vision = { path = "../ojas-vision" }
 tracing = { workspace = true }
 anyhow = "1"
+libc = "0.2"
 serde_json = { workspace = true }
 # The CUDA decoders (`--device cuda`, and `auto` on an NVIDIA box): built with `--features cuda`.
 ojas-cuda = { path = "../ojas-cuda", optional = true }
