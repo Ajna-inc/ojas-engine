@@ -492,6 +492,7 @@ name = "ojas-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "ojas-core",
  "ojas-cpu",
  "ojas-cuda",

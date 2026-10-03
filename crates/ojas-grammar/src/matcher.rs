@@ -5,7 +5,10 @@
 //! after expansion every top points at a character element, and an empty stack
 //! means the grammar can end here. A code point advances each stack whose top
 //! accepts it. Tokens are byte strings that may split a code point, so the state
-//! also carries a partially decoded code point between tokens.
+//! also carries a partially decoded code point between tokens. Bytes are decoded as
+//! strict UTF-8: an overlong form, a surrogate or a value past U+10FFFF is
+//! rejected, so a model cannot spell an allowed character with bytes no reader
+//! would decode to it.
 
 use crate::gbnf::{Elem, Grammar};
 use std::sync::Arc;
@@ -26,6 +29,8 @@ pub struct State {
     stacks: Vec<Stack>,
     cp: u32,
     need: u8,
+    /// The smallest code point the partial one may encode, by its length.
+    min: u32,
 }
 
 impl State {
@@ -44,7 +49,7 @@ impl Grammar {
             self.expand(vec![Pos { rule: self.root, alt: a, idx: 0 }], &mut stacks);
         }
         normalize(&mut stacks);
-        State { stacks, cp: 0, need: 0 }
+        State { stacks, cp: 0, need: 0, min: 0 }
     }
 
     /// Push every stack `stack` can become with a character element (or nothing)
@@ -95,26 +100,40 @@ impl Grammar {
         let mut st = state.clone();
         for &b in bytes {
             if st.need == 0 {
-                let (cp, need) = match b {
-                    0x00..=0x7F => (b as u32, 0),
-                    0xC2..=0xDF => ((b & 0x1F) as u32, 1),
-                    0xE0..=0xEF => ((b & 0x0F) as u32, 2),
-                    0xF0..=0xF4 => ((b & 0x07) as u32, 3),
+                let (cp, need, min) = match b {
+                    0x00..=0x7F => (b as u32, 0, 0),
+                    0xC2..=0xDF => ((b & 0x1F) as u32, 1, 0x80),
+                    0xE0..=0xEF => ((b & 0x0F) as u32, 2, 0x800),
+                    0xF0..=0xF4 => ((b & 0x07) as u32, 3, 0x1_0000),
                     _ => return None,
                 };
-                st.cp = cp;
-                st.need = need;
+                (st.cp, st.need, st.min) = (cp, need, min);
             } else {
                 if b & 0xC0 != 0x80 { return None; }
                 st.cp = (st.cp << 6) | (b & 0x3F) as u32;
                 st.need -= 1;
             }
             if st.need == 0 {
+                if st.cp < st.min || st.cp > 0x10_FFFF || (0xD800..=0xDFFF).contains(&st.cp) { return None; }
                 st.stacks = self.advance(&st.stacks, st.cp);
                 if st.stacks.is_empty() { return None; }
+            } else if !self.can_continue(&st) {
+                return None;
             }
         }
         Some(st)
+    }
+
+    /// Whether some valid code point beginning with the partial one in `state` is
+    /// accepted, so a token ending mid-character is allowed only where the
+    /// character it starts can follow.
+    fn can_continue(&self, state: &State) -> bool {
+        let shift = 6 * state.need as u32;
+        let lo = (state.cp << shift).max(state.min);
+        let hi = ((state.cp << shift) | ((1 << shift) - 1)).min(0x10_FFFF);
+        if lo > hi || (0xD800 <= lo && hi <= 0xDFFF) { return false; }
+        state.stacks.iter().filter_map(|s| s.last())
+            .any(|top| self.rules[top.rule as usize][top.alt as usize][top.idx as usize].matches_any(lo, hi))
     }
 
     /// Whether `text` is a complete sentence of the grammar.
@@ -256,6 +275,32 @@ mod tests {
         let s2 = gr.feed(&s1, &bytes[1..]).unwrap();
         assert!(s2.accepting() && s2.finished());
         assert!(gr.feed(&gr.start(), &[0xFF]).is_none());
+    }
+
+    #[test]
+    fn a_partial_character_is_allowed_only_where_it_can_complete() {
+        let ascii = g("root ::= \"{\" [a-z]+");
+        assert!(ascii.feed(&ascii.start(), &[0xEA]).is_none(), "no character starting 0xEA fits here");
+        let accented = g("root ::= \"é\"");
+        assert!(accented.feed(&accented.start(), &[0xC3]).is_some(), "é is C3 A9");
+        assert!(accented.feed(&accented.start(), &[0xC4]).is_none());
+        assert!(accented.feed(&accented.start(), &[0xC3, 0xA8]).is_none(), "è is not é");
+        let not_quote = g("root ::= [^\"]");
+        assert!(not_quote.feed(&not_quote.start(), &[0xE4, 0xB8]).is_some());
+        let gap = g("root ::= [^a-z\\u0080-\\u00ff]");
+        assert!(gap.feed(&gap.start(), &[0xC3]).is_none(), "every code point from C3 is excluded");
+    }
+
+    #[test]
+    fn only_strict_utf8_is_accepted() {
+        let brace = g("root ::= \"{\"");
+        assert!(brace.feed(&brace.start(), &[0xF0, 0x80, 0x81, 0xBB]).is_none(), "overlong form of {{");
+        assert!(brace.feed(&brace.start(), &[0xF0, 0x80]).is_none(), "an overlong prefix is refused at once");
+        let any = g("root ::= .");
+        assert!(any.feed(&any.start(), &[0xE0, 0x9F]).is_none(), "overlong three-byte prefix");
+        assert!(any.feed(&any.start(), &[0xED, 0xA0, 0x80]).is_none(), "surrogate");
+        assert!(any.feed(&any.start(), &[0xF4, 0x90, 0x80, 0x80]).is_none(), "past U+10FFFF");
+        assert!(any.accepts("世") && any.accepts("😀") && any.accepts("é"));
     }
 
     #[test]

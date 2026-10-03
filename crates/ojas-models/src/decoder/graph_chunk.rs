@@ -261,7 +261,9 @@ impl<'a> DecoderGpu<'a> {
                 stage!("ssm_conv");
                 self.enc_reduce(&enc, "ssm_ab", &[(&self.st.ssm_gate, 0), (&self.st.ssm_beta, 1), (&self.wt.w32[&p("ssm_dt.bias")], 2), (&self.wt.w32[&p("ssm_a")], 3)], &[(4, m*hv), (5, hv)], &[], ((m*hv + 63)/64) as u64, 64);
                 {
-                    enc.set_compute_pipeline_state(&self.p["conv1d_prefill"]);
+                    // Tokens in parallel (`conv1d_prefill_tiled`): 1.5 against 3.3 ms per
+                    // 256-token chunk of Qwen3.5 4B for the token-serial kernel.
+                    enc.set_compute_pipeline_state(&self.p["conv1d_prefill_tiled"]);
                     enc.set_buffer(0, Some(&self.st.ssm_qkv), 0);
                     enc.set_buffer(1, Some(&self.st.conv_state[l]), conv_o(l));
                     enc.set_buffer(2, Some(&self.wt.w32[&p("ssm_conv1d.weight")]), 0);
@@ -269,7 +271,8 @@ impl<'a> DecoderGpu<'a> {
                     enc.set_buffer(6, Some(if verify { &self.sp.conv_snap[l] } else { &self.st.conv_state[l] }),
                                    if verify { 0 } else { conv_o(l) });
                     ints(&enc, &[(7, if verify { 0 } else { u32::MAX })]);
-                    enc.dispatch_thread_groups(MTLSize::new(((conv_ch + 63)/64) as u64, 1, 1), MTLSize::new(64, 1, 1));
+                    // 16 channels per threadgroup: the kernel's CONV_TILE_C.
+                    enc.dispatch_thread_groups(MTLSize::new(conv_ch.div_ceil(16) as u64, 1, 1), MTLSize::new(256, 1, 1));
                 }
                 self.bar(&enc); // ssm_ab + conv done (ran concurrently)
                 stage!("deltanet");

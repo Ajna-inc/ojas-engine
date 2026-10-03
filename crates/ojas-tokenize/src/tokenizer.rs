@@ -538,6 +538,50 @@ pub fn chat_transcript(arch: &str, system: &str, turns: &[(String, String)]) -> 
     s
 }
 
+/// Length of the longest common prefix of two token sequences.
+pub fn shared_prefix(a: &[u32], b: &[u32]) -> usize { a.iter().zip(b).take_while(|(x, y)| x == y).count() }
+
+/// Token positions in `chat_transcript(arch, system, turns)` where a later request
+/// is likely to stop matching it: the end of the system prompt, and the start of
+/// the assistant turn after each of the last `recent` user turns, where a template
+/// may re-render the reply differently. Each is the token prefix the full
+/// transcript shares with a shorter rendering, so it holds for any template and any
+/// tokenizer; each costs one encoding of the transcript up to it. Ascending,
+/// without zeros.
+pub fn transcript_boundaries(arch: &str, system: &str, turns: &[(String, String)], recent: usize,
+                             encode: impl Fn(&str) -> Vec<u32>) -> Vec<usize> {
+    let after_system = |next: &str| encode(&chat_transcript(arch, system, &[("user".into(), next.into())]));
+    let full = encode(&chat_transcript(arch, system, turns));
+    let mut marks = vec![shared_prefix(&after_system("a"), &after_system("b"))];
+    let users: Vec<usize> = (0..turns.len()).filter(|&k| turns[k].0 != "assistant").collect();
+    for &k in &users[users.len().saturating_sub(recent)..] {
+        marks.push(shared_prefix(&full, &encode(&chat_transcript(arch, system, &turns[..=k]))));
+    }
+    marks.retain(|&m| m > 0);
+    marks.sort_unstable();
+    marks.dedup();
+    marks
+}
+
+/// Token range `[start, end)` of turn `k`'s text in the tokens of
+/// `chat_transcript(arch, system, turns)`: where the transcript stops matching one
+/// whose turn `k` text has a character added at its start, and at its end. Holds for
+/// any template. At the end, a token the text shares with the template is left out;
+/// at the start, one is counted in, so the range can begin a token early.
+pub fn transcript_span(arch: &str, system: &str, turns: &[(String, String)], k: usize,
+                       encode: impl Fn(&str) -> Vec<u32>) -> (usize, usize) {
+    let shared = shared_prefix;
+    let full = encode(&chat_transcript(arch, system, turns));
+    let altered = |text: String| {
+        let mut t = turns.to_vec();
+        t[k].1 = text;
+        encode(&chat_transcript(arch, system, &t))
+    };
+    let start = shared(&full, &altered(format!("\u{7}{}", turns[k].1)));
+    let end = shared(&full, &altered(format!("{}\u{7}", turns[k].1)));
+    (start, end.max(start))
+}
+
 /// Reassembles a byte stream into valid UTF-8 as tokens arrive.
 ///
 /// Byte-level BPE happily splits one character across token boundaries — a token
@@ -592,6 +636,36 @@ impl Utf8Stream {
         let out = String::from_utf8_lossy(&self.tail).into_owned();
         self.tail.clear();
         out
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::{chat_transcript, transcript_boundaries, transcript_span};
+
+    fn chars(s: &str) -> Vec<u32> { s.chars().map(|c| c as u32).collect() }
+
+    #[test]
+    fn a_turn_span_covers_exactly_its_text() {
+        let turns: Vec<(String, String)> = [("user", "the page"), ("user", "a question")]
+            .map(|(r, t)| (r.to_string(), t.to_string())).to_vec();
+        let text = chat_transcript("qwen35", "be brief", &turns);
+        let (s, e) = transcript_span("qwen35", "be brief", &turns, 0, chars);
+        let chars: Vec<char> = text.chars().collect();
+        assert_eq!(chars[s..e].iter().collect::<String>(), "the page");
+    }
+
+    #[test]
+    fn marks_the_system_prompt_end_and_each_assistant_turn_start() {
+        let turns: Vec<(String, String)> = [("user", "hi"), ("assistant", "hello"), ("user", "more")]
+            .map(|(r, t)| (r.to_string(), t.to_string())).to_vec();
+        let text = chat_transcript("qwen35", "be brief", &turns);
+        let marks = transcript_boundaries("qwen35", "be brief", &turns, 8, chars);
+        let system_end = "<|im_start|>system\nbe brief<|im_end|>\n<|im_start|>user\n".chars().count();
+        let first_reply = text.find("hello").unwrap();
+        assert_eq!(marks, vec![system_end, first_reply, text.chars().count()]);
+        let last_only = transcript_boundaries("qwen35", "be brief", &turns, 1, chars);
+        assert_eq!(last_only, vec![system_end, text.chars().count()]);
     }
 }
 

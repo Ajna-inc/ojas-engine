@@ -514,7 +514,7 @@ impl<'a> DecoderGpu<'a> {
         // its own input rows before encoding: row i depends on rows i-1/i-2,
         // including drafts that have not yet been committed by the frontend.
         {
-            let mut history = self.sess.session_tokens.borrow_mut();
+            let mut history = self.seq().session_tokens.borrow_mut();
             if base_pos <= history.len() {
                 history.truncate(base_pos);
                 history.extend_from_slice(tokens);

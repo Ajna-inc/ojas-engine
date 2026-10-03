@@ -58,6 +58,7 @@ impl<'a> DecoderGpu<'a> {
     /// per-token 600KB logits copy + CPU scan that `forward()` incurs.
     pub fn forward_id(&self, token: u32, pos: usize) -> u32 {
         assert!(pos < self.st.max_seq && (token as usize) < self.arch.vocab, "decode token or position exceeds model bounds");
+        assert_eq!(self.cur_slot.get(), 0, "single-token decode runs on slot 0; other slots decode through decode_slots");
         // Streaming (GLM/DeepSeek disk-streamed MoE): the whole-token forward binds
         // every layer's expert buffers, so a single command buffer would make all
         // ~440GB of no-copy mmap'd experts resident at commit → OOM. Chunk the forward
@@ -72,7 +73,7 @@ impl<'a> DecoderGpu<'a> {
             } else {
                 self.forward_id_streamed(token, pos)
             };
-            let mut history = self.sess.session_tokens.borrow_mut();
+            let mut history = self.seq().session_tokens.borrow_mut();
             if pos <= history.len() { history.truncate(pos); history.push(token); }
             drop(history);
             if next != u32::MAX { self.sync_mtp_single(token, pos); }
@@ -151,9 +152,11 @@ impl<'a> DecoderGpu<'a> {
         // record it so the next turn can reuse this response, not just the prompt.
         // Dense KV is positional and persistent, so this runs for every arch, not
         // just SSM. Snapshots stay SSM-only (dense has none).
-        if pos == self.sess.session_tokens.borrow().len() {
-            self.sess.session_tokens.borrow_mut().push(token);
-            if self.arch.ssm.is_some() {
+        if pos == self.seq().session_tokens.borrow().len() {
+            self.seq().session_tokens.borrow_mut().push(token);
+            // Decode-step states differ in the last bits from prefill's, so the
+            // prefix cache never stores them; the ladder serves the other paths.
+            if self.arch.ssm.is_some() && !self.uses_prefix_cache() {
                 self.maybe_snapshot(pos + 1);
             }
         }
@@ -217,6 +220,7 @@ impl<'a> DecoderGpu<'a> {
             && !(self.strm.stream && self.arch.moe.is_some())
             && self.arch.sparse_budget.is_none()
             && self.sp.mtp.is_none()
+            && !self.cfg.no_prefill
     }
 
     /// Decode one token for each of B independent sequences in one step.
@@ -280,11 +284,9 @@ impl<'a> DecoderGpu<'a> {
     /// included: slot 0 is the sequence every existing caller means.
     ///
     /// A non-zero slot takes a narrower path — the qwen35 chunk graph pointed at
-    /// that slot's state, and nothing else. The reuse machinery (`session_tokens`,
-    /// the snapshot ladder, the on-disk session cache) is keyed to one resident
-    /// sequence: `reuse_prefix` would match slot 2's prompt against slot 0's cached
-    /// ids and restore a snapshot belonging to neither. Skipping it costs only a
-    /// warm start.
+    /// that slot's state, and nothing else: no prompt-prefix cache and no reuse of
+    /// the slot's previous sequence. A host that wants those points `prefill` at the
+    /// slot with [`ojas_core::Model::with_slot`].
     pub fn prefill_slot(&self, s: usize, tokens: &[u32], base_pos: usize) -> bool {
         if s == 0 { self.prefill(tokens, base_pos); return true; }
         if !self.slots_ok() || s >= self.st.slots || self.cfg.no_prefill { return false; }
@@ -396,6 +398,20 @@ impl<'a> ojas_core::Model for DecoderGpu<'a> {
         Some(DecoderGpu::encode_image(self, img, w, h))
     }
     fn reuse_prefix_len(&self, full_prompt: &[u32]) -> usize { self.dense_reuse_start(full_prompt) }
+    fn set_prefix_reuse(&self, on: bool) { self.seq().cache_reuse.set(on) }
+    fn set_prefix_marks(&self, positions: &[usize]) { *self.seq().cache_marks.borrow_mut() = positions.to_vec() }
+    fn set_prefix_docs(&self, spans: &[(usize, usize)], serve: bool) {
+        *self.seq().cache_docs.borrow_mut() = spans.to_vec();
+        self.seq().docs_serve.set(serve);
+    }
+    fn prefix_cache_stats(&self) -> Option<ojas_core::PrefixCacheStats> {
+        self.uses_prefix_cache().then(|| DecoderGpu::prefix_cache_stats(self))
+    }
+    fn save_prefix_cache(&self) { self.sess.cache.borrow_mut().flush() }
+    fn warm_prefix(&self, tokens: &[u32], pin: bool) -> Option<usize> {
+        self.uses_prefix_cache().then(|| DecoderGpu::warm_prefix(self, tokens, pin))
+    }
+    fn unpin_prefix_cache(&self) { self.sess.cache.borrow_mut().unpin_all() }
     fn forward_id(&self, token: u32, pos: usize) -> u32 { DecoderGpu::forward_id(self, token, pos) }
     fn reset_session(&self) { DecoderGpu::reset_session(self) }
     fn has_mtp(&self) -> bool { DecoderGpu::has_mtp(self) }
@@ -439,6 +455,7 @@ impl<'a> ojas_core::Model for DecoderGpu<'a> {
     }
 
     fn forward_logits(&self, token: u32, pos: usize) -> Option<Vec<f32>> {
+        assert_eq!(self.cur_slot.get(), 0, "single-token decode runs on slot 0; other slots decode through decode_slots");
         Some(self.forward(token, pos))
     }
 
@@ -453,6 +470,21 @@ impl<'a> ojas_core::Model for DecoderGpu<'a> {
         Some(DecoderGpu::decode_slots(self, steps))
     }
     fn reset_slot(&self, s: usize) { DecoderGpu::reset_slot(self, s) }
+    fn with_slot(&self, s: usize, f: &mut dyn FnMut()) -> bool {
+        if s >= self.max_slots() { return false; }
+        DecoderGpu::with_slot(self, s, f);
+        true
+    }
+    fn slot_logits(&self, i: usize) -> Option<Vec<f32>> {
+        if !self.slots_ok() || i >= self.st.slots { return None; }
+        let vocab = self.arch.vocab;
+        Some(unsafe { std::slice::from_raw_parts((self.st.logits.contents() as *const f32).add(i * vocab), vocab) }.to_vec())
+    }
+    fn cached_prefix_len(&self, tokens: &[u32]) -> usize {
+        if !self.uses_prefix_cache() { return 0; }
+        let keys = super::prefix_cache::block_keys(tokens);
+        self.sess.cache.borrow().lookup(tokens, &keys, true).resume * super::prefix_cache::BLOCK
+    }
     fn prefill_slot(&self, s: usize, tokens: &[u32], base_pos: usize) -> bool {
         DecoderGpu::prefill_slot(self, s, tokens, base_pos)
     }

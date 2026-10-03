@@ -21,6 +21,28 @@
 /// [`EngineConfig::current`].
 static INSTALLED: std::sync::OnceLock<EngineConfig> = std::sync::OnceLock::new();
 
+/// When the prompt-prefix cache writes a block to its directory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrefixCacheSave {
+    /// On the block's second use, so one-off prompts cost no disk writes.
+    #[default]
+    Reused,
+    /// As soon as the block is cached.
+    Always,
+}
+
+impl std::str::FromStr for PrefixCacheSave {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "reused" => Ok(PrefixCacheSave::Reused),
+            "always" => Ok(PrefixCacheSave::Always),
+            _ => Err(format!("expected `reused` or `always`, got {s:?}")),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     /// OJAS_TOPK — MoE adaptive routing: keep only top-K experts (renormalized).
@@ -122,8 +144,48 @@ pub struct EngineConfig {
     /// fatter experts pays proportionally more, and the load log prints the figure
     /// so it can be lowered.
     pub ubatch: usize,
-    /// OJAS_SNAP — SSM snapshot ladder interval in tokens (≥256).
+    /// OJAS_SNAP — SSM snapshot ladder interval in tokens (≥256). The prefix cache
+    /// also keeps a snapshot at every multiple of it inside a long prompt.
     pub snap_interval: usize,
+    /// `--prefix-cache-gb` / OJAS_PREFIX_CACHE_GB — memory for cached prompt
+    /// prefixes. Unset: a sixteenth of physical memory, at most 4 GB. 0 disables.
+    pub prefix_cache_gb: Option<f64>,
+    /// `--doc-cache-gb` / OJAS_DOC_CACHE_GB — memory for the document cache, which
+    /// reuses a marked span of a prompt at any position, approximately. 0 (the
+    /// default) disables it.
+    pub doc_cache_gb: f64,
+    /// OJAS_DOC_RECOMPUTE — leading tokens of a reused document processed again in
+    /// their new context.
+    pub doc_recompute: usize,
+    /// OJAS_DOC_TAIL — share of a reused document processed again at its end, which
+    /// rebuilds the recurrent state. The default 0.3 measured 97% teacher-forced
+    /// agreement on the 4B; 0.1 serves more of the document from the cache at 94%.
+    pub doc_tail: f64,
+    /// `-np` / `--parallel` — sequence slots: how many requests the server runs at
+    /// once. Unset: `OJAS_SLOTS`, else 1.
+    pub parallel: Option<usize>,
+    /// `--prefix-cache-dir` / OJAS_PREFIX_CACHE_DIR — a directory that keeps cached
+    /// prompt prefixes across runs, and serves any process that opens it later.
+    pub prefix_cache_dir: Option<std::path::PathBuf>,
+    /// `--prefix-cache-readonly` / OJAS_PREFIX_CACHE_READONLY — use the directory's
+    /// blocks without adding to or evicting from it.
+    pub prefix_cache_readonly: bool,
+    /// `--prefix-cache-disk-gb` / OJAS_PREFIX_CACHE_DISK_GB — the directory's size
+    /// cap. Unset: 20 GB, or a quarter of the volume's free space if that is less.
+    pub prefix_cache_disk_gb: Option<f64>,
+    /// `--prefix-cache-reserve-gb` / OJAS_PREFIX_CACHE_RESERVE_GB — free space the
+    /// directory always leaves on its volume (default 10 GB).
+    pub prefix_cache_reserve_gb: f64,
+    /// `--prefix-cache-save` / OJAS_PREFIX_CACHE_SAVE — when a block is written to
+    /// the directory.
+    pub prefix_cache_save: PrefixCacheSave,
+    /// `--prefix-cache-disk-int8` / OJAS_PREFIX_CACHE_DISK_INT8 — store KV in the
+    /// directory as Q8_0, about half the size. Restores from it are close to, not
+    /// identical with, processing the prompt, so they get their own subdirectory.
+    pub prefix_cache_disk_int8: bool,
+    /// `--prefix-cache-pin` / OJAS_PREFIX_CACHE_PIN — a file holding a system prompt
+    /// that the server processes and pins at startup.
+    pub prefix_cache_pin: Option<std::path::PathBuf>,
     /// OJAS_PREFILL_CB_LAYERS — layers per command buffer in a batched prefill, so no
     /// one command buffer holds the GPU long enough for macOS to end it ("Impacting
     /// Interactivity"); see `ojas-models` `decoder/pass.rs`. 0 keeps each chunk in
@@ -305,6 +367,18 @@ impl EngineConfig {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(16)
                 .max(1),
+            prefix_cache_gb: var("OJAS_PREFIX_CACHE_GB").ok().and_then(|v| v.parse().ok()),
+            parallel: None,
+            doc_cache_gb: var("OJAS_DOC_CACHE_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            doc_recompute: var("OJAS_DOC_RECOMPUTE").ok().and_then(|v| v.parse().ok()).unwrap_or(32),
+            doc_tail: var("OJAS_DOC_TAIL").ok().and_then(|v| v.parse().ok()).unwrap_or(0.3),
+            prefix_cache_dir: var("OJAS_PREFIX_CACHE_DIR").ok().filter(|v| !v.is_empty()).map(Into::into),
+            prefix_cache_readonly: flag("OJAS_PREFIX_CACHE_READONLY"),
+            prefix_cache_disk_gb: var("OJAS_PREFIX_CACHE_DISK_GB").ok().and_then(|v| v.parse().ok()),
+            prefix_cache_reserve_gb: var("OJAS_PREFIX_CACHE_RESERVE_GB").ok().and_then(|v| v.parse().ok()).unwrap_or(10.0),
+            prefix_cache_save: var("OJAS_PREFIX_CACHE_SAVE").ok().and_then(|v| v.parse().ok()).unwrap_or_default(),
+            prefix_cache_disk_int8: flag("OJAS_PREFIX_CACHE_DISK_INT8"),
+            prefix_cache_pin: var("OJAS_PREFIX_CACHE_PIN").ok().filter(|v| !v.is_empty()).map(Into::into),
             snap_interval: var("OJAS_SNAP")
                 .ok()
                 .and_then(|v| v.parse().ok())

@@ -40,6 +40,21 @@ impl Elem {
             Elem::Rule(_) => false,
         }
     }
+
+    /// Whether some code point in `lo..=hi` matches.
+    pub(crate) fn matches_any(&self, lo: u32, hi: u32) -> bool {
+        let Elem::Chars { ranges, negated } = self else { return false };
+        if !*negated { return ranges.iter().any(|&(a, b)| a <= hi && lo <= b); }
+        let mut sorted = ranges.clone();
+        sorted.sort_unstable();
+        let mut next = lo;
+        for (a, b) in sorted {
+            if a > next { return next <= hi; }
+            next = next.max(b.saturating_add(1));
+            if next > hi { return false; }
+        }
+        next <= hi
+    }
 }
 
 /// A compiled grammar: `rules[r][a]` is alternative `a` of rule `r`.

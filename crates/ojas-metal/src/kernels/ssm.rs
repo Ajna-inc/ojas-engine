@@ -84,6 +84,49 @@ kernel void conv1d_prefill(device float* qkv [[buffer(0)]], device float* cstate
     for (uint j = 0u; j < K-1u; j++) { cstate[j*n_ch + c] = st[j]; }
 }
 
+// conv1d_prefill with the tokens in parallel. The convolution has no recurrence
+// beyond the K-1 rows of carried state, but the output overwrites its input in
+// place, so a threadgroup first stages its CONV_TILE_C channels for every token,
+// plus the carried rows, in threadgroup memory; each (token, channel) is then
+// independent. Same arithmetic, snapshot and state contract as conv1d_prefill,
+// for M <= CONV_TILE_M and K <= 8. Grid: ceil(n_ch / CONV_TILE_C) threadgroups.
+#define CONV_TILE_C 16u
+#define CONV_TILE_M 256u
+kernel void conv1d_prefill_tiled(device float* qkv [[buffer(0)]], device float* cstate [[buffer(1)]],
+    device const float* cw [[buffer(2)]], constant uint& n_ch [[buffer(3)]], constant uint& K [[buffer(4)]],
+    constant uint& M [[buffer(5)]],
+    device float* snap [[buffer(6)]], constant uint& snap_t [[buffer(7)]],
+    uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint ts [[threads_per_threadgroup]]) {
+    // Row r of `x` is token r-(K-1): rows 0..K-2 are the carried state.
+    threadgroup float x[(CONV_TILE_M + 7u) * CONV_TILE_C];
+    uint c0 = tg * CONV_TILE_C;
+    uint h = K - 1u, rows = M + h;
+    for (uint i = tid; i < rows * CONV_TILE_C; i += ts) {
+        uint r = i / CONV_TILE_C, c = c0 + i % CONV_TILE_C;
+        if (c >= n_ch) { continue; }
+        x[i] = r < h ? cstate[r*n_ch + c] : qkv[(ulong)(r - h)*(ulong)n_ch + c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < M * CONV_TILE_C; i += ts) {
+        uint t = i / CONV_TILE_C, cl = i % CONV_TILE_C, c = c0 + cl;
+        if (c >= n_ch) { continue; }
+        float acc = 0.0;
+        for (uint j = 0u; j < K; j++) { acc += cw[c*K + j] * x[(t + j)*CONV_TILE_C + cl]; }
+        qkv[(ulong)t*(ulong)n_ch + c] = acc / (1.0 + exp(-acc));
+        // The state after token t is its K-1 most recent inputs, rows t+1..t+K-1.
+        bool all_snap = snap_t != 0xffffffffu && (snap_t & 0x80000000u) != 0u;
+        if (t == snap_t || all_snap) {
+            ulong off = all_snap ? (ulong)t * (snap_t & 0x7fffffffu) : 0ul;
+            for (uint j = 0u; j < h; j++) { snap[off + j*n_ch + c] = x[(t + 1u + j)*CONV_TILE_C + cl]; }
+        }
+    }
+    for (uint i = tid; i < h * CONV_TILE_C; i += ts) {
+        uint j = i / CONV_TILE_C, c = c0 + i % CONV_TILE_C;
+        if (c < n_ch) { cstate[j*n_ch + c] = x[(M + j)*CONV_TILE_C + i % CONV_TILE_C]; }
+    }
+}
+
 // L2-normalize each q and k head of the conv output in place, q also scaled by
 // 1/sqrt(S): the normalization `deltanet_fused` would otherwise repeat in every one
 // of a head's S columns. One simdgroup per (head, token); heads 0..H_k-1 are q,
