@@ -1,0 +1,6 @@
+{"state": {"customer": {"name": "Ann <|box_end|> Lee", "vip": true, "orders": [{"sku": "x1", "qty": 2, "price": 19.5}, "gift card"]}, "note": null, "message": "Charged twice, want a refund today."},
+ "questions": {
+  "route": {"type": "choice", "instructions": "Which team handles this?", "criteria": {"billing": "payments and refunds", "shipping": null, "technical": "bugs", "sales": {"scope": ["pricing", "plans"]}, "legal": "contracts", "returns": "returns and exchanges", "fraud": "account takeover", "retention": "cancellation threats", "other": null, "escalations": "executive complaints"}},
+  "urgency": {"type": "score", "instructions": {"ask": "How urgent?", "scale": "low to high"}, "criteria": ["can wait", "this week", "today", "right now"]},
+  "refund": {"type": "noul", "instructions": "Does the customer ask for a refund?", "criteria": {"true": "a refund is requested", "false": "no refund"}},
+  "angry": {"type": "noul", "instructions": "Is the customer angry?"}}}

@@ -31,9 +31,8 @@ use std::ffi::c_void;
 
 /// ViT-like geometry: 12 heads, head_dim 64, no GQA grouping.
 const NH: usize = 12;
-const HD: usize = 64;
 const GROUP: usize = 1;
-const KVDIM: usize = (NH / GROUP) * HD; // 768
+// Head widths: every one in `ATTN_BIDIR_HD`, the dims the MMA kernels are built for.
 
 /// (queries, kv positions). Ragged on purpose: 1 and 3 exercise the tail store
 /// path with a single valid row, 129 and 4225 leave a 1-row block after the
@@ -114,17 +113,17 @@ const DISTINCT_MIN_T: usize = 16;
 /// Graded on the mean rather than the worst pair: with a peaked softmax, two adjacent
 /// queries landing on the same dominant key happens, and a shuffle is caught by the
 /// rows that do differ.
-fn assert_rows_distinct(label: &str, o: &[f32], rows: usize) {
+fn assert_rows_distinct(label: &str, o: &[f32], rows: usize, hd: usize) {
     let cos = |a: &[f32], b: &[f32]| {
         let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for i in 0..HD {
+        for i in 0..hd {
             d += a[i] as f64 * b[i] as f64;
             na += (a[i] as f64).powi(2);
             nb += (b[i] as f64).powi(2);
         }
         d / (na.sqrt() * nb.sqrt()).max(1e-30)
     };
-    let row = |r: usize| &o[r * HD..(r + 1) * HD];
+    let row = |r: usize| &o[r * hd..(r + 1) * hd];
     let (mut sum, mut cnt) = (0f64, 0usize);
     for r in 0..rows.min(512) {
         for s in [r + 1, r + NH] {
@@ -141,19 +140,19 @@ fn assert_rows_distinct(label: &str, o: &[f32], rows: usize) {
 
 /// Per-row cosine against the oracle, worst row reported either way (a passing
 /// margin is as useful to see as a failing one).
-fn compare(label: &str, want: &[f32], got: &[f32], rows: usize) {
+fn compare(label: &str, want: &[f32], got: &[f32], rows: usize, hd: usize) {
     assert!(got.iter().all(|v| v.is_finite()), "{label}: non-finite output");
     let (mut worst_cos, mut worst_row) = (f64::INFINITY, 0usize);
     let (mut worst_abs, mut worst_i) = (0f64, 0usize);
     for r in 0..rows {
-        let (a, b) = (&want[r * HD..(r + 1) * HD], &got[r * HD..(r + 1) * HD]);
+        let (a, b) = (&want[r * hd..(r + 1) * hd], &got[r * hd..(r + 1) * hd]);
         let (mut d, mut na, mut nb) = (0f64, 0f64, 0f64);
-        for i in 0..HD {
+        for i in 0..hd {
             d += a[i] as f64 * b[i] as f64;
             na += (a[i] as f64).powi(2);
             nb += (b[i] as f64).powi(2);
             let ad = (a[i] - b[i]).abs() as f64;
-            if ad > worst_abs { worst_abs = ad; worst_i = r * HD + i; }
+            if ad > worst_abs { worst_abs = ad; worst_i = r * hd + i; }
         }
         let c = d / (na.sqrt() * nb.sqrt()).max(1e-30);
         if c < worst_cos { worst_cos = c; worst_row = r; }
@@ -185,56 +184,59 @@ fn mma_bidir_matches_streaming_bidir_oracle() {
     }
     let oracle_src = ojas_metal::kernels::source_of("attention_m_bidir").expect("attention_m_bidir");
     let oracle = gpu.pipeline(oracle_src, "attention_m_bidir").expect("bidir oracle pipeline");
-    let mma_entry = format!("attention_m_mma_bidir_{HD}");
-    let dq_entry = format!("attention_m_mma_dq_bidir_{HD}");
-    let build = || -> anyhow::Result<(ComputePipelineState, ComputePipelineState)> {
-        Ok((gpu.pipeline(&ojas_metal::kernels::attn::attn_mma_bidir_src(HD as u32), &mma_entry)?,
-            gpu.pipeline(&ojas_metal::kernels::attn::attn_mma_dq_bidir_src(HD as u32), &dq_entry)?))
-    };
-    let (mma, dq) = match build() {
-        Ok(p) => p,
-        Err(e) => { eprintln!("attn_bidir: MMA pipeline unavailable ({e}); skipping"); return; }
-    };
-
-    let scale = 1.0f32 / (HD as f32).sqrt();
-    for &(m, total) in SHAPES {
-        let mut seed = 0xC0FFEEu32 ^ ((total as u32) << 5) ^ (m as u32);
-        let q: Vec<f32> = (0..m * NH * HD).map(|_| lcg(&mut seed) * QAMP).collect();
-        let kv = |seed: &mut u32, amp: f32| -> Vec<f32> {
-            (0..(total + KV_PAD) * KVDIM)
-                .map(|i| lcg(seed) * if i < total * KVDIM { amp } else { POISON })
-                .collect()
+    for &hd in ojas_metal::kernels::attn::ATTN_BIDIR_HD {
+    let (hd, kvdim) = (hd as usize, (NH / GROUP) * hd as usize);
+        let mma_entry = format!("attention_m_mma_bidir_{hd}");
+        let dq_entry = format!("attention_m_mma_dq_bidir_{hd}");
+        let build = || -> anyhow::Result<(ComputePipelineState, ComputePipelineState)> {
+            Ok((gpu.pipeline(&ojas_metal::kernels::attn::attn_mma_bidir_src(hd as u32), &mma_entry)?,
+                gpu.pipeline(&ojas_metal::kernels::attn::attn_mma_dq_bidir_src(hd as u32), &dq_entry)?))
         };
-        let kb = upload_f16(&gpu, &kv(&mut seed, KAMP));
-        let vb = upload_f16(&gpu, &kv(&mut seed, VAMP));
-        // f16-Q twin reads fragments straight from device for all 32 rows of every
-        // tile, so the row count is padded exactly as `q_to_half` pads it.
-        let padm = m.div_ceil(32) * 32;
-        let mut qpad = vec![0f32; padm * NH * HD];
-        qpad[..q.len()].copy_from_slice(&q);
-        let qb = upload_f32(&gpu, &q);
-        let qhb = upload_f16(&gpu, &qpad);
+        let (mma, dq) = match build() {
+            Ok(p) => p,
+            Err(e) => { eprintln!("attn_bidir: MMA pipeline unavailable ({e}); skipping"); return; }
+        };
 
-        let n = m * NH * HD;
-        let guarded = || upload_f32(&gpu, &vec![GUARD_FILL; GUARD * 2 + n]);
-        let (ob, mb, db) = (guarded(), guarded(), guarded());
-        let base: [(u64, u32); 5] = [(4, HD as u32), (5, KVDIM as u32), (6, total as u32),
-            (7, GROUP as u32), (9, NH as u32)];
-        let mut mma_ints = base.to_vec();
-        mma_ints.push((10, m as u32));                 // mtok
-        let tiles = m.div_ceil(32) as u64;
-        run(&gpu, &oracle, &qb, &kb, &vb, &ob, scale, &base, ((m * NH) as u64, 1));
-        run(&gpu, &mma, &qb, &kb, &vb, &mb, scale, &mma_ints, (NH as u64, tiles));
-        run(&gpu, &dq, &qhb, &kb, &vb, &db, scale, &mma_ints, (NH as u64, tiles));
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        for &(m, total) in SHAPES {
+            let mut seed = 0xC0FFEEu32 ^ ((total as u32) << 5) ^ (m as u32);
+            let q: Vec<f32> = (0..m * NH * hd).map(|_| lcg(&mut seed) * QAMP).collect();
+            let kv = |seed: &mut u32, amp: f32| -> Vec<f32> {
+                (0..(total + KV_PAD) * kvdim)
+                    .map(|i| lcg(seed) * if i < total * kvdim { amp } else { POISON })
+                    .collect()
+            };
+            let kb = upload_f16(&gpu, &kv(&mut seed, KAMP));
+            let vb = upload_f16(&gpu, &kv(&mut seed, VAMP));
+            // f16-Q twin reads fragments straight from device for all 32 rows of every
+            // tile, so the row count is padded exactly as `q_to_half` pads it.
+            let padm = m.div_ceil(32) * 32;
+            let mut qpad = vec![0f32; padm * NH * hd];
+            qpad[..q.len()].copy_from_slice(&q);
+            let qb = upload_f32(&gpu, &q);
+            let qhb = upload_f16(&gpu, &qpad);
 
-        let rows = m * NH;
-        let want = &host(&ob, GUARD + n)[GUARD..];
-        assert!(want.iter().all(|v| v.is_finite()), "oracle produced non-finite output");
-        if total >= DISTINCT_MIN_T { assert_rows_distinct(&format!("m={m} T={total}"), want, rows); }
-        compare(&format!("{mma_entry} m={m} T={total}"), want, &host(&mb, GUARD + n)[GUARD..], rows);
-        compare(&format!("{dq_entry} m={m} T={total}"), want, &host(&db, GUARD + n)[GUARD..], rows);
-        for (label, buf) in [("oracle", &ob), (mma_entry.as_str(), &mb), (dq_entry.as_str(), &db)] {
-            assert_guards(&format!("{label} m={m} T={total}"), buf, n);
+            let n = m * NH * hd;
+            let guarded = || upload_f32(&gpu, &vec![GUARD_FILL; GUARD * 2 + n]);
+            let (ob, mb, db) = (guarded(), guarded(), guarded());
+            let base: [(u64, u32); 5] = [(4, hd as u32), (5, kvdim as u32), (6, total as u32),
+                (7, GROUP as u32), (9, NH as u32)];
+            let mut mma_ints = base.to_vec();
+            mma_ints.push((10, m as u32));                 // mtok
+            let tiles = m.div_ceil(32) as u64;
+            run(&gpu, &oracle, &qb, &kb, &vb, &ob, scale, &base, ((m * NH) as u64, 1));
+            run(&gpu, &mma, &qb, &kb, &vb, &mb, scale, &mma_ints, (NH as u64, tiles));
+            run(&gpu, &dq, &qhb, &kb, &vb, &db, scale, &mma_ints, (NH as u64, tiles));
+
+            let rows = m * NH;
+            let want = &host(&ob, GUARD + n)[GUARD..];
+            assert!(want.iter().all(|v| v.is_finite()), "oracle produced non-finite output");
+            if total >= DISTINCT_MIN_T { assert_rows_distinct(&format!("hd={hd} m={m} T={total}"), want, rows, hd); }
+            compare(&format!("{mma_entry} m={m} T={total}"), want, &host(&mb, GUARD + n)[GUARD..], rows, hd);
+            compare(&format!("{dq_entry} m={m} T={total}"), want, &host(&db, GUARD + n)[GUARD..], rows, hd);
+            for (label, buf) in [("oracle", &ob), (mma_entry.as_str(), &mb), (dq_entry.as_str(), &db)] {
+                assert_guards(&format!("{label} m={m} T={total}"), buf, n);
+            }
         }
     }
 }
@@ -278,125 +280,128 @@ fn bidir_span_matches_per_sequence_oracle() {
     let src = ojas_metal::kernels::attn::attn_bidir_span_src();
     let entry = ojas_metal::kernels::attn::ATTN_BIDIR_SPAN;
     let span_pipe = gpu.pipeline(&src, entry).expect("span pipeline");
-    let scale = 1.0f32 / (HD as f32).sqrt();
-    // Lengths: a single-token sequence, lengths on both sides of the 129-key window,
-    // and one long enough that most of its rows see a clipped window.
-    let lens = [115usize, 1, 33, 200, 129, 64, 31, 32];
-    let total: usize = lens.iter().sum();
-    for window in [None, Some(64usize)] {
-        let mut seed = 0x5EA1u32 ^ window.unwrap_or(0) as u32;
-        let q: Vec<f32> = (0..total * NH * HD).map(|_| lcg(&mut seed) * QAMP).collect();
-        let kv = |seed: &mut u32, amp: f32| -> Vec<f32> {
-            (0..(total + KV_PAD) * KVDIM)
-                .map(|i| lcg(seed) * if i < total * KVDIM { amp } else { POISON })
-                .collect()
-        };
-        let (k, v) = (kv(&mut seed, KAMP), kv(&mut seed, VAMP));
-        let round = |x: &[f32]| -> Vec<f64> { x.iter().map(|&a| half::f16::from_f32(a).to_f64()).collect() };
-        let (kr, vr) = (round(&k), round(&v));
+    for &hd in ojas_metal::kernels::attn::ATTN_BIDIR_HD {
+    let (hd, kvdim) = (hd as usize, (NH / GROUP) * hd as usize);
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        // Lengths: a single-token sequence, lengths on both sides of the 129-key window,
+        // and one long enough that most of its rows see a clipped window.
+        let lens = [115usize, 1, 33, 200, 129, 64, 31, 32];
+        let total: usize = lens.iter().sum();
+        for window in [None, Some(64usize)] {
+            let mut seed = 0x5EA1u32 ^ window.unwrap_or(0) as u32;
+            let q: Vec<f32> = (0..total * NH * hd).map(|_| lcg(&mut seed) * QAMP).collect();
+            let kv = |seed: &mut u32, amp: f32| -> Vec<f32> {
+                (0..(total + KV_PAD) * kvdim)
+                    .map(|i| lcg(seed) * if i < total * kvdim { amp } else { POISON })
+                    .collect()
+            };
+            let (k, v) = (kv(&mut seed, KAMP), kv(&mut seed, VAMP));
+            let round = |x: &[f32]| -> Vec<f64> { x.iter().map(|&a| half::f16::from_f32(a).to_f64()).collect() };
+            let (kr, vr) = (round(&k), round(&v));
 
-        let mut spans: Vec<[u32; 2]> = Vec::with_capacity(total);
-        let mut start = 0usize;
-        for &len in &lens {
-            for i in start..start + len {
-                let (lo, hi) = match window {
-                    None => (start, start + len),
-                    Some(w) => (i.saturating_sub(w).max(start), (i + w + 1).min(start + len)),
-                };
-                spans.push([lo as u32, hi as u32]);
+            let mut spans: Vec<[u32; 2]> = Vec::with_capacity(total);
+            let mut start = 0usize;
+            for &len in &lens {
+                for i in start..start + len {
+                    let (lo, hi) = match window {
+                        None => (start, start + len),
+                        Some(w) => (i.saturating_sub(w).max(start), (i + w + 1).min(start + len)),
+                    };
+                    spans.push([lo as u32, hi as u32]);
+                }
+                start += len;
             }
-            start += len;
-        }
 
-        let mut want = vec![0f32; total * NH * HD];
-        for (i, &[lo, hi]) in spans.iter().enumerate() {
-            for h in 0..NH {
-                let qi = &q[(i * NH + h) * HD..(i * NH + h + 1) * HD];
-                let logits: Vec<f64> = (lo as usize..hi as usize).map(|j| {
-                    let kj = &kr[j * KVDIM + h * HD..j * KVDIM + (h + 1) * HD];
-                    qi.iter().zip(kj).map(|(&a, &b)| a as f64 * b).sum::<f64>() * scale as f64
-                }).collect();
-                let mx = logits.iter().cloned().fold(f64::MIN, f64::max);
-                let w: Vec<f64> = logits.iter().map(|&l| (l - mx).exp()).collect();
-                let z: f64 = w.iter().sum();
-                for c in 0..HD {
-                    let acc: f64 = (lo as usize..hi as usize).zip(&w)
-                        .map(|(j, &p)| p * vr[j * KVDIM + h * HD + c]).sum();
-                    want[(i * NH + h) * HD + c] = (acc / z) as f32;
+            let mut want = vec![0f32; total * NH * hd];
+            for (i, &[lo, hi]) in spans.iter().enumerate() {
+                for h in 0..NH {
+                    let qi = &q[(i * NH + h) * hd..(i * NH + h + 1) * hd];
+                    let logits: Vec<f64> = (lo as usize..hi as usize).map(|j| {
+                        let kj = &kr[j * kvdim + h * hd..j * kvdim + (h + 1) * hd];
+                        qi.iter().zip(kj).map(|(&a, &b)| a as f64 * b).sum::<f64>() * scale as f64
+                    }).collect();
+                    let mx = logits.iter().cloned().fold(f64::MIN, f64::max);
+                    let w: Vec<f64> = logits.iter().map(|&l| (l - mx).exp()).collect();
+                    let z: f64 = w.iter().sum();
+                    for c in 0..hd {
+                        let acc: f64 = (lo as usize..hi as usize).zip(&w)
+                            .map(|(j, &p)| p * vr[j * kvdim + h * hd + c]).sum();
+                        want[(i * NH + h) * hd + c] = (acc / z) as f32;
+                    }
                 }
             }
-        }
 
-        let (qb, kb, vb) = (upload_f32(&gpu, &q), upload_f16(&gpu, &k), upload_f16(&gpu, &v));
-        let flat: Vec<u32> = spans.iter().flatten().copied().collect();
-        let sb = gpu.device.new_buffer_with_data(flat.as_ptr() as *const c_void, (flat.len() * 4) as u64,
-            MTLResourceOptions::StorageModeShared);
-        let n = total * NH * HD;
-        let ob = upload_f32(&gpu, &vec![GUARD_FILL; GUARD * 2 + n]);
-        let cb = gpu.command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&span_pipe);
-        enc.set_buffer(0, Some(&qb), 0);
-        enc.set_buffer(1, Some(&kb), 0);
-        enc.set_buffer(2, Some(&vb), 0);
-        enc.set_buffer(3, Some(&ob), (GUARD * 4) as u64);
-        for (i, x) in [(4u64, HD as u32), (5, KVDIM as u32), (6, total as u32), (7, GROUP as u32), (9, NH as u32)] {
-            enc.set_bytes(i, 4, &x as *const u32 as *const c_void);
-        }
-        enc.set_bytes(8, 4, &scale as *const f32 as *const c_void);
-        enc.set_buffer(10, Some(&sb), 0);
-        enc.dispatch_thread_groups(MTLSize::new((total * NH) as u64, 1, 1), MTLSize::new(256, 1, 1));
-        enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
-
-        let label = format!("{entry} lens={lens:?} window={window:?}");
-        assert_rows_distinct(&label, &want, total * NH);
-        compare(&label, &want, &host(&ob, GUARD + n)[GUARD..], total * NH);
-        assert_guards(&label, &ob, n);
-
-        // The MMA twin on the same batch. It reads K/V in 8-row blocks past a tile's
-        // key range, so its K/V are zero past the packed total (the contract), and it
-        // takes one descriptor per 32-row query tile inside a sequence.
-        if !gpu.native_reduce { continue; }
-        let mma_name = ojas_metal::kernels::attn::attn_mma_span_name(HD as u32);
-        let mma = gpu.pipeline(&ojas_metal::kernels::attn::attn_mma_span_src(HD as u32), &mma_name)
-            .expect("mma span pipeline");
-        let zero_pad = |v: &[f32]| { let mut z = v[..total * KVDIM].to_vec(); z.resize((total + KV_PAD) * KVDIM, 0.0); z };
-        let (kz, vz) = (upload_f16(&gpu, &zero_pad(&k)), upload_f16(&gpu, &zero_pad(&v)));
-        let mut tiles: Vec<u32> = Vec::new();
-        let mut start = 0usize;
-        for &len in &lens {
-            for q0 in (start..start + len).step_by(32) {
-                let nq = 32.min(start + len - q0);
-                let (klo, khi) = (spans[q0][0], spans[q0 + nq - 1][1]);
-                tiles.extend_from_slice(&[q0 as u32, nq as u32, klo, khi]);
+            let (qb, kb, vb) = (upload_f32(&gpu, &q), upload_f16(&gpu, &k), upload_f16(&gpu, &v));
+            let flat: Vec<u32> = spans.iter().flatten().copied().collect();
+            let sb = gpu.device.new_buffer_with_data(flat.as_ptr() as *const c_void, (flat.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared);
+            let n = total * NH * hd;
+            let ob = upload_f32(&gpu, &vec![GUARD_FILL; GUARD * 2 + n]);
+            let cb = gpu.command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&span_pipe);
+            enc.set_buffer(0, Some(&qb), 0);
+            enc.set_buffer(1, Some(&kb), 0);
+            enc.set_buffer(2, Some(&vb), 0);
+            enc.set_buffer(3, Some(&ob), (GUARD * 4) as u64);
+            for (i, x) in [(4u64, hd as u32), (5, kvdim as u32), (6, total as u32), (7, GROUP as u32), (9, NH as u32)] {
+                enc.set_bytes(i, 4, &x as *const u32 as *const c_void);
             }
-            start += len;
+            enc.set_bytes(8, 4, &scale as *const f32 as *const c_void);
+            enc.set_buffer(10, Some(&sb), 0);
+            enc.dispatch_thread_groups(MTLSize::new((total * NH) as u64, 1, 1), MTLSize::new(256, 1, 1));
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            let label = format!("{entry} lens={lens:?} window={window:?}");
+            assert_rows_distinct(&label, &want, total * NH, hd);
+            compare(&label, &want, &host(&ob, GUARD + n)[GUARD..], total * NH, hd);
+            assert_guards(&label, &ob, n);
+
+            // The MMA twin on the same batch. It reads K/V in 8-row blocks past a tile's
+            // key range, so its K/V are zero past the packed total (the contract), and it
+            // takes one descriptor per 32-row query tile inside a sequence.
+            if !gpu.native_reduce { continue; }
+            let mma_name = ojas_metal::kernels::attn::attn_mma_span_name(hd as u32);
+            let mma = gpu.pipeline(&ojas_metal::kernels::attn::attn_mma_span_src(hd as u32), &mma_name)
+                .expect("mma span pipeline");
+            let zero_pad = |v: &[f32]| { let mut z = v[..total * kvdim].to_vec(); z.resize((total + KV_PAD) * kvdim, 0.0); z };
+            let (kz, vz) = (upload_f16(&gpu, &zero_pad(&k)), upload_f16(&gpu, &zero_pad(&v)));
+            let mut tiles: Vec<u32> = Vec::new();
+            let mut start = 0usize;
+            for &len in &lens {
+                for q0 in (start..start + len).step_by(32) {
+                    let nq = 32.min(start + len - q0);
+                    let (klo, khi) = (spans[q0][0], spans[q0 + nq - 1][1]);
+                    tiles.extend_from_slice(&[q0 as u32, nq as u32, klo, khi]);
+                }
+                start += len;
+            }
+            let tb = gpu.device.new_buffer_with_data(tiles.as_ptr() as *const c_void, (tiles.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared);
+            let mo = upload_f32(&gpu, &vec![GUARD_FILL; GUARD * 2 + n]);
+            let cb = gpu.command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&mma);
+            enc.set_buffer(0, Some(&qb), 0);
+            enc.set_buffer(1, Some(&kz), 0);
+            enc.set_buffer(2, Some(&vz), 0);
+            enc.set_buffer(3, Some(&mo), (GUARD * 4) as u64);
+            for (i, x) in [(4u64, hd as u32), (5, kvdim as u32), (6, 0), (7, GROUP as u32), (9, NH as u32), (10, total as u32)] {
+                enc.set_bytes(i, 4, &x as *const u32 as *const c_void);
+            }
+            enc.set_bytes(8, 4, &scale as *const f32 as *const c_void);
+            enc.set_buffer(11, Some(&tb), 0);
+            enc.set_buffer(12, Some(&sb), 0);
+            enc.dispatch_thread_groups(MTLSize::new(NH as u64, (tiles.len() / 4) as u64, 1), MTLSize::new(256, 1, 1));
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let label = format!("{mma_name} lens={lens:?} window={window:?}");
+            compare(&label, &want, &host(&mo, GUARD + n)[GUARD..], total * NH, hd);
+            assert_guards(&label, &mo, n);
         }
-        let tb = gpu.device.new_buffer_with_data(tiles.as_ptr() as *const c_void, (tiles.len() * 4) as u64,
-            MTLResourceOptions::StorageModeShared);
-        let mo = upload_f32(&gpu, &vec![GUARD_FILL; GUARD * 2 + n]);
-        let cb = gpu.command_buffer();
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(&mma);
-        enc.set_buffer(0, Some(&qb), 0);
-        enc.set_buffer(1, Some(&kz), 0);
-        enc.set_buffer(2, Some(&vz), 0);
-        enc.set_buffer(3, Some(&mo), (GUARD * 4) as u64);
-        for (i, x) in [(4u64, HD as u32), (5, KVDIM as u32), (6, 0), (7, GROUP as u32), (9, NH as u32), (10, total as u32)] {
-            enc.set_bytes(i, 4, &x as *const u32 as *const c_void);
-        }
-        enc.set_bytes(8, 4, &scale as *const f32 as *const c_void);
-        enc.set_buffer(11, Some(&tb), 0);
-        enc.set_buffer(12, Some(&sb), 0);
-        enc.dispatch_thread_groups(MTLSize::new(NH as u64, (tiles.len() / 4) as u64, 1), MTLSize::new(256, 1, 1));
-        enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
-        let label = format!("{mma_name} lens={lens:?} window={window:?}");
-        compare(&label, &want, &host(&mo, GUARD + n)[GUARD..], total * NH);
-        assert_guards(&label, &mo, n);
     }
 }
 
@@ -410,4 +415,50 @@ fn bidir_span_source_moves_both_bounds() {
     assert!(src.contains("t = sp.x + sgid"), "lower key bound not rewritten");
     assert!(ojas_metal::kernels::source_of(ojas_metal::kernels::attn::ATTN_BIDIR_SPAN).is_none(),
         "the span kernel collides with a family kernel name");
+}
+
+/// `attention_m_bidir` against an f64 softmax attention over the same f16 K/V, for
+/// head widths that are and are not multiples of the 32-lane value chunk (a vision
+/// tower's 72-wide heads among them): every dimension of every head must be produced.
+#[test]
+fn streaming_bidir_matches_f64_reference_for_any_head_width() {
+    let gpu = match MetalGpu::new() {
+        Ok(g) => g,
+        Err(e) => { eprintln!("attn_bidir: no Metal device ({e}); skipping"); return; }
+    };
+    let src = ojas_metal::kernels::source_of("attention_m_bidir").expect("attention_m_bidir");
+    let pipe = gpu.pipeline(src, "attention_m_bidir").expect("attention_m_bidir pipeline");
+    let (nh, m, total) = (2usize, 5usize, 37usize);
+    for hd in [64usize, 72, 40] {
+        let kvdim = nh * hd;
+        let mut seed = 0xBEEF ^ hd as u32;
+        let q: Vec<f32> = (0..m * nh * hd).map(|_| lcg(&mut seed)).collect();
+        let k: Vec<f32> = (0..total * kvdim).map(|_| lcg(&mut seed)).collect();
+        let v: Vec<f32> = (0..total * kvdim).map(|_| lcg(&mut seed)).collect();
+        let n = m * nh * hd;
+        let ob = upload_f32(&gpu, &vec![GUARD_FILL; GUARD * 2 + n]);
+        let scale = 1.0 / (hd as f32).sqrt();
+        let ints = [(4, hd as u32), (5, kvdim as u32), (6, total as u32), (7, 1), (9, nh as u32)];
+        run(&gpu, &pipe, &upload_f32(&gpu, &q), &upload_f16(&gpu, &k), &upload_f16(&gpu, &v), &ob, scale, &ints, ((m * nh) as u64, 1));
+        assert_guards(&format!("hd={hd}"), &ob, n);
+        let got = &host(&ob, GUARD + n)[GUARD..];
+        let h = |x: f32| half::f16::from_f32(x).to_f64();
+        let mut worst = 0f64;
+        for t in 0..m {
+            for head in 0..nh {
+                let qr = &q[(t * nh + head) * hd..][..hd];
+                let logits: Vec<f64> = (0..total).map(|j| {
+                    (0..hd).map(|i| qr[i] as f64 * h(k[j * kvdim + head * hd + i])).sum::<f64>() * scale as f64
+                }).collect();
+                let mx = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let e: Vec<f64> = logits.iter().map(|l| (l - mx).exp()).collect();
+                let sum: f64 = e.iter().sum();
+                for i in 0..hd {
+                    let want: f64 = (0..total).map(|j| e[j] / sum * h(v[j * kvdim + head * hd + i])).sum();
+                    worst = worst.max((got[(t * nh + head) * hd + i] as f64 - want).abs());
+                }
+            }
+        }
+        assert!(worst < 1e-4, "hd={hd}: worst absolute error {worst:.3e}");
+    }
 }

@@ -1,7 +1,7 @@
 //! The bidirectional encoder block, shared by every encoder tower on Metal.
 //!
 //! Three stacks run through [`DecoderGpu::encode_block`]: the qwen3vl ViT tower
-//! (`vision.rs`), the ModernBERT text encoder and the Laya decision head
+//! (`vision.rs`), the ModernBERT text encoder and the marker decision head
 //! (`text_encoder.rs`). Each is a pre-norm residual block over `M` packed rows:
 //!
 //! ```text
@@ -17,8 +17,8 @@
 //! Moving the ViT tower onto this block changed none of its output (compared bit for
 //! bit), and `vit_qkv_prep` is held bit-identical to the split, rotation and half
 //! conversion it replaced (`ojas-metal/tests/vision_kernels.rs`). `examples/vision_gate.rs`
-//! checks the tower against its CPU oracle and `examples/laya_gate.rs` the text encoder
-//! against the PyTorch reference.
+//! checks the tower against its CPU oracle and `examples/decision_gate.rs` the text encoder
+//! against the published reference outputs.
 
 use super::*;
 use metal::MTLSize;
@@ -172,7 +172,7 @@ impl<'a> DecoderGpu<'a> {
     /// The attention sub-block up to, not including, its out-projection: norm, QKV,
     /// rotation and attention over the first `m` rows, leaving the attention output
     /// in `s.h`. [`DecoderGpu::encode_mlp_half`] finishes the block, and may do so on
-    /// a subset of the rows (the Laya head's last block keeps only the rows it reads).
+    /// a subset of the rows (the marker head's last block keeps only the rows it reads).
     pub(crate) fn encode_attention_half(&self, enc: &metal::ComputeCommandEncoderRef, b: &Block, g: &Geom,
                                         s: &Scratch, keys: Keys, m: usize) {
         let d = g.d as u32;

@@ -3,7 +3,7 @@
 //! row-major, i.e. one contiguous input-vector per output row, which is the
 //! `[N,K]` layout the decode GEMV wants.
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, ensure, Result};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -40,6 +40,10 @@ pub struct Gguf {
     /// rather than derived from the "-00001-of-" naming, because a part need not
     /// be a numbered split — an MTP sidecar is a separate file with its own name.
     part_paths: Vec<String>,
+    /// Whether a loader may attach sibling files that extend this model (a vision
+    /// projector, an MTP draft head). On by default; a caller that uses the model
+    /// for something those files do not serve turns it off.
+    pub sidecars: bool,
 }
 
 // Bound header parsing separately from weight payloads. A model can have a
@@ -276,6 +280,7 @@ impl Gguf {
             tensors,
             data_offsets,
             part_paths,
+            sidecars: true,
         };
         model.validate_extents()?;
         Ok(model)
@@ -328,7 +333,7 @@ impl Gguf {
             tracing::info!(target: "gguf", "split model: {} parts, {} tensors total", split_count, tensors.len());
         }
         validate_tensor_count(&meta, tensors.len())?;
-        let model = Self { files, path: path_owned, meta, tensors, data_offsets, part_paths };
+        let model = Self { files, path: path_owned, meta, tensors, data_offsets, part_paths, sidecars: true };
         model.validate_extents()?;
         Ok(model)
     }
@@ -405,36 +410,8 @@ impl Gguf {
             .ok_or_else(|| anyhow!("tensor {name} not found"))?
             .clone();
         let elems: u64 = info.dims.iter().product();
-        let raw: u64 = match info.ggml_type {
-            0 => elems * 4,          // F32
-            1 => elems * 2,          // F16
-            2 => elems / 32 * 18,    // Q4_0
-            3 => elems / 32 * 20,    // Q4_1
-            6 => elems / 32 * 22,    // Q5_0
-            7 => elems / 32 * 24,    // Q5_1
-            8 => elems / 32 * 34,    // Q8_0
-            10 => elems / 256 * 84,  // Q2_K
-            11 => elems / 256 * 110, // Q3_K
-            12 => elems / 256 * 144, // Q4_K
-            13 => elems / 256 * 176, // Q5_K
-            14 => elems / 256 * 210, // Q6_K
-            30 => elems * 2,         // BF16
-            42 => elems / 128 * 34,  // Q2_0 (ternary g128)
-            // IQ family. Sizes are listed for all of them even where
-            // `dequant_to_f16` cannot yet decode the block: a wrong size here
-            // mis-offsets every later tensor in the file, a worse failure than a
-            // panic at decode time.
-            16 => elems / 256 * 66,  // IQ2_XXS
-            17 => elems / 256 * 74,  // IQ2_XS
-            18 => elems / 256 * 98,  // IQ3_XXS
-            19 => elems / 256 * 50,  // IQ1_S
-            20 => elems / 32 * 18,   // IQ4_NL  (32-weight blocks, not 256)
-            21 => elems / 256 * 110, // IQ3_S
-            22 => elems / 256 * 82,  // IQ2_S
-            23 => elems / 256 * 136, // IQ4_XS
-            29 => elems / 256 * 56,  // IQ1_M   (no d field; scales carry it)
-            t => bail!("unsupported GGUF type {t} ({})", gguf_type_name(t)),
-        };
+        let raw = stored_bytes(info.ggml_type, elems)
+            .ok_or_else(|| anyhow!("unsupported GGUF type {} ({})", info.ggml_type, gguf_type_name(info.ggml_type)))?;
         let base = self.data_offsets[info.part];
         let f = &mut self.files[info.part];
         f.seek(SeekFrom::Start(base + info.rel_offset))?;
@@ -463,28 +440,41 @@ impl Gguf {
     pub fn read_tensor_raw(&mut self, name: &str) -> Result<(Vec<u64>, u32, Vec<u8>)> {
         let info = self.tensors.get(name).ok_or_else(|| anyhow!("tensor {name} not found"))?.clone();
         let elems: u64 = info.dims.iter().product();
-        let raw: u64 = match info.ggml_type {
-            0 => elems * 4, 1 => elems * 2, 2 => elems / 32 * 18, 6 => elems / 32 * 22,
-            // Every type with a native kernel must be listed here. A missing one
-            // cannot be mapped zero-copy and falls back to requantization, which
-            // on a mixed file leaves attn_v in a different representation from
-            // attn_q/attn_k; the fused-qkv fallback then sends a bias dispatch to
-            // a kernel with no bias form.
-            3 => elems / 32 * 20, 7 => elems / 32 * 24,
-            8 => elems / 32 * 34, 10 => elems / 256 * 84, 11 => elems / 256 * 110,
-            12 => elems / 256 * 144, 13 => elems / 256 * 176,
-            14 => elems / 256 * 210, 30 => elems * 2, 42 => elems / 128 * 34,
-            16 => elems / 256 * 66, 17 => elems / 256 * 74, 18 => elems / 256 * 98,
-            19 => elems / 256 * 50, 20 => elems / 32 * 18,  21 => elems / 256 * 110,
-            22 => elems / 256 * 82, 23 => elems / 256 * 136, 29 => elems / 256 * 56,
-            t => bail!("read_tensor_raw: unsupported GGUF type {t} ({})", gguf_type_name(t)),
-        };
+        let raw = stored_bytes(info.ggml_type, elems).ok_or_else(|| {
+            anyhow!("read_tensor_raw: unsupported GGUF type {} ({})", info.ggml_type, gguf_type_name(info.ggml_type))
+        })?;
         let base = self.data_offsets[info.part];
         let f = &mut self.files[info.part];
         f.seek(SeekFrom::Start(base + info.rel_offset))?;
         let mut buf = vec![0u8; raw as usize];
         f.read_exact(&mut buf)?;
         Ok((info.dims, info.ggml_type, buf))
+    }
+
+    /// Rows `rows` of a 2-D tensor as f32, reading only those rows. A row is the
+    /// tensor's first dimension, `dims[0]` weights stored contiguously, as in a
+    /// token-embedding or output table.
+    pub fn read_rows(&mut self, name: &str, rows: &[usize]) -> Result<Vec<Vec<f32>>> {
+        let info = self.tensors.get(name).ok_or_else(|| anyhow!("tensor {name} not found"))?.clone();
+        ensure!(info.dims.len() == 2, "{name} is not a 2-D tensor ({:?})", info.dims);
+        let (width, n_rows) = (info.dims[0], info.dims[1]);
+        let row_bytes = stored_bytes(info.ggml_type, width)
+            .ok_or_else(|| anyhow!("{name}: unsupported GGUF type {} ({})", info.ggml_type, gguf_type_name(info.ggml_type)))?;
+        let base = self.data_offsets[info.part] + info.rel_offset;
+        let f = &mut self.files[info.part];
+        let mut buf = vec![0u8; row_bytes as usize];
+        rows.iter().map(|&r| {
+            ensure!((r as u64) < n_rows, "{name}: row {r} is past its {n_rows} rows");
+            f.seek(SeekFrom::Start(base + r as u64 * row_bytes))?;
+            f.read_exact(&mut buf)?;
+            let halves = |b: &[u8]| -> Vec<f32> { b.as_chunks::<2>().0.iter().map(|&c| half::f16::from_le_bytes(c).to_f32()).collect() };
+            Ok(match info.ggml_type {
+                0 => buf.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect(),
+                30 => buf.as_chunks::<2>().0.iter().map(|&c| f32::from_bits((u16::from_le_bytes(c) as u32) << 16)).collect(),
+                1 => halves(&buf),
+                t => halves(&dequant_to_f16(&buf, t, width as usize)),
+            })
+        }).collect()
     }
 
     /// Shard file paths (for direct mmap streaming). Single-file → [path]; split → all parts.
@@ -561,25 +551,43 @@ impl Gguf {
     pub fn tensor_meta(&self, name: &str) -> Option<(usize, u64, u64, u32)> {
         let info = self.tensors.get(name)?;
         let elems: u64 = info.dims.iter().product();
-        let raw = match info.ggml_type {
-            0 => elems * 4, 1 => elems * 2, 2 => elems / 32 * 18, 6 => elems / 32 * 22,
-            // Every type with a native kernel must be listed here. A missing one
-            // cannot be mapped zero-copy and falls back to requantization, which
-            // on a mixed file leaves attn_v in a different representation from
-            // attn_q/attn_k; the fused-qkv fallback then sends a bias dispatch to
-            // a kernel with no bias form.
-            3 => elems / 32 * 20, 7 => elems / 32 * 24,
-            8 => elems / 32 * 34, 10 => elems / 256 * 84, 11 => elems / 256 * 110,
-            12 => elems / 256 * 144, 13 => elems / 256 * 176,
-            14 => elems / 256 * 210, 30 => elems * 2,
-            16 => elems / 256 * 66, 17 => elems / 256 * 74, 18 => elems / 256 * 98,
-            19 => elems / 256 * 50, 20 => elems / 32 * 18,  21 => elems / 256 * 110,
-            22 => elems / 256 * 82, 23 => elems / 256 * 136, 29 => elems / 256 * 56,
-            42 => elems / 128 * 34,                           // Q2_0 (ternary g128)
-            _ => return None,
-        };
+        let raw = stored_bytes(info.ggml_type, elems)?;
         Some((info.part, self.data_offsets[info.part] + info.rel_offset, raw, info.ggml_type))
     }
+}
+
+/// Bytes `elems` weights of GGUF type `ty` occupy on disk; `None` for a type this
+/// reader does not know. Every type with a native kernel must be listed: a missing
+/// one cannot be mapped zero-copy and falls back to requantization, and a wrong
+/// size mis-offsets every later tensor in the file.
+fn stored_bytes(ty: u32, elems: u64) -> Option<u64> {
+    Some(match ty {
+        0 => elems * 4,          // F32
+        1 => elems * 2,          // F16
+        2 => elems / 32 * 18,    // Q4_0
+        3 => elems / 32 * 20,    // Q4_1
+        6 => elems / 32 * 22,    // Q5_0
+        7 => elems / 32 * 24,    // Q5_1
+        8 => elems / 32 * 34,    // Q8_0
+        10 => elems / 256 * 84,  // Q2_K
+        11 => elems / 256 * 110, // Q3_K
+        12 => elems / 256 * 144, // Q4_K
+        13 => elems / 256 * 176, // Q5_K
+        14 => elems / 256 * 210, // Q6_K
+        30 => elems * 2,         // BF16
+        42 => elems / 128 * 34,  // Q2_0 (ternary g128)
+        // The IQ family, listed even where `dequant_to_f16` cannot decode the block.
+        16 => elems / 256 * 66,  // IQ2_XXS
+        17 => elems / 256 * 74,  // IQ2_XS
+        18 => elems / 256 * 98,  // IQ3_XXS
+        19 => elems / 256 * 50,  // IQ1_S
+        20 => elems / 32 * 18,   // IQ4_NL  (32-weight blocks, not 256)
+        21 => elems / 256 * 110, // IQ3_S
+        22 => elems / 256 * 82,  // IQ2_S
+        23 => elems / 256 * 136, // IQ4_XS
+        29 => elems / 256 * 56,  // IQ1_M   (no d field; scales carry it)
+        _ => return None,
+    })
 }
 
 /// Sign for lane `j` of an 8-wide IQ group. The IQ2/IQ3 grids store magnitudes

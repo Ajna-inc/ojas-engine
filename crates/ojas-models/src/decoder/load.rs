@@ -220,15 +220,28 @@ impl VisionConfig {
 }
 
 impl TextEncoderConfig {
-    /// The `modern-bert.*` keys (llama.cpp's names for the architecture) and the
-    /// `laya.head.*` keys, both as `scripts/laya_convert.py` writes them. Shapes are checked against the tensors
-    /// here, so a truncated or foreign file fails with a key name rather than inside
-    /// graph construction.
+    /// The `<arch>.*` encoder keys, and the `<arch>.decision.*` keys of a decision
+    /// head over the last blocks. Shapes are checked against the tensors here, so a
+    /// truncated or foreign file fails with a key name rather than inside graph
+    /// construction.
     fn from_gguf(g: &Gguf) -> Result<TextEncoderConfig> {
         let arch = g.arch();
         let mu = |k: &str| g.meta_u32(&format!("{arch}.{k}"));
-        let (d, layers, n_head, ffn) = (mu("embedding_length").unwrap_or(0), mu("block_count").unwrap_or(0),
-            mu("attention.head_count").unwrap_or(0), mu("feed_forward_length").unwrap_or(0));
+        let total = mu("block_count").unwrap_or(0);
+        let head_blocks = mu("decision.block_count").unwrap_or(0);
+        anyhow::ensure!(head_blocks < total, "{arch}: decision.block_count {head_blocks} leaves no encoder blocks");
+        let layers = total - head_blocks;
+        // One width for every encoder block; the head's blocks have their own.
+        let ffn = match g.meta.get(&format!("{arch}.feed_forward_length")) {
+            Some(Meta::IntArr(per_block)) => {
+                let encoder = &per_block[..(layers as usize).min(per_block.len())];
+                anyhow::ensure!(!encoder.is_empty() && encoder.iter().all(|&f| f == encoder[0]),
+                    "{arch}: the encoder blocks do not share one feed_forward_length");
+                encoder[0] as u32
+            }
+            _ => mu("feed_forward_length").unwrap_or(0),
+        };
+        let (d, n_head) = (mu("embedding_length").unwrap_or(0), mu("attention.head_count").unwrap_or(0));
         anyhow::ensure!(d > 0 && layers > 0 && n_head > 0 && ffn > 0 && d % n_head == 0,
             "{arch}: incomplete encoder metadata (embd={d} blocks={layers} heads={n_head} ffn={ffn})");
         let hd = d / n_head;
@@ -253,29 +266,26 @@ impl TextEncoderConfig {
             let t = g.tensors.get(name).ok_or_else(|| anyhow::anyhow!("{arch}: missing {name}"))?;
             anyhow::ensure!(t.dims == want, "{arch}: {name} is {:?}, expected {want:?}", t.dims);
         }
-        let laya = match g.meta_u32("laya.head.block_count") {
-            None => None,
-            Some(blocks) => {
-                anyhow::ensure!(blocks >= 1, "laya head: laya.head.block_count is 0");
-                let head = LayaHeadConfig {
-                    blocks,
-                    n_head: g.meta_u32("laya.head.head_count").unwrap_or(n_head),
-                    ffn: g.meta_u32("laya.head.feed_forward_length").unwrap_or(4 * d),
-                    eps: g.meta_f32("laya.head.layer_norm_epsilon").unwrap_or(1e-5),
-                };
-                anyhow::ensure!(head.n_head > 0 && d % head.n_head == 0 && d / head.n_head == hd,
-                    "laya head: {} heads over d={d} gives a head_dim other than the encoder's {hd}", head.n_head);
-                for i in 0..blocks {
-                    let name = format!("laya.blk.{i}.ffn_up.weight");
-                    let t = g.tensors.get(&name).ok_or_else(|| anyhow::anyhow!("laya head: missing {name}"))?;
-                    anyhow::ensure!(t.dims == [d as u64, head.ffn as u64], "laya head: {name} is {:?}", t.dims);
-                }
-                Some(head)
+        let marker_head = if head_blocks == 0 {
+            None
+        } else {
+            let up = format!("blk.{layers}.ffn_up.weight");
+            let t = g.tensors.get(&up).ok_or_else(|| anyhow::anyhow!("decision head: missing {up}"))?;
+            anyhow::ensure!(t.dims.len() == 2 && t.dims[0] == d as u64, "decision head: {up} is {:?}", t.dims);
+            let head = MarkerHeadConfig { first: layers, blocks: head_blocks, n_head, ffn: t.dims[1] as u32, eps };
+            for i in layers..total {
+                let name = format!("blk.{i}.ffn_up.weight");
+                let t = g.tensors.get(&name).ok_or_else(|| anyhow::anyhow!("decision head: missing {name}"))?;
+                anyhow::ensure!(t.dims == [d as u64, head.ffn as u64], "decision head: {name} is {:?}", t.dims);
             }
+            for name in ["token_types.weight", "cls.norm.weight", "cls.weight", "cls.output.weight"] {
+                anyhow::ensure!(g.tensors.contains_key(name), "decision head: missing {name}");
+            }
+            Some(head)
         };
         Ok(TextEncoderConfig {
             d, layers, n_head, hd, ffn, eps, rope_base, rope_base_local,
-            window: sliding / 2, swa_pattern, max_positions, laya,
+            window: sliding / 2, swa_pattern, max_positions, marker_head,
         })
     }
 
@@ -291,14 +301,13 @@ impl TextEncoderConfig {
                 names.push(format!("blk.{i}.{s}"));
             }
         }
-        if let Some(h) = &self.laya {
-            for i in 0..h.blocks {
+        if let Some(h) = &self.marker_head {
+            for i in h.first..h.first + h.blocks {
                 for s in ["attn_norm", "attn_qkv", "attn_output", "ffn_norm", "ffn_up", "ffn_down"] {
-                    for kind in ["weight", "bias"] { names.push(format!("laya.blk.{i}.{s}.{kind}")); }
+                    for kind in ["weight", "bias"] { names.push(format!("blk.{i}.{s}.{kind}")); }
                 }
             }
-            for s in ["laya.type_emb.weight", "laya.scorer_norm.weight", "laya.scorer_norm.bias",
-                      "laya.scorer_fc.weight", "laya.scorer_fc.bias"] {
+            for s in ["token_types.weight", "cls.norm.weight", "cls.norm.bias", "cls.weight", "cls.bias"] {
                 names.push(s.into());
             }
         }
@@ -361,7 +370,21 @@ impl<'a> DecoderGpu<'a> {
         kv_gb: Option<u64>,
         expert_cache_gb: Option<f64>,
     ) -> Result<Self> {
-        let ecfg = EngineConfig::current(); // all OJAS_* knobs, read once
+        Self::load_with(gpu, g, max_seq, prec, kv_gb, expert_cache_gb, EngineConfig::current())
+    }
+
+    /// [`DecoderGpu::load`] with the engine knobs given rather than read from the
+    /// environment: for a host that fixes some of them itself, such as the number of
+    /// sequence slots (`parallel`).
+    pub fn load_with(
+        gpu: &'a MetalGpu,
+        g: &mut Gguf,
+        max_seq: usize,
+        prec: u8,
+        kv_gb: Option<u64>,
+        expert_cache_gb: Option<f64>,
+        ecfg: EngineConfig,
+    ) -> Result<Self> {
         let prec = if prec == PRECISION_AUTO {
             let (p, why) = Self::auto_precision(g)?;
             tracing::info!(target: "arch", "precision {p} ({why})");
@@ -463,9 +486,11 @@ impl<'a> DecoderGpu<'a> {
         //   token_embd / nextn.embed_tokens : row-gather `embed_*` kernels
         //   *_exps / *_shexp                : the MoE expert and shared-expert path
         //   ssm_conv1d                      : elementwise, never a gemv weight
+        //   v.* / mm.* (the vision tower)   : held in f16 at every precision
         let is_qwen4exp = g.arch() == "qwen4exp";
         let native_eligible = |name: &str| -> bool {
-            !name.contains("ssm_conv1d")
+            !ojas_formats::mmproj::keep_tensor(name)
+                && !name.contains("ssm_conv1d")
                 && !name.contains("token_embd")
                 && !name.contains("embed_tokens")
                 && !name.contains("_exps.")
@@ -494,7 +519,8 @@ impl<'a> DecoderGpu<'a> {
             .checked_sub(nx).ok_or_else(|| anyhow::anyhow!("NextN layer count exceeds block count"))?;
         let mut mtp_sidecar = false;
         if !g.tensors.contains_key(&format!("blk.{nl}.nextn.eh_proj.weight")) {
-            let sidecar = ojas_formats::mtp::discover(std::path::Path::new(&g.path), ecfg.mtp.as_deref())?;
+            let sidecar = if !g.sidecars { None }
+                          else { ojas_formats::mtp::discover(std::path::Path::new(&g.path), ecfg.mtp.as_deref())? };
             if let Some(sc) = sidecar {
                 let path = sc.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF8 MTP path"))?;
                 let draft = Gguf::open(path)?;
@@ -511,7 +537,9 @@ impl<'a> DecoderGpu<'a> {
         // (~20 clip.* keys describing the ViT), so this needs attach_with_meta — plain
         // attach merges tensors only and drops the incoming metadata. "Main model wins"
         // holds for KV as it does for tensor names.
-        if let Some(sc) = ojas_formats::mmproj::discover(std::path::Path::new(&g.path), ecfg.mmproj.as_deref())? {
+        let sidecar = if !g.sidecars { None }
+                      else { ojas_formats::mmproj::discover(std::path::Path::new(&g.path), ecfg.mmproj.as_deref())? };
+        if let Some(sc) = sidecar {
             let path = sc.to_str().ok_or_else(|| anyhow::anyhow!("non-UTF8 mmproj path"))?;
             let side = Gguf::open(path)?;
             ojas_formats::mmproj::validate(g, &side)?;
@@ -603,7 +631,7 @@ impl<'a> DecoderGpu<'a> {
         tracing::info!(target: "arch", "{arch}: d={d} L={n_layers} heads={n_head}/{n_kv} hd={hd} ffn={ffn} \
                    | qkv_bias={qkv_bias} qk_norm={qk_norm} tied_lm_head={tied_embed} sandwich={sandwich} gelu={is_gemma}");
         // The note is about decoders. `modern-bert` is an encoder, gated by
-        // `examples/laya_gate.rs`.
+        // `examples/decision_gate.rs`.
         if !matches!(arch.as_str(), "qwen2" | "qwen3" | "llama" | "gemma3" | "modern-bert") {
             tracing::warn!(target: "arch", "NOTE: arch '{arch}' partially supported; validation is model-, quantization-, and execution-path-specific");
         }
@@ -1623,20 +1651,18 @@ impl<'a> DecoderGpu<'a> {
         // choice.
         if let Some(v) = &vision {
             let k = (v.channels * v.patch * v.patch) as usize;
-            let (_d0, t0, b0) = g.read_tensor("v.patch_embd.weight")?;
-            let (_d1, t1, b1) = g.read_tensor("v.patch_embd.weight.1")?;
-            anyhow::ensure!(t0 == 1 && t1 == 1 && b0.len() == b1.len(),
-                "v.patch_embd.weight/.1 are not a matching f16 pair (types {t0}/{t1}, {} vs {} bytes)",
-                b0.len(), b1.len());
-            anyhow::ensure!(b0.len() == 2 * k * v.d as usize,
-                "v.patch_embd.weight is {} bytes, expected {} ({k} x {})", b0.len(), 2 * k * v.d as usize, v.d);
-            let rd = |b: &[u8], i: usize| half::f16::from_bits(u16::from_le_bytes([b[2 * i], b[2 * i + 1]])).to_f32();
-            let mut folded = vec![0u8; b0.len()];
-            for i in 0..k * v.d as usize {
-                let bits = half::f16::from_f32(rd(&b0, i) + rd(&b1, i)).to_bits().to_le_bytes();
-                folded[2 * i] = bits[0];
-                folded[2 * i + 1] = bits[1];
-            }
+            // `read_tensor` hands back f32 or f16; the two halves may be stored either way.
+            let mut values = |name: &str| -> Result<Vec<f32>> {
+                let (_, ty, b) = g.read_tensor(name)?;
+                Ok(match ty {
+                    0 => b.as_chunks::<4>().0.iter().map(|&c| f32::from_le_bytes(c)).collect(),
+                    _ => b.as_chunks::<2>().0.iter().map(|&c| half::f16::from_le_bytes(c).to_f32()).collect(),
+                })
+            };
+            let (w0, w1) = (values("v.patch_embd.weight")?, values("v.patch_embd.weight.1")?);
+            anyhow::ensure!(w0.len() == k * v.d as usize && w1.len() == w0.len(),
+                "v.patch_embd.weight/.1 hold {} and {} values, expected {} ({k} x {})", w0.len(), w1.len(), k * v.d as usize, v.d);
+            let folded: Vec<u8> = w0.iter().zip(&w1).flat_map(|(a, b)| half::f16::from_f32(a + b).to_le_bytes()).collect();
             let n = v.d as usize;
             // f16, as the upload loop keeps every other tower weight.
             w16.insert(VIT_PATCH_FOLD.into(), newbuf(&folded));
@@ -1970,7 +1996,9 @@ impl<'a> DecoderGpu<'a> {
             let mmrows = vpad(p / 4);
             (
                 (v.channels * v.patch * v.patch) as usize * p as usize, // vimg: pixels of `p` patches
-                rows * k,                                              // vrows
+                // vrows: the patch rows, and later the projector's activated hidden
+                // rows, which outnumber them when the tower is wider than a patch.
+                (rows * k).max(mmrows * v.mm_hidden as usize),
                 rows * dv,                                             // vx / vh / vq
                 rows * 3 * dv,                                         // vqkv
                 ((rows + 32) * dv + 1) / 2,                            // vkh / vvh: half + 32 pad rows
@@ -2190,7 +2218,7 @@ impl<'a> DecoderGpu<'a> {
             // scratch sized for up to MAXM tokens (batched speculative forward)
             st: StateArena {
                 x: buf(gpu, d * MAXM), h: buf(gpu, d * MAXM), q: buf(gpu, max_qdim * MAXM), k: buf(gpu, max_kvdim * MAXM),
-                v: buf(gpu, max_kvdim * MAXM), attn: buf(gpu, max_qdim.max(d) * MAXM), tmp: buf(gpu, d.max(vocab)), tokbuf: buf(gpu, MAXM), xh: buf(gpu, MAXM * ffn.max(d) / 2 + 1), qh: buf(gpu, MAXM * max_qdim / 2 + 1), skbuf: buf(gpu, 8 * MAXM * d), mpos: buf(gpu, 4 + 4 * MAXM),
+                v: buf(gpu, max_kvdim * MAXM), attn: buf(gpu, max_qdim.max(d) * MAXM), tmp: buf(gpu, d.max(vocab)), tokbuf: buf(gpu, MAXM), xh: buf(gpu, MAXM * ffn.max(d) / 2 + 1), qh: buf(gpu, MAXM * max_qdim / 2 + 1), skbuf: buf(gpu, 8 * MAXM * d), mpos: buf(gpu, 4 * MAX_SLOTS + 4 * MAXM),
                 gate: buf(gpu, ffn * MAXM), up: buf(gpu, ffn * MAXM), act: buf(gpu, ffn * MAXM), ones,
                 logits: buf(gpu, vocab.max(1) * MAXM), kcache, vcache, mla_lat, conv_state, ssm_state,
                 // sized for both uses: SSM conv channels and the attention layers' joint

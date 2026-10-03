@@ -356,6 +356,8 @@ pub(crate) struct StateArena {
     /// command buffer is committed elsewhere, and `set_unretained_command_buffers(true)`
     /// means a temporary Buffer would not be retained by it. Written host-side like
     /// `st.x`; read only when the rope mode is non-zero, so text models never touch it.
+    /// A multi-sequence chunk writes one descriptor per sequence back to back, hence
+    /// the room for `MAX_SLOTS` headers.
     pub(crate) mpos: metal::Buffer,
     pub(crate) gate: metal::Buffer,
     pub(crate) up: metal::Buffer,
@@ -917,8 +919,8 @@ pub(crate) struct TextEncoderConfig {
     /// rule); 0 means every layer is global.
     pub(crate) swa_pattern: u32,
     pub(crate) max_positions: u32,
-    /// The Laya decision head, when the file carries one.
-    pub(crate) laya: Option<LayaHeadConfig>,
+    /// The decision head read at marker tokens, when the file carries one.
+    pub(crate) marker_head: Option<MarkerHeadConfig>,
 }
 
 impl TextEncoderConfig {
@@ -927,10 +929,14 @@ impl TextEncoderConfig {
     }
 }
 
-/// Geometry of the Laya decision head appended by `scripts/laya_convert.py`: a stack
-/// of PyTorch `nn.TransformerEncoderLayer` blocks (pre-norm, ReLU, biased, no RoPE).
+/// Geometry of a decision head read at marker tokens: the encoder's last `blocks`
+/// blocks are PyTorch `nn.TransformerEncoderLayer` blocks (pre-norm, ReLU, biased,
+/// no RoPE) over the encoder output plus a per-question-type embedding
+/// (`token_types`), followed by a scorer (`cls.*`).
 #[derive(Clone, Debug)]
-pub(crate) struct LayaHeadConfig {
+pub(crate) struct MarkerHeadConfig {
+    /// Index of the first head block; the encoder blocks are the ones before it.
+    pub(crate) first: u32,
     pub(crate) blocks: u32,
     pub(crate) n_head: u32,
     pub(crate) ffn: u32,
@@ -1187,6 +1193,7 @@ mod span;
 mod spec;
 mod text_encoder;
 mod vision;
+pub(crate) use graph_chunk::{PromptRows, SlotPrefill};
 pub(crate) use vision::VIT_PATCH_FOLD;
 
 /// Env-gated attention-kernel logger (OJAS_ATTN_LOG=1). Prints each distinct

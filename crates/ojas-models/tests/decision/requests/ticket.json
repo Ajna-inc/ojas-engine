@@ -1,0 +1,5 @@
+{"state": "I was charged twice for my order last week and nobody has replied.",
+ "questions": {
+  "route": {"type": "choice", "instructions": "Which team should handle this?", "criteria": {"billing": "payments and refunds", "shipping": null, "technical": null}},
+  "urgency": {"type": "score", "instructions": "How urgent is this?", "criteria": ["can wait", "this week", "today", "right now"]},
+  "angry": {"type": "noul", "instructions": "Is the customer angry?"}}}

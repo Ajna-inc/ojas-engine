@@ -200,6 +200,19 @@ impl<'a> DecoderGpu<'a> {
         Some((width / p) * (height / p) / (m * m))
     }
 
+    /// The merged token grid `(columns, rows)` an image of this size encodes to;
+    /// [`DecoderGpu::encode_image`]'s rows are this grid in raster order.
+    pub fn vision_grid(&self, width: usize, height: usize) -> Option<(usize, usize)> {
+        let v = self.arch.vision?;
+        let (p, m) = (v.patch as usize, v.merge as usize);
+        Some((width / p / m, height / p / m))
+    }
+
+    /// The tower's patch side and spatial merge, which size its input.
+    pub fn vision_patch_merge(&self) -> Option<(usize, usize)> {
+        self.arch.vision.map(|v| (v.patch as usize, v.merge as usize))
+    }
+
     /// Projector output width (`clip.vision.projection_dim`), which is by
     /// construction the decoder's embedding width — `mmproj::validate` refuses a
     /// file where it is not.

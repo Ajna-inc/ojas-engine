@@ -52,6 +52,13 @@ pub struct Bpe {
     /// gemma-4, which does neither.
     g4_prefix: bool,
     g4_split: bool,
+    /// mmBERT (`tokenizer.ggml.pre = "mmbert"`): the text is first cut into runs of
+    /// newlines and runs of anything else; a newline run is one token when the
+    /// vocabulary has it, and every other run takes the metaspace prefix and split.
+    newline_runs: bool,
+    /// Special tokens that swallow the whitespace before them in raw text (mmBERT's
+    /// `<mask>`).
+    lstrip: std::collections::HashSet<usize>,
     enc: HashMap<u8, char>,
     dec: HashMap<char, u8>,
     specials: Vec<(String, usize)>, // (literal string, id), longest first
@@ -88,13 +95,15 @@ impl Bpe {
             _ => String::new(),
         };
         let spm = model == "llama" || model == "gemma" || model == "gemma2"; // score-based SPM
-        let g4 = model == "gemma4";                                          // rank-based SPM-style BPE
         let pre = match g.meta.get("tokenizer.ggml.pre") {
             Some(ojas_formats::gguf::Meta::Str(p)) => p.clone(),
             _ => String::new(),
         };
-        let g4_prefix = g4 && matches!(g.meta.get("tokenizer.ggml.add_space_prefix"), Some(ojas_formats::gguf::Meta::Bool(true)));
-        let g4_split = g4 && pre == "metaspace";
+        let newline_runs = pre == "mmbert";
+        let g4 = model == "gemma4" || newline_runs;                          // rank-based SPM-style BPE
+        let g4_prefix = newline_runs
+            || g4 && matches!(g.meta.get("tokenizer.ggml.add_space_prefix"), Some(ojas_formats::gguf::Meta::Bool(true)));
+        let g4_split = newline_runs || g4 && pre == "metaspace";
         let scores = g.float_arr("tokenizer.ggml.scores").cloned().unwrap_or_default();
         // special tokens: CONTROL(3) / USER_DEFINED(4) — matched atomically in raw text.
         let mut specials: Vec<(String, usize)> = Vec::new();
@@ -112,7 +121,11 @@ impl Bpe {
         specials.sort_by(|a, b| b.0.len().cmp(&a.0.len())); // longest first
         let (enc, dec) = byte_maps();
         let split = PreSplit::for_pre(&pre);
-        Bpe { tokens, vocab, ranks, scores, spm, g4, g4_prefix, g4_split, enc, dec, specials, split, literal, control }
+        let lstrip = if newline_runs { vocab.get("<mask>").copied().into_iter().collect() } else { Default::default() };
+        Bpe {
+            tokens, vocab, ranks, scores, spm, g4, g4_prefix, g4_split, newline_runs, lstrip, enc, dec, specials, split,
+            literal, control,
+        }
     }
 
     pub fn encode(&self, text: &str) -> Vec<usize> {
@@ -129,7 +142,8 @@ impl Bpe {
             }
             match hit {
                 Some((pos, len, id)) => {
-                    if pos > 0 { self.encode_seg(&rest[..pos], at_start, &mut ids); }
+                    let before = if self.lstrip.contains(&id) { rest[..pos].trim_end() } else { &rest[..pos] };
+                    if !before.is_empty() { self.encode_seg(before, at_start, &mut ids); }
                     ids.push(id);
                     rest = &rest[pos + len..];
                     at_start = false;
@@ -154,6 +168,7 @@ impl Bpe {
         // (first word has no ▁; internal spaces become ▁).
         let mut norm = String::new();
         for c in text.chars() { norm.push(if c == ' ' { '\u{2581}' } else { c }); }
+        if self.newline_runs { return self.encode_runs(&norm, out); }
         if self.g4_prefix && !norm.starts_with('\u{2581}') { norm.insert(0, '\u{2581}'); }
         if !self.g4_split { return self.bpe_g4_word(&norm, out); }
         // Split before every ▁, each word keeping its leading ▁ ("▁a▁▁b" → "▁a", "▁", "▁b").
@@ -162,6 +177,31 @@ impl Bpe {
             if c == '\u{2581}' && i > start { self.bpe_g4_word(&norm[start..i], out); start = i; }
         }
         if start < norm.len() { self.bpe_g4_word(&norm[start..], out); }
+    }
+
+    /// mmBERT: runs of newlines and runs of anything else, the latter prefixed and
+    /// split as metaspace words. `norm` has its spaces as `▁` already.
+    fn encode_runs(&self, norm: &str, out: &mut Vec<usize>) {
+        let mut rest = norm;
+        while let Some(first) = rest.chars().next() {
+            let newline = first == '\n';
+            let end = rest.find(|c: char| (c == '\n') != newline).unwrap_or(rest.len());
+            let run = &rest[..end];
+            rest = &rest[end..];
+            if newline {
+                match self.vocab.get(run) {
+                    Some(&id) => out.push(id),
+                    None => self.bpe_g4_word(run, out),
+                }
+                continue;
+            }
+            let word = if run.starts_with('\u{2581}') { run.to_string() } else { format!("\u{2581}{run}") };
+            let mut start = 0usize;
+            for (i, c) in word.char_indices() {
+                if c == '\u{2581}' && i > start { self.bpe_g4_word(&word[start..i], out); start = i; }
+            }
+            self.bpe_g4_word(&word[start..], out);
+        }
     }
 
     /// Rank-ordered merges over one span of characters, then `<0xXX>` byte fallback
@@ -807,9 +847,28 @@ mod metaspace_tests {
         let (enc, dec) = byte_maps();
         Bpe {
             tokens, vocab, ranks, scores: Vec::new(), spm: false, g4: true, g4_prefix: prefix, g4_split: split,
-            enc, dec, specials: Vec::new(), split: PreSplit::default(), literal: Default::default(),
-            control: Default::default(),
+            newline_runs: false, lstrip: Default::default(), enc, dec, specials: Vec::new(), split: PreSplit::default(),
+            literal: Default::default(), control: Default::default(),
         }
+    }
+
+    /// mmBERT's mode: newline runs whole, `<mask>` swallowing the space before it.
+    fn mmbert() -> Bpe {
+        let mut b = bpe(true, true);
+        for t in ["\n", "\n\n", "<mask>"] {
+            b.vocab.insert(t.to_string(), b.tokens.len());
+            b.tokens.push(t.to_string());
+        }
+        let mask = b.vocab["<mask>"];
+        (b.newline_runs, b.lstrip, b.specials) = (true, [mask].into(), vec![("<mask>".to_string(), mask)]);
+        b
+    }
+
+    #[test]
+    fn mmbert_keeps_newline_runs_whole_and_prefixes_each_line() {
+        let b = mmbert();
+        assert_eq!(pieces(&b, "a\n\nb"), ["▁a", "\n\n", "▁b"]);
+        assert_eq!(pieces(&b, "a  <mask>b"), ["▁a", "<mask>", "▁b"], "the mask strips the spaces before it");
     }
 
     fn pieces(b: &Bpe, text: &str) -> Vec<String> {

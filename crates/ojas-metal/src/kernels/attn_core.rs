@@ -277,7 +277,7 @@ kernel void attention_m_bidir(device const float* q [[buffer(0)]], device const 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float mi = -1e30, li = 0.0;
     float acc[16] = {0.0};
-    uint nch = hd/32u;
+    uint nch = (hd + 31u)/32u;            // any hd up to 512; lanes past hd idle
     for (uint t = sgid; t < seq; t += nsg) {
         device const half* kt = kc + (ulong)t*(ulong)kvdim + kvh*hd;
         float sv = 0.0;
@@ -286,11 +286,11 @@ kernel void attention_m_bidir(device const float* q [[buffer(0)]], device const 
         float mn = max(mi, sv); float corr = exp(mi - mn); float pw = exp(sv - mn);
         li = li*corr + pw;
         device const half* vt = vc + (ulong)t*(ulong)kvdim + kvh*hd;
-        for (uint c = 0u; c < nch; c++) { acc[c] = acc[c]*corr + pw*float(vt[lane + 32u*c]); }
+        for (uint c = 0u; c < nch; c++) { uint i = lane + 32u*c; if (i < hd) { acc[c] = acc[c]*corr + pw*float(vt[i]); } }
         mi = mn;
     }
     if (lane == 0u) { tm[sgid] = mi; tl[sgid] = li; }
-    for (uint c = 0u; c < nch; c++) { tacc[sgid*hd + lane + 32u*c] = acc[c]; }
+    for (uint c = 0u; c < nch; c++) { uint i = lane + 32u*c; if (i < hd) { tacc[sgid*hd + i] = acc[c]; } }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float gm = -1e30; for (uint j = 0u; j < nsg; j++) { gm = max(gm, tm[j]); }
     float gl = 0.0; for (uint j = 0u; j < nsg; j++) { gl += tl[j]*exp(tm[j] - gm); }
