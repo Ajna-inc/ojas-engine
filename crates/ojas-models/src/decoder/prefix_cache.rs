@@ -44,7 +44,8 @@ const INDEX_EVERY: u64 = 32;
 pub(crate) const ROOT: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// Chain `parent` with one block of tokens (FNV-1a). A collision cannot serve the
-/// wrong state: lookups also compare the stored tokens.
+/// wrong state: lookups compare the stored parent and tokens, and a block is only
+/// added to, or given a snapshot, under a key whose stored block matches.
 pub(crate) fn chain(parent: u64, tokens: &[u32]) -> u64 {
     let mut h = parent;
     for &t in tokens {
@@ -312,7 +313,9 @@ impl PrefixCache {
         s
     }
 
-    fn matches(&self, key: u64, parent: u64, tokens: &[u32]) -> bool {
+    /// Whether `key` holds the block `tokens` after `parent`, rather than another
+    /// block whose key collides with it.
+    pub(crate) fn matches(&self, key: u64, parent: u64, tokens: &[u32]) -> bool {
         self.blocks.get(&key).is_some_and(|b| b.parent == parent && *b.tokens == *tokens)
     }
 
@@ -409,18 +412,26 @@ impl PrefixCache {
         }
     }
 
+    /// Whether KV restored from the directory is bit-identical to processing:
+    /// true without a directory, false for one that stores KV as Q8_0.
+    pub(crate) fn disk_kv_exact(&self) -> bool { self.disk.as_ref().is_none_or(|d| d.io.exact_kv()) }
+
     pub(crate) fn contains(&self, key: u64) -> bool { self.blocks.contains_key(&key) }
 
     pub(crate) fn has_snapshot(&self, key: u64) -> bool {
         self.blocks.get(&key).is_some_and(|b| b.snapshot.is_some())
     }
 
-    /// Admit a block whose parent is cached (or the root). Returns false, storing
-    /// nothing, when the block cannot fit even after eviction.
+    /// Admit a block whose parent is cached (or the root). Returns whether the
+    /// cache now holds it: false, storing nothing, when it cannot fit even after
+    /// eviction, or when another block holds its key.
     pub(crate) fn insert(&mut self, parent: u64, tokens: &[u32], kv: Vec<u8>) -> bool {
         let key = chain(parent, tokens);
-        if self.blocks.contains_key(&key) || (parent != ROOT && !self.blocks.contains_key(&parent)) {
-            return self.blocks.contains_key(&key);
+        if self.blocks.contains_key(&key) {
+            return self.matches(key, parent, tokens);
+        }
+        if parent != ROOT && !self.blocks.contains_key(&parent) {
+            return false;
         }
         if !self.make_room(Tier::Ram, kv.len(), Some(parent)) { return false; }
         self.ram.used += kv.len();
@@ -740,6 +751,21 @@ mod tests {
         assert_eq!(ka[..2], kb[..2]);
         assert_ne!(ka[2], kb[2]);
         assert_eq!(block_keys(&a[..BLOCK + 10]).len(), 1, "partial blocks have no key");
+    }
+
+    #[test]
+    fn a_key_held_by_another_block_is_neither_matched_nor_overwritten() {
+        let mut c = PrefixCache::new(1 << 30);
+        let (a, b) = (prompt(BLOCK, 21), prompt(BLOCK, 22));
+        assert!(c.insert(ROOT, &b, vec![1; 8]));
+        // Plant `b` under `a`'s key, as a hash collision would.
+        let (ka, kb) = (chain(ROOT, &a), chain(ROOT, &b));
+        let planted = c.blocks.remove(&kb).unwrap();
+        c.blocks.insert(ka, planted);
+        assert!(!c.matches(ka, ROOT, &a));
+        assert!(!c.insert(ROOT, &a, vec![2; 8]), "the colliding block was taken for `a`");
+        assert_eq!(*c.blocks[&ka].tokens, *b, "the block under the key was replaced");
+        assert_eq!(c.lookup(&a, &block_keys(&a), false), Hit { blocks: 0, resume: 0 });
     }
 
     #[test]

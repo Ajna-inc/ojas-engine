@@ -183,7 +183,7 @@ fn resample_filter(x: f64, algo: ResizeAlgo) -> f64 {
                 if v == 0.0 {
                     return 1.0;
                 }
-                let pi_v = v * 3.141_592_653_589_793_2;
+                let pi_v = v * std::f64::consts::PI;
                 pi_v.sin() / pi_v
             }
             return sinc(x) * sinc(x / 3.0);

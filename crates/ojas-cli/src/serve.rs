@@ -22,11 +22,16 @@ use ojas_tokenize::Bpe;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Instant;
 
 mod completion;
 use completion::Ctx;
 
 const MAX_BODY: usize = 32 * 1024 * 1024;
+/// Most bytes of a request line and its headers.
+const MAX_HEAD: usize = 64 * 1024;
 
 pub(crate) struct Request {
     pub(crate) method: String,
@@ -35,11 +40,12 @@ pub(crate) struct Request {
 }
 
 /// Read one HTTP/1.1 request. `None` on a closed or unusable connection.
-fn read_request(stream: &mut BufReader<&TcpStream>) -> Result<Option<Request>> {
+fn read_request(stream: &mut impl BufRead) -> Result<Option<Request>> {
     let mut line = String::new();
     if stream.read_line(&mut line)? == 0 {
         return Ok(None);
     }
+    let mut head = line.len();
     let mut parts = line.split_whitespace();
     let (method, path) = match (parts.next(), parts.next()) {
         (Some(m), Some(p)) => (m.to_string(), p.to_string()),
@@ -51,6 +57,10 @@ fn read_request(stream: &mut BufReader<&TcpStream>) -> Result<Option<Request>> {
         let mut h = String::new();
         if stream.read_line(&mut h)? == 0 {
             return Ok(None);
+        }
+        head += h.len();
+        if head > MAX_HEAD {
+            anyhow::bail!("request headers exceed the {MAX_HEAD}-byte limit");
         }
         let h = h.trim_end();
         if h.is_empty() {
@@ -165,11 +175,18 @@ fn warm_ids(body: &Value, bpe: &Bpe, info: &ModelInfo, opts: &RunOpts) -> Result
     Ok(a[..ojas_tokenize::shared_prefix(&a, &b)].to_vec())
 }
 
+/// `ids`, when they fit in the context the model was loaded with.
+fn fits_context(ids: Vec<u32>, info: &ModelInfo) -> Result<Vec<u32>> {
+    anyhow::ensure!(ids.len() < info.context, "the prompt is {} tokens; the context holds {}", ids.len(), info.context);
+    Ok(ids)
+}
+
 /// Process and pin `--prefix-cache-pin`'s system prompt, when one is set.
 fn pin_startup_prompt(model: &dyn Model, bpe: &Bpe, info: &ModelInfo, opts: &RunOpts) -> Result<()> {
     let Some(path) = ojas_core::config::EngineConfig::current().prefix_cache_pin else { return Ok(()) };
     let system = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let ids = warm_ids(&json!({"messages": [{"role": "system", "content": system}]}), bpe, info, opts)?;
+    let ids = fits_context(warm_ids(&json!({"messages": [{"role": "system", "content": system}]}), bpe, info, opts)?, info)
+        .with_context(|| format!("{}", path.display()))?;
     match model.warm_prefix(&ids, true) {
         Some(n) => eprintln!("  pinned {n} of {} system-prompt tokens from {}", ids.len(), path.display()),
         None => eprintln!("  {}: this model keeps no prompt-prefix cache; nothing pinned", path.display()),
@@ -242,11 +259,13 @@ fn prompt_ids(body: &Value, bpe: &Bpe, info: &ModelInfo, opts: &RunOpts) -> Resu
     // A raw `prompt` may be a string or an array of token ids.
     if let Some(p) = body.get("prompt") {
         if let Some(s) = p.as_str() {
-            let text = if opts.raw { s.to_string() } else { s.to_string() };
-            return Ok(bpe.encode(&text).into_iter().map(|v| v as u32).collect());
+            return Ok(bpe.encode(s).into_iter().map(|v| v as u32).collect());
         }
         if let Some(a) = p.as_array() {
-            return Ok(a.iter().filter_map(Value::as_u64).map(|v| v as u32).collect());
+            return a.iter().map(|v| match v.as_u64() {
+                Some(id) if (id as usize) < info.vocab => Ok(id as u32),
+                _ => anyhow::bail!("prompt token {v} is not an id in the {}-token vocabulary", info.vocab),
+            }).collect();
         }
     }
     if let Some(msgs) = body.get("messages").and_then(Value::as_array) {
@@ -438,10 +457,10 @@ fn serve_batched(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &V
         let mut replies: HashMap<u64, completion::Reply> = HashMap::new();
         // `/cache/warm` needs a slot of its own outside the batch, and waits here
         // until one is free.
-        let mut warms: VecDeque<(TcpStream, Vec<u32>, bool)> = VecDeque::new();
+        let mut warms: VecDeque<(TcpStream, Vec<u32>, bool, Ticket)> = VecDeque::new();
         let mut next_id = 0u64;
         loop {
-            let mut arrived: Vec<Arrival> = Vec::new();
+            let mut arrived: Vec<(Arrival, Ticket)> = Vec::new();
             if batch.is_idle() && warms.is_empty() {
                 match rx.recv() {
                     Ok(a) => arrived.push(a),
@@ -449,7 +468,7 @@ fn serve_batched(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &V
                 }
             }
             arrived.extend(rx.try_iter());
-            for a in arrived {
+            for (a, ticket) in arrived {
                 match a {
                     Arrival::Completion(request) => {
                         let (job, mut reply) = *request;
@@ -464,7 +483,7 @@ fn serve_batched(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &V
                             next_id += 1;
                         }
                     }
-                    Arrival::Warm(stream, ids, pin) => warms.push_back((stream, ids, pin)),
+                    Arrival::Warm(stream, ids, pin) => warms.push_back((stream, ids, pin, ticket)),
                     Arrival::Other(mut stream, req, path) => {
                         if !serve_other(&mut stream, &req, &path, model, ctx, props) {
                             send_err(&mut stream, "404 Not Found", &format!("no route for {} {}", req.method, path));
@@ -473,7 +492,7 @@ fn serve_batched(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &V
                 }
             }
             if let Some(slot) = batch.free_slot() {
-                if let Some((mut stream, ids, pin)) = warms.pop_front() { warm(&mut stream, model, slot, &ids, pin); }
+                if let Some((mut stream, ids, pin, _ticket)) = warms.pop_front() { warm(&mut stream, model, slot, &ids, pin); }
             }
             batch.step(&mut |id, event| match event {
                 Event::Token(t) => replies.get_mut(&id).is_some_and(|r| r.token(ctx.bpe, t)),
@@ -511,7 +530,7 @@ fn warm_request(stream: &mut TcpStream, req: &Request, ctx: &Ctx) -> Option<(Vec
             return None;
         }
     };
-    match warm_ids(&body, ctx.bpe, ctx.info, ctx.opts) {
+    match warm_ids(&body, ctx.bpe, ctx.info, ctx.opts).and_then(|ids| fits_context(ids, ctx.info)) {
         Ok(ids) => Some((ids, body.get("pin").and_then(Value::as_bool).unwrap_or(true))),
         Err(e) => {
             send_err(stream, "400 Bad Request", &e.to_string());
@@ -573,22 +592,42 @@ pub(crate) fn serve_http(listener: &TcpListener, mut handle: impl FnMut(&mut Tcp
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         scope.spawn(move || accept_each(listener, scope, accept, tx));
-        for (mut stream, req, path) in rx { handle(&mut stream, &req, &path); }
+        for ((mut stream, req, path), _ticket) in rx { handle(&mut stream, &req, &path); }
         Ok(())
     })
 }
 
+/// Connections being read, or holding a request not yet answered, at once. A
+/// connection past it is answered 503 straight away, so neither threads nor
+/// queued request bodies grow without bound.
+const MAX_CONNECTIONS: usize = 128;
+
+/// An admitted connection, counted against `MAX_CONNECTIONS` until dropped.
+pub(crate) struct Ticket(Arc<AtomicUsize>);
+
+impl Drop for Ticket {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
+}
+
 /// Read every new connection on its own thread with `read`, and send what it
-/// returns to `tx`.
+/// returns to `tx` with the connection's ticket, which the receiver holds until the
+/// request is answered.
 fn accept_each<'scope, T: Send + 'scope>(listener: &'scope TcpListener, scope: &'scope std::thread::Scope<'scope, '_>,
                                          read: impl Fn(TcpStream) -> Option<T> + Copy + Send + 'scope,
-                                         tx: std::sync::mpsc::Sender<T>) {
+                                         tx: std::sync::mpsc::Sender<(T, Ticket)>) {
+    let open = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
         match conn {
-            Ok(stream) => {
-                let tx = tx.clone();
+            Ok(mut stream) => {
+                if open.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+                    open.fetch_sub(1, Ordering::AcqRel);
+                    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(1)));
+                    send_err(&mut stream, "503 Service Unavailable", "too many connections; retry shortly");
+                    continue;
+                }
+                let (tx, ticket) = (tx.clone(), Ticket(open.clone()));
                 scope.spawn(move || {
-                    if let Some(item) = read(stream) { let _ = tx.send(item); }
+                    if let Some(item) = read(stream) { let _ = tx.send((item, ticket)); }
                 });
             }
             Err(e) => {
@@ -599,18 +638,17 @@ fn accept_each<'scope, T: Send + 'scope>(listener: &'scope TcpListener, scope: &
     }
 }
 
-/// A client gets this long to send its request, and each write to it this long to
-/// complete, so an idle or stalled connection cannot hold a thread forever.
+/// A client gets this long to send its whole request, and each write to it this
+/// long to complete, so an idle or stalled connection cannot hold a thread forever.
 const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Read one request from a new connection, with its path (query string removed).
 /// Answers CORS preflight itself, and a request that cannot be parsed with 400;
 /// `None` for those and for a connection closed before a request.
 fn accept(mut stream: TcpStream) -> Option<(TcpStream, Request, String)> {
-    let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
     let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
     let req = {
-        let mut reader = BufReader::new(&stream);
+        let mut reader = BufReader::new(Deadline { stream: &stream, until: Instant::now() + SOCKET_TIMEOUT });
         match read_request(&mut reader) {
             Ok(Some(r)) => r,
             Ok(None) => return None,
@@ -627,13 +665,68 @@ fn accept(mut stream: TcpStream) -> Option<(TcpStream, Request, String)> {
         let _ = stream.write_all(head.as_bytes());
         return None;
     }
+    let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
     let path = req.path.split('?').next().unwrap_or("").to_string();
     Some((stream, req, path))
+}
+
+/// A connection read against one deadline for the whole request, so a client that
+/// sends a byte at a time cannot hold its thread past `SOCKET_TIMEOUT`.
+struct Deadline<'a> {
+    stream: &'a TcpStream,
+    until: Instant,
+}
+
+impl Read for Deadline<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the request did not arrive in time"));
+        }
+        self.stream.set_read_timeout(Some(left))?;
+        (&*self.stream).read(buf)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_token_ids_must_be_in_the_vocabulary() {
+        let info = info_for("qwen3");
+        let opts = RunOpts::default();
+        let bpe = Bpe::default();
+        assert_eq!(prompt_ids(&json!({"prompt": [1, 2, 9]}), &bpe, &info, &opts).unwrap(), vec![1, 2, 9]);
+        for bad in [json!({"prompt": [1, 10]}), json!({"prompt": [1, -1]}), json!({"prompt": [1, "a"]})] {
+            assert!(prompt_ids(&bad, &bpe, &info, &opts).is_err(), "{bad}");
+        }
+        assert!(fits_context(vec![0; 63], &info).is_ok());
+        assert!(fits_context(vec![0; 64], &info).is_err());
+    }
+
+    #[test]
+    fn a_request_must_arrive_before_its_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(b"GET /health HTTP/1.1\r\n").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let _ = s.write_all(b"\r\n");
+        });
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(Deadline { stream: &stream, until: Instant::now() + std::time::Duration::from_millis(100) });
+        assert!(read_request(&mut reader).is_err(), "a request arriving after its deadline was read");
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn oversized_headers_are_refused() {
+        let head = format!("GET / HTTP/1.1\r\nX-Pad: {}\r\n\r\n", "a".repeat(MAX_HEAD));
+        let mut reader = BufReader::new(head.as_bytes());
+        assert!(read_request(&mut reader).is_err());
+    }
 
     fn info_for(arch: &str) -> ModelInfo {
         ModelInfo {

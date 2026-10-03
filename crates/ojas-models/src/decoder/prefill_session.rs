@@ -516,8 +516,11 @@ impl<'a> DecoderGpu<'a> {
         let disk_payloads = self.sess.cache.borrow().stats().disk_reads - reads;
         let restore_us = t0.elapsed().as_micros() as u64;
         self.seq().last_prefill_reused.set(n);
-        *self.seq().cache_plan.borrow_mut() =
-            Some(Plan::new(prompt.to_vec(), keys, hit, &self.seq().cache_marks.take()));
+        let mut plan = Plan::new(prompt.to_vec(), keys, hit, &self.seq().cache_marks.take());
+        // KV restored from a Q8_0 directory is close to, not identical with, what
+        // processing computes, so nothing built on it is cached as exact.
+        if disk_payloads > 0 && !self.sess.cache.borrow().disk_kv_exact() { plan.exact = plan.exact.min(n); }
+        *self.seq().cache_plan.borrow_mut() = Some(plan);
         let (resumed, doc_reused_tokens) = self.place_docs(prompt, n);
         self.sess.cache_last.set(ojas_core::PrefixRestore {
             matched_tokens: hit.blocks * BLOCK, reused_tokens: n, doc_reused_tokens, disk_payloads, restore_us,
@@ -648,9 +651,13 @@ impl<'a> DecoderGpu<'a> {
         let key = plan.keys[b - 1];
         let parent = if b > 1 { plan.keys[b - 2] } else { prefix_cache::ROOT };
         let mut cache = self.sess.cache.borrow_mut();
-        if !cache.contains(key) {
+        let tokens = &plan.tokens[pos - BLOCK..pos];
+        // A key held by another block (a hash collision) is left alone: neither its
+        // KV nor its snapshot may come from this prompt.
+        if !cache.matches(key, parent, tokens) {
+            if cache.contains(key) { return; }
             let kv = read_parts(&self.kv_block_parts(pos - BLOCK));
-            if !cache.insert(parent, &plan.tokens[pos - BLOCK..pos], kv) { return; }
+            if !cache.insert(parent, tokens, kv) { return; }
         }
         if plan.wants_snapshot(b, self.snap_interval()) && !cache.has_snapshot(key)
             && cache.attach_snapshot(key, self.state_bytes()) {

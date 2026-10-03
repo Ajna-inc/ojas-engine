@@ -190,6 +190,9 @@ impl Disk {
 
     pub(crate) fn dir(&self) -> &Path { &self.shared.dir }
 
+    /// Whether a KV payload read back is bit-identical to the rows written.
+    pub(crate) fn exact_kv(&self) -> bool { self.shared.kv == KvFormat::F16 }
+
     /// Bytes a payload of `len` bytes takes in the directory.
     pub(crate) fn stored_len(&self, part: Part, len: usize) -> usize { stored_len(self.shared.kv, part, len) }
 
