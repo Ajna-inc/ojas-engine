@@ -1,0 +1,39 @@
+{
+ "answers": {
+  "route": {
+   "type": "choice",
+   "choice": "technical",
+   "probabilities": {
+    "billing": 0.3483773148662742,
+    "shipping": 0.29239791056782044,
+    "technical": 0.35922477456590535
+   },
+   "confidence": 0.03883716184885804
+  },
+  "urgency": {
+   "type": "score",
+   "score": 1.4009078157714816,
+   "legend": {
+    "0": "can wait",
+    "1": "this week",
+    "2": "today",
+    "3": "right now"
+   },
+   "probabilities": {
+    "0": 0.250613523640125,
+    "1": 0.27558933337805064,
+    "2": 0.29607294655204264,
+    "3": 0.17772419642978188
+   },
+   "confidence": 0.04545942291191751
+  },
+  "angry": {
+   "type": "noul",
+   "noul": 0.5531161171091791
+  }
+ },
+ "usage": {
+  "input_tokens": 101,
+  "output_tokens": 0
+ }
+}

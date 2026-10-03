@@ -40,9 +40,9 @@ pub const MAXSEL: usize = 256;
 pub const ATTN_HD_SPECIAL: &[u32] = &[128, 256];
 
 /// Head dims that get a BIDIRECTIONAL (non-causal) MMA kernel
-/// (`attention_m_mma_bidir_<hd>` + its f16-Q twin). The ViT tower this exists for
-/// is hd=64; add a dim here when another encoder needs one.
-pub const ATTN_BIDIR_HD: &[u32] = &[64];
+/// (`attention_m_mma_bidir_<hd>` + its f16-Q twin): the vision towers' 64 (surya-2)
+/// and 72 (16 heads over 1152, OpenJev); add a dim here when another encoder needs one.
+pub const ATTN_BIDIR_HD: &[u32] = &[64, 72];
 
 /// Generate the hd-specialized MMA prefill kernel source (the reference compiles a
 /// template instantiation per head dim for the same reason).
@@ -368,9 +368,9 @@ kernel void attention_m_mma(device const float* q [[buffer(0)]], device const ha
         sq[r*SQ + i] = (r < nq) ? half(q[(ulong)(q0 + r)*(ulong)R + head*hd + i]) : half(0.0);
     }
     if (lid < 32u) { srow[lid] = -1e30; srow[32u + lid] = 0.0; }
-    // per-simdgroup output tiles: sg owns hd/8 columns starting at sg*(hd/8)
-    uint ncol = hd/8u;                             // columns per simdgroup
-    uint nt = ncol/8u;                             // 8x8 output tiles per simdgroup (<= 4)
+    // The hd/8 8-column output tiles are dealt to the 8 simdgroups in turn: sg owns
+    // tiles sg, sg + 8, ..., so any hd that is a multiple of 8 (up to 256) divides.
+    uint nt = (hd/8u + 7u - sg)/8u;                // 8x8 output tiles of this simdgroup (<= 4)
     simdgroup_float8x8 lo[4][4];
     for (uint rb = 0u; rb < 4u; rb++) {
         for (uint i = 0u; i < nt; i++) { lo[rb][i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0); }
@@ -423,7 +423,7 @@ kernel void attention_m_mma(device const float* q [[buffer(0)]], device const ha
             sdg[lid] = (ix % 9u == 0u) ? srow[64u + rb*8u + ix/9u] : 0.0;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // ---- rescale O by diag(factor), then O += P(32xC) * V(Cxncol), V shared
+        // ---- rescale O by diag(factor), then O += P(32xC) * V(C x its tiles), V shared
         simdgroup_float8x8 mdg;
         for (uint rb = 0u; rb < 4u; rb++) {
             simdgroup_load(mdg, sdg + rb*64u, 8u);
@@ -433,9 +433,9 @@ kernel void attention_m_mma(device const float* q [[buffer(0)]], device const ha
         for (uint cc = 0u; cc < cn; cc += 8u) {
             simdgroup_half8x8 ms[4], mv;
             for (uint rb = 0u; rb < 4u; rb++) { simdgroup_load(ms[rb], sp + rb*8u*SP + cc, SP); }
-            device const half* pv = vc + (ulong)(c0 + cc)*(ulong)kvdim + kvh*hd + sg*ncol;
+            device const half* pv = vc + (ulong)(c0 + cc)*(ulong)kvdim + kvh*hd + sg*8u;
             for (uint i = 0u; i < nt; i++) {
-                simdgroup_load(mv, pv + i*8u, kvdim);
+                simdgroup_load(mv, pv + i*64u, kvdim);
                 for (uint rb = 0u; rb < 4u; rb++) {
                     simdgroup_multiply_accumulate(lo[rb][i], ms[rb], mv, lo[rb][i]);
                 }
@@ -458,15 +458,15 @@ kernel void attention_m_mma(device const float* q [[buffer(0)]], device const ha
         simdgroup_load(mdv, sdg, 8u);
         if (rv == 8u) {
             // full block: simdgroup-direct store to device (row stride R)
-            device float* po = out + (ulong)(q0 + rb*8u)*(ulong)R + head*hd + sg*ncol;
+            device float* po = out + (ulong)(q0 + rb*8u)*(ulong)R + head*hd + sg*8u;
             for (uint i = 0u; i < nt; i++) {
                 simdgroup_multiply(lo[rb][i], mdv, lo[rb][i]);
-                simdgroup_store(lo[rb][i], po + i*8u, R);
+                simdgroup_store(lo[rb][i], po + i*64u, R);
             }
         } else {
             for (uint i = 0u; i < nt; i++) {
                 simdgroup_multiply(lo[rb][i], mdv, lo[rb][i]);
-                simdgroup_store(lo[rb][i], sof + sg*ncol + i*8u, hd);
+                simdgroup_store(lo[rb][i], sof + sg*8u + i*64u, hd);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint e = lid; e < rv*hd; e += ts) {
@@ -514,9 +514,9 @@ kernel void attention_m_mma_dq(device const half* q [[buffer(0)]], device const 
     // which size only two threadgroups fit per core. Without it, ~14 KB.
     device const half* qbase = q + (ulong)q0*(ulong)R + head*hd;
     if (lid < 32u) { srow[lid] = -1e30; srow[32u + lid] = 0.0; }
-    // per-simdgroup output tiles: sg owns hd/8 columns starting at sg*(hd/8)
-    uint ncol = hd/8u;                             // columns per simdgroup
-    uint nt = ncol/8u;                             // 8x8 output tiles per simdgroup (<= 4)
+    // The hd/8 8-column output tiles are dealt to the 8 simdgroups in turn: sg owns
+    // tiles sg, sg + 8, ..., so any hd that is a multiple of 8 (up to 256) divides.
+    uint nt = (hd/8u + 7u - sg)/8u;                // 8x8 output tiles of this simdgroup (<= 4)
     simdgroup_float8x8 lo[4][4];
     for (uint rb = 0u; rb < 4u; rb++) {
         for (uint i = 0u; i < nt; i++) { lo[rb][i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0); }
@@ -569,7 +569,7 @@ kernel void attention_m_mma_dq(device const half* q [[buffer(0)]], device const 
             sdg[lid] = (ix % 9u == 0u) ? srow[64u + rb*8u + ix/9u] : 0.0;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        // ---- rescale O by diag(factor), then O += P(32xC) * V(Cxncol), V shared
+        // ---- rescale O by diag(factor), then O += P(32xC) * V(C x its tiles), V shared
         simdgroup_float8x8 mdg;
         for (uint rb = 0u; rb < 4u; rb++) {
             simdgroup_load(mdg, sdg + rb*64u, 8u);
@@ -579,9 +579,9 @@ kernel void attention_m_mma_dq(device const half* q [[buffer(0)]], device const 
         for (uint cc = 0u; cc < cn; cc += 8u) {
             simdgroup_half8x8 ms[4], mv;
             for (uint rb = 0u; rb < 4u; rb++) { simdgroup_load(ms[rb], sp + rb*8u*SP + cc, SP); }
-            device const half* pv = vc + (ulong)(c0 + cc)*(ulong)kvdim + kvh*hd + sg*ncol;
+            device const half* pv = vc + (ulong)(c0 + cc)*(ulong)kvdim + kvh*hd + sg*8u;
             for (uint i = 0u; i < nt; i++) {
-                simdgroup_load(mv, pv + i*8u, kvdim);
+                simdgroup_load(mv, pv + i*64u, kvdim);
                 for (uint rb = 0u; rb < 4u; rb++) {
                     simdgroup_multiply_accumulate(lo[rb][i], ms[rb], mv, lo[rb][i]);
                 }
@@ -604,15 +604,15 @@ kernel void attention_m_mma_dq(device const half* q [[buffer(0)]], device const 
         simdgroup_load(mdv, sdg, 8u);
         if (rv == 8u) {
             // full block: simdgroup-direct store to device (row stride R)
-            device float* po = out + (ulong)(q0 + rb*8u)*(ulong)R + head*hd + sg*ncol;
+            device float* po = out + (ulong)(q0 + rb*8u)*(ulong)R + head*hd + sg*8u;
             for (uint i = 0u; i < nt; i++) {
                 simdgroup_multiply(lo[rb][i], mdv, lo[rb][i]);
-                simdgroup_store(lo[rb][i], po + i*8u, R);
+                simdgroup_store(lo[rb][i], po + i*64u, R);
             }
         } else {
             for (uint i = 0u; i < nt; i++) {
                 simdgroup_multiply(lo[rb][i], mdv, lo[rb][i]);
-                simdgroup_store(lo[rb][i], sof + sg*ncol + i*8u, hd);
+                simdgroup_store(lo[rb][i], sof + sg*8u + i*64u, hd);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint e = lid; e < rv*hd; e += ts) {

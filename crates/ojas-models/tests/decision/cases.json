@@ -1,0 +1,10 @@
+[
+  {"model": "tinylaya-Q8_0.gguf", "requests": ["ticket", "nested"]},
+  {"model": "Laya-Q8_0.gguf", "requests": ["support", "nested"]},
+  {"model": "Julia-1-Q8_0.gguf", "requests": ["support", "nested"]},
+  {"model": "tinyopenjev-Q8_0.gguf", "projector": "mmproj-tinyopenjev-Q8_0.gguf", "requests": ["ticket", "nested", "one_image", "two_images", "image_in_message"]},
+  {"model": "tinylev-Q8_0.gguf", "requests": ["ticket", "nested"]},
+  {"model": "tinykev-Q8_0.gguf", "requests": ["ticket", "nested"]},
+  {"model": "lev-Q4_K_M.gguf", "requests": ["ticket", "support", "nested"], "tolerance": 0.02},
+  {"model": "Kev-4B-Q4_K_M.gguf", "requests": ["ticket", "support", "nested"]}
+]

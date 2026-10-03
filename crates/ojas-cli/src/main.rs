@@ -39,7 +39,7 @@ usage:
   ojas detect <model.onnx> <image|dir>  object detection (CPU; --conf --iou --json)
   ojas plate  <det.onnx> <rec.onnx> <dict.txt> <image|dir>  detect + read plates
   ojas vbench <model.onnx>              vision forward-pass timing
-  ojas decide <laya.gguf>               typed decisions (Laya, Metal; serve and bench take one too)
+  ojas decide <model.gguf>              typed decisions (decision models, Metal; serve and bench take one too)
 ";
 
 // No `\` line-continuation: it would strip the leading indent off the first
@@ -111,6 +111,8 @@ runtime flags:
          --json           detect/decide: JSON output
          --state S / --state-file F          decide: JSON object or text to decide about
          --questions Q / --questions-file F  decide: {id: {type, instructions, criteria}}
+         --image F                           decide: an image the request carries (repeatable)
+         --requests-file F                   decide: request bodies, one per line; answers one per line
 ";
 
 fn main() -> Result<()> {
