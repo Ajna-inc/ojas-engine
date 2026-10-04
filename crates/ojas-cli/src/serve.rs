@@ -1,5 +1,5 @@
-//! HTTP server: OpenAI-compatible plus llama.cpp's native `/completion`. A Laya
-//! model is served by `decide::serve` instead (`POST /v1/decide`), on the same
+//! HTTP server: OpenAI-compatible plus the native `/completion`. A decision
+//! model is served by `decide::serve` instead (`POST /v1/systemone`), on the same
 //! connection loop, [`serve_http`].
 //!
 //! Requests are served on the thread that owns the model: `DecoderGpu` is `Send`
@@ -94,8 +94,23 @@ fn response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
 fn json_response(status: &str, v: &Value) -> Vec<u8> { response(status, "application/json", v.to_string().as_bytes()) }
 
 /// OpenAI's error envelope, so clients surface the text instead of a blank failure.
+/// An error body: `{"error": {"code", "message", "type"}}`, the type named for the
+/// status's class.
 fn error_response(status: &str, msg: &str) -> Vec<u8> {
-    json_response(status, &json!({"error": {"message": msg, "type": "invalid_request_error"}}))
+    json_response(status, &error_body(status, msg))
+}
+
+fn error_body(status: &str, msg: &str) -> Value {
+    let code: u16 = status.split(' ').next().and_then(|c| c.parse().ok()).unwrap_or(500);
+    let kind = match code {
+        400 | 413 | 422 => "invalid_request_error",
+        401 | 403 => "authentication_error",
+        404 => "not_found_error",
+        501 => "not_supported_error",
+        503 => "unavailable_error",
+        _ => "server_error",
+    };
+    json!({"error": {"code": code, "message": msg, "type": kind}})
 }
 
 /// The head of a server-sent event stream.
@@ -335,8 +350,7 @@ fn stop_ids(bpe: &Bpe, info: &ModelInfo) -> (Option<u32>, Option<u32>) {
 }
 
 pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    if crate::decide::is_laya(model) {
+    if crate::decide::is_decision_model(model) {
         return crate::decide::serve(model, opts);
     }
     with_model(model, opts.device, context, opts.precision, |m, bpe, info| {
@@ -580,6 +594,8 @@ fn serve_other(stream: &mut TcpStream, req: &Request, path: &str, model: &dyn Mo
             "object": "list",
             "data": [{"id": ctx.info.arch, "object": "model", "created": now(), "owned_by": "ojas"}]
         })),
+        ("POST", "/v1/systemone" | "/v1/decide" | "/decide") =>
+            send_err(stream, "501 Not Implemented", "this model is not a decision model"),
         _ => return false,
     }
     true
@@ -589,10 +605,33 @@ fn serve_other(stream: &mut TcpStream, req: &Request, path: &str, model: &dyn Mo
 /// time on the calling thread, in the order they arrive. Each connection is read on
 /// its own thread, so a client slow to send its request delays no one else's.
 pub(crate) fn serve_http(listener: &TcpListener, mut handle: impl FnMut(&mut TcpStream, &Request, &str)) -> Result<()> {
+    serve_http_batches(listener, 1, |batch| {
+        for (mut stream, req, path) in batch { handle(&mut stream, &req, &path); }
+    })
+}
+
+/// A request read from its connection: the stream to answer on, the request, and
+/// its path (query string removed).
+pub(crate) type Arrived = (TcpStream, Request, String);
+
+/// Hand requests to `handle` on the calling thread, in arrival order, in batches:
+/// it waits for one, then takes every request already waiting, up to `most`.
+/// Connections are read as in [`serve_http`].
+pub(crate) fn serve_http_batches(listener: &TcpListener, most: usize, mut handle: impl FnMut(Vec<Arrived>)) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         scope.spawn(move || accept_each(listener, scope, accept, tx));
-        for ((mut stream, req, path), _ticket) in rx { handle(&mut stream, &req, &path); }
+        while let Ok(first) = rx.recv() {
+            let mut batch = vec![first];
+            while batch.len() < most.max(1) {
+                match rx.try_recv() {
+                    Ok(next) => batch.push(next),
+                    Err(_) => break,
+                }
+            }
+            let (arrived, _tickets): (Vec<Arrived>, Vec<Ticket>) = batch.into_iter().unzip();
+            handle(arrived);
+        }
         Ok(())
     })
 }
@@ -691,6 +730,17 @@ impl Read for Deadline<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_bodies_name_the_class_of_their_status() {
+        for (status, kind) in [("400 Bad Request", "invalid_request_error"), ("404 Not Found", "not_found_error"),
+                               ("501 Not Implemented", "not_supported_error"), ("503 Service Unavailable", "unavailable_error"),
+                               ("500 Internal Server Error", "server_error")] {
+            let body = error_body(status, "m");
+            assert_eq!(body["error"]["type"], kind, "{status}");
+            assert_eq!(body["error"]["code"].as_u64(), status.split(' ').next().unwrap().parse().ok());
+        }
+    }
 
     #[test]
     fn prompt_token_ids_must_be_in_the_vocabulary() {

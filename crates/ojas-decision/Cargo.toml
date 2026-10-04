@@ -1,0 +1,23 @@
+[package]
+name = "ojas-decision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Decision models (typed questions with calibrated answers) over any ojas GPU backend."
+repository.workspace = true
+
+# Backend-neutral: the readouts, prompts, calibration and request handling live here,
+# and reach the GPU through the traits in `backend.rs`. `ojas-models` implements them on
+# Metal and `ojas-cuda` on CUDA, so this crate builds and tests on every platform.
+[dependencies]
+anyhow = "1"
+half = "2"
+minijinja = { version = "2.21", default-features = false, features = ["builtins", "preserve_order", "serde"] }
+# `EngineConfig` (the host's `--parallel`), and the error types the server maps to statuses.
+ojas-core = { path = "../ojas-core" }
+ojas-formats = { path = "../ojas-formats" }
+# Decision models build their prompts with the engine's tokenizer.
+ojas-tokenize = { path = "../ojas-tokenize" }
+# Image decoding and the vision tower's preprocessing, for image requests.
+ojas-cpu = { path = "../ojas-cpu" }

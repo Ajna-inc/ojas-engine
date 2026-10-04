@@ -1,12 +1,12 @@
 //! Order-preserving JSON, and Python's `json.dumps` text form.
 //!
-//! Laya's reference implementation turns a JSON state into text with
-//! `json.dumps(state, ensure_ascii=False)` before tokenizing it, and reads a
-//! `choice` question's options in the order its object lists them. Both orders
-//! reach the model: key order changes the state's tokens, option order changes
-//! which `[MASK]` scores which option. So objects here keep their keys in source
-//! order, and [`Json::to_python`] reproduces `json.dumps` byte for byte: `", "`
-//! and `": "` separators, Python's string escapes, `repr` for floats.
+//! Decision models were trained on requests serialized with
+//! `json.dumps(value, ensure_ascii=False)`, and read options in the order the
+//! request lists them. Both orders reach the model: key order changes the state's
+//! tokens, option order changes which marker scores which option. So objects here
+//! keep their keys in source order, and [`Json::to_python`] reproduces `json.dumps`
+//! byte for byte: `", "` and `": "` separators, Python's string escapes, `repr` for
+//! floats.
 
 use anyhow::{bail, Result};
 
@@ -59,6 +59,29 @@ impl Json {
             Json::Float(f) => Some(*f),
             Json::Int(digits) => digits.parse().ok(),
             _ => None,
+        }
+    }
+
+    /// A copy with `f` applied to every string value; object keys are kept.
+    pub fn map_strings(&self, f: &impl Fn(&str) -> String) -> Json {
+        match self {
+            Json::Str(s) => Json::Str(f(s)),
+            Json::Array(items) => Json::Array(items.iter().map(|v| v.map_strings(f)).collect()),
+            Json::Object(kv) => Json::Object(kv.iter().map(|(k, v)| (k.clone(), v.map_strings(f))).collect()),
+            other => other.clone(),
+        }
+    }
+
+    /// A copy with the keys of every object in sorted order.
+    pub fn sorted(&self) -> Json {
+        match self {
+            Json::Array(items) => Json::Array(items.iter().map(Json::sorted).collect()),
+            Json::Object(kv) => {
+                let mut kv: Vec<(String, Json)> = kv.iter().map(|(k, v)| (k.clone(), v.sorted())).collect();
+                kv.sort_by(|a, b| a.0.cmp(&b.0));
+                Json::Object(kv)
+            }
+            other => other.clone(),
         }
     }
 

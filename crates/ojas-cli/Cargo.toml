@@ -22,6 +22,9 @@ ojas-infer = { path = "../ojas-infer" }
 ojas-grammar = { path = "../ojas-grammar" }
 ojas-cpu = { path = "../ojas-cpu" }
 ojas-vision = { path = "../ojas-vision" }
+# Decision models (`ojas decide`, `/v1/systemone`): backend-neutral; the Metal and CUDA
+# backends below implement its traits.
+ojas-decision = { path = "../ojas-decision" }
 tracing = { workspace = true }
 anyhow = "1"
 libc = "0.2"

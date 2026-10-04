@@ -1,4 +1,4 @@
-//! The ModernBERT text encoder and the Laya decision head on Metal.
+//! The ModernBERT text encoder and a decision head read at marker tokens, on Metal.
 //!
 //! A request is a batch of independent token sequences packed into one row buffer
 //! with no padding between them. Every block is the shared encoder block
@@ -12,30 +12,19 @@
 //!   output straight to its QKV projection);
 //! * the MLP is gated over one fused `ffn_up` (first half activated), erf GELU.
 //!
-//! When the file carries a Laya head, [`DecoderGpu::laya_forward`] continues on the
-//! same rows: the question-type embedding is added per sequence and the head's
-//! transformer blocks run with sequence-wide spans. Only each sequence's first row and
-//! its option-marker rows are read afterwards, so the last head block finishes, and
-//! the scorer's LayerNorm, first linear and GELU run, on those rows alone. The
-//! scorer's final `d -> 1` projection and the act head are small enough to finish on
-//! the host (`crate::laya`).
+//! When the file carries a marker head, [`DecoderGpu::marker_head_forward`]
+//! continues on the same rows: the question-type embedding is added per sequence and
+//! the head's transformer blocks run with sequence-wide spans. Only the option-marker
+//! rows are read afterwards, so the last head block finishes, and the scorer's
+//! LayerNorm, first linear and GELU run, on those rows alone. The scorer's final
+//! `d -> 1` projection is small enough to finish on the host (`crate::decision`).
 
 use super::encoder::{Act, Block, Geom, Keys, Mlp, Norm, Rope, Scratch};
 use super::*;
 use anyhow::{ensure, Result};
 use objc::{msg_send, sel, sel_impl};
 
-/// Per-sequence results of [`DecoderGpu::laya_forward`].
-pub struct LayaGpuOut {
-    /// For each sequence, for each marker position asked for: the scorer's hidden
-    /// vector after its GELU, `d` floats.
-    pub scorer_hidden: Vec<Vec<Vec<f32>>>,
-    /// For each sequence, the head's output at the sequence's first position
-    /// (`[CLS]`), `d` floats: the act head's pooled input.
-    pub pooled: Vec<Vec<f32>>,
-    /// GPU execution time, from the command buffer's timestamps.
-    pub gpu_s: f64,
-}
+pub use ojas_decision::MarkerHeadOut;
 
 /// Row buffers for packed requests, kept on the decoder and reused. Allocating them per
 /// request (up to 15 MB each, two of them zero-filled) put about 9 ms of host time on
@@ -60,7 +49,7 @@ pub(crate) struct TextBuffers {
     tiles_local: Option<metal::Buffer>,
     n_tiles: u32,
     tokens: metal::Buffer,
-    /// Rows the Laya head's last block keeps (`int`), in compact order.
+    /// Rows the marker head's last block keeps (`int`), in compact order.
     keep: metal::Buffer,
 }
 
@@ -100,9 +89,9 @@ impl<'a> DecoderGpu<'a> {
     /// True when this file is a text encoder rather than a decoder.
     pub fn has_text_encoder(&self) -> bool { self.arch.text_encoder.is_some() }
 
-    /// True when the text encoder carries a Laya decision head.
-    pub fn has_laya_head(&self) -> bool {
-        self.arch.text_encoder.as_ref().is_some_and(|t| t.laya.is_some())
+    /// True when the text encoder carries a decision head read at marker tokens.
+    pub fn has_marker_head(&self) -> bool {
+        self.arch.text_encoder.as_ref().is_some_and(|t| t.marker_head.is_some())
     }
 
     /// Hidden width of the text encoder.
@@ -134,46 +123,41 @@ impl<'a> DecoderGpu<'a> {
         Ok(out)
     }
 
-    /// The encoder, then the Laya head, over `seqs`. `qtypes[i]` selects the row of
-    /// `laya.type_emb` added to sequence `i`; `markers[i]` lists the positions in
+    /// The encoder, then the marker head, over `seqs`. `qtypes[i]` selects the row of
+    /// `token_types` added to sequence `i`; `markers[i]` lists the positions in
     /// sequence `i` whose scorer hidden vector is returned.
-    pub fn laya_forward(&self, seqs: &[Vec<u32>], qtypes: &[u32], markers: &[Vec<usize>]) -> Result<LayaGpuOut> {
+    pub fn marker_head_forward(&self, seqs: &[Vec<u32>], qtypes: &[u32], markers: &[Vec<usize>]) -> Result<MarkerHeadOut> {
         let te = self.text_config()?;
-        let head = te.laya.as_ref().ok_or_else(|| anyhow::anyhow!("this text encoder has no Laya head"))?;
+        let head = te.marker_head.as_ref().ok_or_else(|| anyhow::anyhow!("this text encoder has no marker head"))?;
         ensure!(qtypes.len() == seqs.len() && markers.len() == seqs.len(),
-            "laya_forward: {} sequences, {} question types, {} marker lists", seqs.len(), qtypes.len(), markers.len());
-        let n_types = self.wt.wshape.get("laya.type_emb.weight").map(|&(_, n)| n).unwrap_or(0);
+            "marker_head_forward: {} sequences, {} question types, {} marker lists", seqs.len(), qtypes.len(), markers.len());
+        let n_types = self.wt.wshape.get("token_types.weight").map(|&(_, n)| n).unwrap_or(0);
         for (i, (&q, mk)) in qtypes.iter().zip(markers).enumerate() {
             ensure!(q < n_types, "sequence {i}: question type {q} out of range ({n_types} types)");
             ensure!(mk.iter().all(|&p| p < seqs[i].len()), "sequence {i}: a marker lies past its end");
         }
         let d = te.d as usize;
         let b = self.text_buffers(te, seqs)?;
-        // The head's reads, in compact order: each sequence's first row ([CLS], the
-        // act head's input), then its option markers.
+        // The head's reads, in compact order: each sequence's option markers.
         let mut keep: Vec<u32> = Vec::new();
         let mut start = 0usize;
         for (s, mk) in seqs.iter().zip(markers) {
-            keep.push(start as u32);
             keep.extend(mk.iter().map(|&p| (start + p) as u32));
             start += s.len();
         }
         write_u32(&b.keep, &keep);
         let gpu_s = self.run_text(te, &b, seqs, |enc, m| {
-            self.encode_laya_head(enc, te, head, &b, seqs, qtypes, keep.len(), m);
+            self.encode_marker_head(enc, te, head, &b, seqs, qtypes, keep.len(), m);
             Ok(())
         })?;
         self.gpu_s.set(self.gpu_s.get() + gpu_s);
-        let (xc, scorer) = (&b.qkv, &b.ffn);
         let mut scorer_hidden = Vec::with_capacity(seqs.len());
-        let mut pooled = Vec::with_capacity(seqs.len());
         let mut r = 0usize;
         for mk in markers {
-            pooled.push(row(xc, r, d));
-            scorer_hidden.push((1..=mk.len()).map(|i| row(scorer, r + i, d)).collect());
-            r += 1 + mk.len();
+            scorer_hidden.push((r..r + mk.len()).map(|i| row(&b.ffn, i, d)).collect());
+            r += mk.len();
         }
-        Ok(LayaGpuOut { scorer_hidden, pooled, gpu_s })
+        Ok(MarkerHeadOut { scorer_hidden, gpu_s })
     }
 
     /// Per-category GPU time of one text-encoder pass over `seqs`, in the manner of
@@ -181,7 +165,7 @@ impl<'a> DecoderGpu<'a> {
     /// layer weights, in its own command buffer; after two warm-up runs the best of
     /// five is kept, so a busy GPU inflates the numbers less than a whole-pass timing.
     /// Returns `(category, milliseconds)` for the encoder's layers and their sum, the
-    /// pass's compute floor, then the Laya head's cost measured against a whole pass.
+    /// pass's compute floor, then the marker head's cost measured against a whole pass.
     pub fn profile_text(&self, seqs: &[Vec<u32>]) -> Result<Vec<(String, f64)>> {
         let te = self.text_config()?;
         let b = self.text_buffers(te, seqs)?;
@@ -233,9 +217,9 @@ impl<'a> DecoderGpu<'a> {
         ];
         let total: f64 = out.iter().map(|(_, t)| t).sum();
         out.push(("sum (encoder)".into(), total));
-        // The Laya head, once (not per layer): its blocks and the scorer, timed as a
+        // The marker head, once (not per layer): its blocks and the scorer, timed as a
         // whole against the encoder pass it follows.
-        if let Some(head) = &te.laya {
+        if let Some(head) = &te.marker_head {
             let qtypes = vec![0u32; seqs.len()];
             let firsts: Vec<u32> = seqs.iter().scan(0u32, |at, s| { let r = *at; *at += s.len() as u32; Some(r) }).collect();
             write_u32(&b.keep, &firsts);
@@ -243,12 +227,12 @@ impl<'a> DecoderGpu<'a> {
             let mut best = f64::INFINITY;
             for _ in 0..5 {
                 let with_head = self.run_text(te, &b, seqs, |enc, m| {
-                    self.encode_laya_head(enc, te, head, &b, seqs, &qtypes, firsts.len(), m);
+                    self.encode_marker_head(enc, te, head, &b, seqs, &qtypes, firsts.len(), m);
                     Ok(())
                 })?;
                 best = best.min((with_head - enc_only) * 1e3);
             }
-            out.push(("laya head (approx.)".into(), best.max(0.0)));
+            out.push(("decision head (approx.)".into(), best.max(0.0)));
         }
         Ok(out)
     }
@@ -323,7 +307,7 @@ impl<'a> DecoderGpu<'a> {
 
     fn alloc_text_buffers(&self, te: &TextEncoderConfig, cap: usize) -> TextBuffers {
         let d = te.d as usize;
-        let ffn = te.laya.as_ref().map_or(te.ffn, |h| h.ffn.max(te.ffn)).max(te.d) as usize;
+        let ffn = te.marker_head.as_ref().map_or(te.ffn, |h| h.ffn.max(te.ffn)).max(te.d) as usize;
         let mma = self.p.contains_key(&ojas_metal::kernels::attn::attn_mma_span_name(te.hd));
         let gpu = self.gpu;
         // Tiles: at most one per 32 rows of each sequence, so cap/32 + one per sequence.
@@ -393,17 +377,17 @@ impl<'a> DecoderGpu<'a> {
         Ok((ge - gs).max(0.0))
     }
 
-    /// The Laya head on the encoder output in `b.x`: the question-type embedding, the
+    /// The marker head on the encoder output in `b.x`: the question-type embedding, the
     /// head's blocks, then the scorer's LayerNorm, first linear and GELU.
     ///
-    /// Only `n_keep` rows are read afterwards (`b.keep`: each sequence's first row and
-    /// its option markers), so the last block runs its attention over every row (all
+    /// Only `n_keep` rows are read afterwards (`b.keep`: each sequence's option
+    /// markers), so the last block runs its attention over every row (all
     /// rows are keys) and everything after it on the kept rows alone: they are
     /// gathered into `b.qkv` (residual) and `b.q` (attention output), both free by
     /// then, and the scorer's hidden rows land in `b.ffn`, in `b.keep` order.
     #[allow(clippy::too_many_arguments)]
-    fn encode_laya_head(&self, enc: &metal::ComputeCommandEncoderRef, te: &TextEncoderConfig,
-                        head: &LayaHeadConfig, b: &TextBuffers, seqs: &[Vec<u32>], qtypes: &[u32],
+    fn encode_marker_head(&self, enc: &metal::ComputeCommandEncoderRef, te: &TextEncoderConfig,
+                          head: &MarkerHeadConfig, b: &TextBuffers, seqs: &[Vec<u32>], qtypes: &[u32],
                         n_keep: usize, m: usize) {
         let d = te.d;
         let row_bytes = te.d as u64 * 4;
@@ -413,7 +397,7 @@ impl<'a> DecoderGpu<'a> {
         for (s, &q) in seqs.iter().zip(qtypes) {
             let total = s.len() as u32 * d;
             self.enc_reduce_off(enc, "add_rowbias_m",
-                &[(&b.x, 0, start * row_bytes), (&self.wt.w32["laya.type_emb.weight"], 1, q as u64 * row_bytes)],
+                &[(&b.x, 0, start * row_bytes), (&self.wt.w32["token_types.weight"], 1, q as u64 * row_bytes)],
                 &[(2, d), (3, total)], &[], total.div_ceil(64) as u64, 64);
             start += s.len() as u64;
         }
@@ -421,7 +405,7 @@ impl<'a> DecoderGpu<'a> {
                           ffn: head.ffn as usize, eps: head.eps };
         let s = b.scratch();
         let block = |i: u32| {
-            let p = |t: &str| format!("laya.blk.{i}.{t}");
+            let p = |t: &str| format!("blk.{}.{t}", head.first + i);
             let norm = |n: &str| Norm { weight: p(&format!("{n}.weight")), bias: Some(p(&format!("{n}.bias"))) };
             Block {
                 attn_norm: Some(norm("attn_norm")),
@@ -445,10 +429,10 @@ impl<'a> DecoderGpu<'a> {
         }
         self.encode_mlp_half(enc, &block(last), &geom, xc, hc, &b.ffn, &b.ffn_wide, n_keep);
 
-        let scorer_norm = Norm { weight: "laya.scorer_norm.weight".into(), bias: Some("laya.scorer_norm.bias".into()) };
+        let scorer_norm = Norm { weight: "cls.norm.weight".into(), bias: Some("cls.norm.bias".into()) };
         self.enc_layernorm(enc, xc, hc, &scorer_norm, d, head.eps, k32);
-        self.projm(enc, hc, 0, "laya.scorer_fc.weight", &b.ffn, d, d, k32, false);
-        self.enc_bias(enc, &b.ffn, "laya.scorer_fc.bias", d, k32);
+        self.projm(enc, hc, 0, "cls.weight", &b.ffn, d, d, k32, false);
+        self.enc_bias(enc, &b.ffn, "cls.bias", d, k32);
         self.enc_act(enc, &b.ffn, &b.ffn, Act::GeluErf, d * k32);
     }
 }

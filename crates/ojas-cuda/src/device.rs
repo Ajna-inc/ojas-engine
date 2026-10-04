@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
@@ -193,6 +193,14 @@ impl CudaGpu {
         p
     }
 
+    /// Zero `len` bytes of `buf` from byte offset `off`, in stream order.
+    pub fn zero_bytes(&self, buf: &CuBuf, off: usize, len: usize) -> Result<()> {
+        if len == 0 { return Ok(()); }
+        let rc = unsafe { cudarc::driver::sys::cuMemsetD8Async(self.device_ptr(buf) + off as u64, 0, len, self.stream.cu_stream()) };
+        ensure!(rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS, "cuMemsetD8Async: {rc:?}");
+        Ok(())
+    }
+
     /// Copy `out.len()` bytes from a raw device address (e.g. a decoder frame).
     pub fn read_ptr(&self, ptr: u64, out: &mut [u8]) -> Result<()> {
         self.bind_thread()?;
@@ -251,6 +259,66 @@ impl CudaGpu {
     }
 
     /// Wait for everything queued on this stream.
+    /// Blocks of `block_size` threads of a compiled kernel that fit on one SM at once (what
+    /// its registers and shared memory allow), for the kernel benches.
+    pub fn blocks_per_sm(&self, name: &str, block_size: u32) -> Result<u32> {
+        let f = self.func(name)?;
+        f.occupancy_max_active_blocks_per_multiprocessor(block_size, 0, None).map_err(|e| anyhow!("occupancy: {e:?}"))
+    }
+
+    /// Record a timing event on the stream (`CudaEvent::elapsed_ms` between two of them).
+    pub fn record_event(&self) -> Result<cudarc::driver::CudaEvent> {
+        self.stream.record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).map_err(|e| anyhow!("cuda event: {e:?}"))
+    }
+
+    /// `dispatch` bracketed by timing events when `prof` is on (`OJAS_CUDA_PROFILE=1`).
+    pub fn dispatch_profiled(&self, prof: &KernelProfile, name: &str, bufs: &[(&CuBuf, u64)], consts: &[u32],
+                             grid: [u32; 3], block: [u32; 3]) -> Result<()> {
+        if prof.launches.borrow().is_none() {
+            return self.dispatch(&self.stream, name, bufs, consts, grid, block);
+        }
+        let start = self.record_event()?;
+        self.dispatch(&self.stream, name, bufs, consts, grid, block)?;
+        let end = self.record_event()?;
+        prof.launches.borrow_mut().as_mut().expect("on").push((name.to_string(), start, end));
+        Ok(())
+    }
+}
+
+/// GPU time per kernel name, from stream events around every launch; on with
+/// `OJAS_CUDA_PROFILE=1`, reported and cleared by [`KernelProfile::report`].
+pub struct KernelProfile {
+    launches: std::cell::RefCell<Option<Vec<(String, cudarc::driver::CudaEvent, cudarc::driver::CudaEvent)>>>,
+}
+
+impl KernelProfile {
+    pub fn from_env() -> Self {
+        KernelProfile { launches: std::cell::RefCell::new(std::env::var("OJAS_CUDA_PROFILE").is_ok().then(Vec::new)) }
+    }
+
+    /// Print the time per kernel since the last report, most first, to stderr.
+    pub fn report(&self, gpu: &CudaGpu, what: &str) {
+        let mut guard = self.launches.borrow_mut();
+        let Some(launches) = guard.as_mut() else { return };
+        let _ = gpu.sync();
+        let mut by_name: HashMap<String, (f64, usize)> = HashMap::new();
+        for (name, start, end) in launches.drain(..) {
+            let e = by_name.entry(name).or_insert((0.0, 0));
+            e.0 += start.elapsed_ms(&end).unwrap_or(0.0) as f64;
+            e.1 += 1;
+        }
+        let mut rows: Vec<(String, (f64, usize))> = by_name.into_iter().collect();
+        rows.sort_by(|a, b| b.1 .0.total_cmp(&a.1 .0));
+        let total: f64 = rows.iter().map(|r| r.1 .0).sum();
+        eprintln!("cuda profile {what}: {total:.1} ms in kernels");
+        for (name, (ms, n)) in rows {
+            eprintln!("  {name:<24} {ms:>8.2} ms  {n:>5} launches  {:>6.1}%", 100.0 * ms / total);
+        }
+    }
+}
+
+impl CudaGpu {
+
     pub fn sync(&self) -> Result<()> {
         self.stream.synchronize().map_err(|e| anyhow!("cuda synchronize: {e:?}"))
     }

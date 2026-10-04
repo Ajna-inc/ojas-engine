@@ -356,6 +356,8 @@ pub(crate) struct StateArena {
     /// command buffer is committed elsewhere, and `set_unretained_command_buffers(true)`
     /// means a temporary Buffer would not be retained by it. Written host-side like
     /// `st.x`; read only when the rope mode is non-zero, so text models never touch it.
+    /// A multi-sequence chunk writes one descriptor per sequence back to back, hence
+    /// the room for `MAX_SLOTS` headers.
     pub(crate) mpos: metal::Buffer,
     pub(crate) gate: metal::Buffer,
     pub(crate) up: metal::Buffer,
@@ -792,6 +794,8 @@ pub struct DecoderGpu<'a> {
     cur_slot: std::cell::Cell<usize>,
     /// Row buffers of the text encoder, reused across requests (`text_encoder.rs`).
     text_arena: std::cell::RefCell<Option<text_encoder::TextBuffers>>,
+    /// The decision models' saved recurrent state (`CausalBackend::save_state`).
+    pub(crate) saved_state: std::cell::RefCell<Vec<u8>>,
 }
 
 impl Drop for DecoderGpu<'_> {
@@ -893,49 +897,7 @@ pub(crate) struct VisionConfig {
     pub(crate) max_patches: u32,
 }
 
-/// A ModernBERT text encoder (`general.architecture = "modern-bert"`), read from the
-/// same GGUF keys llama.cpp reads. Carried on [`Arch`] as `vision` is: the encoder
-/// runs through its own entry (`text_encoder.rs`), not the decoder graph, because it
-/// has no KV cache, no causal mask and no LM head.
-#[derive(Clone, Debug)]
-pub(crate) struct TextEncoderConfig {
-    pub(crate) d: u32,
-    pub(crate) layers: u32,
-    pub(crate) n_head: u32,
-    pub(crate) hd: u32,
-    /// Per half of the gated MLP: `ffn_up` produces `2 * ffn` columns.
-    pub(crate) ffn: u32,
-    pub(crate) eps: f32,
-    /// RoPE base of the global-attention layers.
-    pub(crate) rope_base: f32,
-    /// RoPE base of the sliding-window layers.
-    pub(crate) rope_base_local: f32,
-    /// Keys a local layer's query sees on each side: `|i - j| <= window`.
-    /// `attention.sliding_window` is the full width (128), this is half of it.
-    pub(crate) window: u32,
-    /// Layer `l` is local when `l % swa_pattern != 0` (llama.cpp's dense-first
-    /// rule); 0 means every layer is global.
-    pub(crate) swa_pattern: u32,
-    pub(crate) max_positions: u32,
-    /// The Laya decision head, when the file carries one.
-    pub(crate) laya: Option<LayaHeadConfig>,
-}
-
-impl TextEncoderConfig {
-    pub(crate) fn is_local(&self, layer: usize) -> bool {
-        self.swa_pattern > 0 && self.window > 0 && layer as u32 % self.swa_pattern != 0
-    }
-}
-
-/// Geometry of the Laya decision head appended by `scripts/laya_convert.py`: a stack
-/// of PyTorch `nn.TransformerEncoderLayer` blocks (pre-norm, ReLU, biased, no RoPE).
-#[derive(Clone, Debug)]
-pub(crate) struct LayaHeadConfig {
-    pub(crate) blocks: u32,
-    pub(crate) n_head: u32,
-    pub(crate) ffn: u32,
-    pub(crate) eps: f32,
-}
+pub(crate) use ojas_arch::text_encoder::{MarkerHeadSpec as MarkerHeadConfig, TextEncoderSpec as TextEncoderConfig};
 
 pub(crate) struct Arch {
     pub(crate) n_layers: usize,
@@ -1187,6 +1149,7 @@ mod span;
 mod spec;
 mod text_encoder;
 mod vision;
+pub(crate) use ojas_decision::SlotPrefill;
 pub(crate) use vision::VIT_PATCH_FOLD;
 
 /// Env-gated attention-kernel logger (OJAS_ATTN_LOG=1). Prints each distinct

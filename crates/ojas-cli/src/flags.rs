@@ -52,6 +52,11 @@ pub struct RunOpts {
     /// inline or from a file.
     pub questions: Option<String>,
     pub questions_file: Option<String>,
+    /// `decide`: image files the request carries (`--image`, repeatable).
+    pub images: Vec<String>,
+    /// `decide`: a file of request bodies, one JSON object per line, answered in
+    /// batches instead of the one request `--state`/`--questions` describe.
+    pub requests_file: Option<String>,
     /// Vision (`plate`): OCR input normalization — "signed" (default) or
     /// "unit" for exports with normalization folded in-graph (see MANIFEST).
     pub ocr_norm: Option<String>,
@@ -104,6 +109,8 @@ impl Default for RunOpts {
             state_file: None,
             questions: None,
             questions_file: None,
+            images: Vec::new(),
+            requests_file: None,
             ocr_norm: None,
             sample_set: false,
         }
@@ -370,6 +377,8 @@ pub fn take_run_flags(args: &mut Vec<String>) -> Result<RunOpts> {
             "--state-file" => o.state_file = Some(take(&mut i)?),
             "--questions" => o.questions = Some(take(&mut i)?),
             "--questions-file" => o.questions_file = Some(take(&mut i)?),
+            "--image" => o.images.push(take(&mut i)?),
+            "--requests-file" => o.requests_file = Some(take(&mut i)?),
             "--ocr-norm" => o.ocr_norm = Some(take(&mut i)?),
             "--token" => o.token = Some(take(&mut i)?),
             "--token-file" => o.token_file = Some(take(&mut i)?),

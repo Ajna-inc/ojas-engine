@@ -183,3 +183,40 @@ mod tests {
         assert!(q[8..].iter().all(|&x| x == 0));
     }
 }
+
+/// Q4_K super-blocks (144 B / 256) relaid for the Q4L GEMM kernels: nibbles with pairs
+/// sharing a byte, and per 32-block f16 `qa = d·sc`, `qb = -dmin·m`, so every value is
+/// `qa·q + qb`. `w` is `n` rows of `k` weights, `k % 256 == 0`. A CPU transcription of
+/// Metal's load-time `relayout_q4k_q4l` kernel (ojas-metal gemv.rs), so it carries the
+/// same f16 rounding of the two products.
+pub fn relayout_q4k_q4l(w: &[u8], k: usize, n: usize) -> (Vec<u8>, Vec<u16>, Vec<u16>) {
+    assert!(k % 256 == 0 && w.len() == n * k / 256 * 144, "relayout_q4k_q4l: {n} rows of {k} need {} bytes, got {}", n * k / 256 * 144, w.len());
+    let (nblk, nsb) = (k / 32, k / 256);
+    let mut nib = vec![0u8; n * k / 2];
+    let mut qa = vec![0u16; n * nblk];
+    let mut qb = vec![0u16; n * nblk];
+    for r in 0..n {
+        for b in 0..nblk {
+            let (sb, j) = (b >> 3, b & 7);
+            let (g, hi) = (j >> 1, j & 1);
+            let blk = &w[(r * nsb + sb) * 144..][..144];
+            let d = f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
+            let dm = f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])).to_f32();
+            let sc = &blk[4..16];
+            let (s_, m_) = if j < 4 {
+                ((sc[j] & 63) as u32, (sc[j + 4] & 63) as u32)
+            } else {
+                (((sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4)) as u32,
+                 ((sc[j + 4] >> 4) | ((sc[j] >> 6) << 4)) as u32)
+            };
+            qa[r * nblk + b] = f16::from_f32(d * s_ as f32).to_bits();
+            qb[r * nblk + b] = f16::from_f32(-dm * m_ as f32).to_bits();
+            let qq = &blk[16 + g * 32..][..32];
+            for i in 0..16 {
+                let pick = |v: u8| if hi == 1 { v >> 4 } else { v & 15 };
+                nib[r * (k / 2) + b * 16 + i] = pick(qq[2 * i]) | (pick(qq[2 * i + 1]) << 4);
+            }
+        }
+    }
+    (nib, qa, qb)
+}

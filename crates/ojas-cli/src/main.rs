@@ -11,7 +11,6 @@
 mod backend;
 mod cmds;
 mod constrain;
-#[cfg(target_os = "macos")]
 mod decide;
 mod detok;
 mod flags;
@@ -39,7 +38,7 @@ usage:
   ojas detect <model.onnx> <image|dir>  object detection (CPU; --conf --iou --json)
   ojas plate  <det.onnx> <rec.onnx> <dict.txt> <image|dir>  detect + read plates
   ojas vbench <model.onnx>              vision forward-pass timing
-  ojas decide <laya.gguf>               typed decisions (Laya, Metal; serve and bench take one too)
+  ojas decide <model.gguf>              typed decisions (decision models, Metal or CUDA; serve and bench take one too)
 ";
 
 // No `\` line-continuation: it would strip the leading indent off the first
@@ -64,7 +63,7 @@ engine flags (llama.cpp names where one exists):
   -ub,   --ubatch-size N  tokens per physical pass (sizes the streamed expert scratch)
          --prefix-cache-gb N  memory for cached prompt prefixes (0 disables)
          --doc-cache-gb N  memory for documents reused at any position (approximate; 0 disables)
-  -np,   --parallel N     serve: requests run at once, up to 4 (qwen35; each holds its own KV and state)
+  -np,   --parallel N     serve: requests run at once, up to 4 (8 on CUDA; qwen35, each holds its own KV and state)
          --prefix-cache-dir PATH  keep cached prefixes in PATH across runs
          --prefix-cache-readonly  use PATH's prefixes without changing it
          --prefix-cache-disk-gb N  size cap for PATH (default 20, at most a quarter of free space)
@@ -111,6 +110,8 @@ runtime flags:
          --json           detect/decide: JSON output
          --state S / --state-file F          decide: JSON object or text to decide about
          --questions Q / --questions-file F  decide: {id: {type, instructions, criteria}}
+         --image F                           decide: an image the request carries (repeatable)
+         --requests-file F                   decide: request bodies, one per line; answers one per line
 ";
 
 fn main() -> Result<()> {
@@ -146,10 +147,7 @@ fn main() -> Result<()> {
         Some("plate") => vision::plate(need(2)?, need(3)?, need(4)?, need(5)?, &opts),
         Some("vbench") => vision::vbench(need(2)?, &opts),
         Some("vision-serve") => vserve::vision_serve(need(2)?, &opts),
-        #[cfg(target_os = "macos")]
         Some("decide") => decide::decide(need(2)?, &opts),
-        #[cfg(not(target_os = "macos"))]
-        Some("decide") => anyhow::bail!("`decide` needs the Metal backend and is not built on this platform"),
 
         #[cfg(target_os = "macos")]
         Some("worker") if a.len() >= 7 => ojas_swarm::worker(

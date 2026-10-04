@@ -4,6 +4,18 @@ use metal::MTLSize;
 use std::ffi::c_void;
  // re-export
 
+/// One sequence's run of consecutive rows in a multi-sequence chunk
+/// ([`DecoderGpu::forward_segments_enc`]).
+#[derive(Clone, Debug)]
+pub(crate) struct ChunkSegment {
+    /// The rows of the chunk (and of its activation buffers) this sequence holds.
+    pub(crate) rows: std::ops::Range<usize>,
+    /// The slot whose recurrent state and KV rows the rows continue.
+    pub(crate) slot: usize,
+    /// The cache row, within the slot, of the segment's first row.
+    pub(crate) base_pos: usize,
+}
+
 impl<'a> DecoderGpu<'a> {
     /// The M-row projection dispatch the chunk graph routes through: `y[M,n] =
     /// x[M,k] @ W^T`, choosing among the native / F32 / F16 / m==2 / MMA-tile / M-row
@@ -112,6 +124,111 @@ impl<'a> DecoderGpu<'a> {
             enc.dispatch_thread_groups(MTLSize::new(m as u64, 1, 1), MTLSize::new(256, 1, 1));
     }
 
+    /// Whether the model keeps a recurrent state, which `prefill_hidden` needs.
+    pub(crate) fn is_recurrent(&self) -> bool { self.arch.ssm.is_some() }
+
+    /// Prefill several prompts at once, each in its own slot, and return the final
+    /// hidden state (after `output_norm`) of each prompt's `read` rows (ascending
+    /// prompt indices inside its span). Recurrent (qwen35) models only. Every pass holds
+    /// rows of as many prompts as fit in a chunk, one segment each
+    /// ([`DecoderGpu::forward_segments_enc`]), so the weights are read once for all of
+    /// them.
+    ///
+    /// Rows the prompt gives as embeddings enter the residual stream directly, and
+    /// rows with explicit rotary coordinates are roped at those rather than at their
+    /// cache row; a prompt without coordinates, beside one with, is roped at its cache
+    /// rows on every axis, which is the same rotation.
+    pub(crate) fn prefill_hidden_slots(&self, jobs: &[SlotPrefill]) -> Vec<Vec<Vec<f32>>> {
+        assert!(self.arch.ssm.is_some(), "prefill_hidden runs the recurrent chunk graph");
+        assert!(jobs.len() <= self.st.slots
+            && jobs.iter().enumerate().all(|(i, j)| jobs[..i].iter().all(|k| k.slot != j.slot)),
+            "prefill_hidden_slots: one slot per prompt, at most {} slots", self.st.slots);
+        for j in jobs {
+            assert!(j.span.end <= j.prompt.ids.len() && j.prompt.positions.is_none_or(|p| p.len() == j.prompt.ids.len()),
+                "prefill_hidden: the span or the positions do not fit the prompt");
+            assert!(j.read.windows(2).all(|w| w[0] < w[1]) && j.read.iter().all(|r| j.span.contains(r)),
+                "prefill_hidden: rows to read must be ascending and inside the span");
+        }
+        let d = self.d;
+        let norm = &self.wt.w32["output_norm.weight"];
+        let chunk_sz = self.cfg.prefill_m.clamp(1, MAXM);
+        let positioned = jobs.iter().any(|j| j.prompt.positions.is_some());
+        let mut next: Vec<usize> = jobs.iter().map(|j| j.span.start).collect();
+        let mut out: Vec<Vec<Vec<f32>>> = jobs.iter().map(|j| Vec::with_capacity(j.read.len())).collect();
+        loop {
+            let (mut tokens, mut segments, mut given, mut positions) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for (i, j) in jobs.iter().enumerate() {
+                let room = chunk_sz - tokens.len();
+                if next[i] == j.span.end || room == 0 { continue; }
+                let take = (j.span.end - next[i]).min(room);
+                let (from, r0) = (next[i], tokens.len());
+                tokens.extend_from_slice(&j.prompt.ids[from..from + take]);
+                for p in from..from + take {
+                    positions.push(j.prompt.positions.map_or([p as u32, p as u32, p as u32, 0], |pos| pos[p]));
+                }
+                // Embedded rows inside this run go straight into st.x.
+                for &(first, rows) in j.prompt.embedded {
+                    let (lo, hi) = (first.max(from), (first + rows.len() / d).min(from + take));
+                    if lo >= hi { continue; }
+                    let src = &rows[(lo - first) * d..(hi - first) * d];
+                    unsafe {
+                        let dst = (self.st.x.contents() as *mut f32).add((r0 + lo - from) * d);
+                        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+                    }
+                    given.push(r0 + lo - from..r0 + hi - from);
+                }
+                segments.push((i, ChunkSegment { rows: r0..r0 + take, slot: j.slot, base_pos: from }));
+                next[i] += take;
+            }
+            if tokens.is_empty() { break; }
+            let chunk: Vec<ChunkSegment> = segments.iter().map(|(_, g)| g.clone()).collect();
+            self.forward_segments_enc(None, &tokens, &chunk, false, false, &given, positioned.then_some(positions.as_slice()));
+            let wanted = segments.iter().any(|(i, g)| jobs[*i].read.iter().any(|&r| (g.base_pos..g.base_pos + g.rows.len()).contains(&r)));
+            if !wanted { continue; }
+            let cb = self.gpu.command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            self.rmsnorm_rows(enc, tokens.len() as u32, norm);
+            enc.end_encoding();
+            let _ = ojas_metal::commit_and_wait_checked(cb, "prefill hidden norm");
+            let h = unsafe { std::slice::from_raw_parts(self.st.h.contents() as *const f32, tokens.len() * d) };
+            for (i, g) in &segments {
+                for &r in jobs[*i].read.iter().filter(|&&r| (g.base_pos..g.base_pos + g.rows.len()).contains(&r)) {
+                    let row = g.rows.start + r - g.base_pos;
+                    out[*i].push(h[row * d..(row + 1) * d].to_vec());
+                }
+            }
+        }
+        out
+    }
+
+    /// Copy slot `from`'s recurrent state and its first `rows` cache rows into slot
+    /// `to`, on the GPU, so `to` continues the same prefix.
+    pub(crate) fn copy_slot_prefix(&self, from: usize, to: usize, rows: usize) {
+        assert!(from < self.slots() && to < self.slots() && rows <= self.st.max_seq, "copy_slot_prefix: slot or rows out of range");
+        if from == to { return; }
+        let cb = self.gpu.command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        let copy = |buf: &metal::Buffer, from_off: u64, to_off: u64, bytes: u64| {
+            let n = (bytes / 4) as u32;
+            if n == 0 { return; }
+            self.enc_reduce_off(enc, "copy_buf", &[(buf, 0, to_off), (buf, 1, from_off)], &[(2, n)], &[], n.div_ceil(256) as u64, 256);
+        };
+        for l in 0..self.arch.n_layers {
+            let lp = self.arch.layers[l];
+            if lp.is_ssm {
+                copy(&self.st.conv_state[l], self.conv_slot_off(l, from), self.conv_slot_off(l, to), self.st.conv_state[l].length() / self.slots() as u64);
+                copy(&self.st.ssm_state[l], self.ssm_slot_off(l, from), self.ssm_slot_off(l, to), self.st.ssm_state[l].length() / self.slots() as u64);
+            } else {
+                // Two bytes per cached value.
+                let bytes = rows as u64 * lp.kvdim as u64 * 2;
+                copy(&self.st.kcache[l], self.kv_slot_off(l, from), self.kv_slot_off(l, to), bytes);
+                copy(&self.st.vcache[l], self.kv_slot_off(l, from), self.kv_slot_off(l, to), bytes);
+            }
+        }
+        enc.end_encoding();
+        let _ = ojas_metal::commit_and_wait_checked(cb, "copy slot prefix");
+    }
+
     /// One qwen35 prefill chunk (M ≤ MAXM tokens), split across command buffers every
     /// `prefill_cb_layers` layers.
     /// Mirrors the qwen35 branch of encode_forward with M-token batched kernels;
@@ -149,21 +266,45 @@ impl<'a> DecoderGpu<'a> {
     /// sections, leaves the rope dispatch on the scalar `base_pos + m`. See
     /// [`ojas_core::Model::prefill_embeds`] for the coordinate convention.
     pub(crate) fn forward_chunk_enc_embed(&self, ext: Option<&metal::ComputeCommandEncoderRef>, tokens: &[u32], base_pos: usize, verify: bool, row1_gpu: bool, do_embed: bool, pos3: Option<&[[u32; 4]]>) {
-        debug_assert!(do_embed || !row1_gpu, "row1_gpu embeds row 1 — it needs do_embed");
+        let one = [ChunkSegment { rows: 0..tokens.len(), slot: self.cur_slot.get(), base_pos }];
+        let given = if do_embed { Vec::new() } else { vec![0..tokens.len()] };
+        self.forward_segments_enc(ext, tokens, &one, verify, row1_gpu, &given, pos3)
+    }
+
+    /// [`DecoderGpu::forward_chunk_enc_embed`] over several sequences at once: each
+    /// segment is a run of consecutive rows continuing its own slot. The projections
+    /// and every row-wise kernel run once over all rows, so the weights are read once
+    /// for the whole chunk; the work that carries a sequence's state (convolution,
+    /// recurrence, rope and KV store, attention) is dispatched per segment, at the
+    /// segment's rows and its slot's state, as [`DecoderGpu::encode_slots`] does for
+    /// single tokens. With one segment at the current slot this is the
+    /// single-sequence chunk, dispatch for dispatch.
+    ///
+    /// `given` lists the rows the caller has already written to `st.x` (an image's
+    /// rows, say); every other row is gathered from the token embeddings.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_segments_enc(&self, ext: Option<&metal::ComputeCommandEncoderRef>, tokens: &[u32], segments: &[ChunkSegment], verify: bool, row1_gpu: bool, given: &[std::ops::Range<usize>], pos3: Option<&[[u32; 4]]>) {
+        let is_given = |i: usize| given.iter().any(|r| r.contains(&i));
+        debug_assert!(!row1_gpu || !is_given(1), "row1_gpu embeds row 1 — it needs gathering");
         assert!(!tokens.is_empty() && tokens.len() <= MAXM
-            && base_pos.checked_add(tokens.len()).is_some_and(|n| n <= self.st.max_seq)
             && tokens.iter().all(|&t| (t as usize) < self.arch.vocab), "chunk exceeds model bounds");
+        assert!(!segments.is_empty() && segments.len() <= self.st.slots
+            && segments.windows(2).all(|w| w[0].rows.end == w[1].rows.start)
+            && segments[0].rows.start == 0 && segments.last().unwrap().rows.end == tokens.len()
+            && segments.iter().all(|g| !g.rows.is_empty() && g.slot < self.st.slots
+                && g.base_pos.checked_add(g.rows.len()).is_some_and(|n| n <= self.st.max_seq)),
+            "chunk segments must tile the chunk, one slot each, inside the context");
         let sc = self.arch.ssm.unwrap();
         let m = tokens.len() as u32;
         let d = self.d as u32;
-        // Which sequence slot this chunk prefills into. The whole graph binds its
-        // recurrent state and KV rows at these offsets; they are 0 for slot 0.
-        let (kv_o, conv_o, ssm_o) = (|l: usize| self.kv_off(l), |l: usize| self.conv_off(l), |l: usize| self.ssm_off(l));
         // The MTP rollback snapshots are sized by `snapshot_rows`, not by slots — they
         // belong to the speculative protocol, which runs on one sequence. Prefilling a
         // verify chunk into a non-zero slot would write another slot's snapshot.
-        debug_assert!(!verify || self.cur_slot.get() == 0,
+        debug_assert!(!verify || (segments.len() == 1 && segments[0].slot == 0),
             "MTP verify snapshots have no slot dimension — prefill slot 0 or disable MTP");
+        // A segment's rows within the chunk's activation buffers, `width` f32 each.
+        let at = |g: &ChunkSegment, width: u32| g.rows.start as u64 * width as u64 * 4;
+        let rows = |g: &ChunkSegment| g.rows.len() as u32;
         let f4 = std::mem::size_of::<f32>() as u64;
         // ---- sectioned M-RoPE ---------------------------------------------------
         // Two conditions, both necessary: the caller has to have coordinates, and the
@@ -188,16 +329,25 @@ impl<'a> DecoderGpu<'a> {
         } else {
             ojas_metal::kernels::ops::rope_mode(true, ojas_metal::kernels::ops::MROPE_OFF)  // == 1, what every call site passes
         };
+        // Each segment's descriptor starts at its own offset in st.mpos: the kernel
+        // reads a header then one coordinate per row, counting rows from its dispatch.
+        let mpos_at: Vec<u64> = segments.iter().scan(0u64, |at, g| {
+            let here = *at;
+            *at += (4 + 4 * g.rows.len() as u64) * 4;
+            Some(here)
+        }).collect();
         if mrope {
             // [s0,s1,s2,s3] then (t,h,w,e) per row. st.mpos is StorageModeShared and
-            // sized 4 + 4*MAXM u32 (load.rs), so this host store is visible to the
-            // command buffer encoded below, the same seam st.x uses. It is
-            // preallocated rather than made per dispatch because an external encoder's
-            // command buffer is committed elsewhere, and
+            // sized for a header per slot plus 4*MAXM u32 (load.rs), so this host store
+            // is visible to the command buffer encoded below, the same seam st.x uses.
+            // It is preallocated rather than made per dispatch because an external
+            // encoder's command buffer is committed elsewhere, and
             // set_unretained_command_buffers(true) would not keep a temporary alive.
-            let desc = ojas_metal::kernels::ops::mrope_desc(sc.mrope_sections, pos3.unwrap());
-            debug_assert!(desc.len() * 4 <= self.st.mpos.length() as usize, "mpos descriptor overruns its buffer");
-            unsafe { std::ptr::copy_nonoverlapping(desc.as_ptr(), self.st.mpos.contents() as *mut u32, desc.len()); }
+            for (g, &off) in segments.iter().zip(&mpos_at) {
+                let desc = ojas_metal::kernels::ops::mrope_desc(sc.mrope_sections, &pos3.unwrap()[g.rows.clone()]);
+                debug_assert!(off as usize + desc.len() * 4 <= self.st.mpos.length() as usize, "mpos descriptor overruns its buffer");
+                unsafe { std::ptr::copy_nonoverlapping(desc.as_ptr(), (self.st.mpos.contents() as *mut u8).add(off as usize) as *mut u32, desc.len()); }
+            }
         }
         // concurrent dispatch (reference-style): independent kernels within a stage
         // overlap; bar() marks the real data dependencies (this path is qwen35-only,
@@ -217,7 +367,7 @@ impl<'a> DecoderGpu<'a> {
         // embed each token into its x row (per-token kernel + row byte-offset).
         // Skipped entirely when the caller supplied the rows: x already holds them.
         for (i, &t) in tokens.iter().enumerate() {
-            if !do_embed { break; }
+            if is_given(i) { continue; }
             if row1_gpu && i == 1 {
                 // draft-chained verify: token id comes from tmp[2] on the GPU
                 enc.set_compute_pipeline_state(&self.p["embed_q4_id"]);
@@ -260,16 +410,17 @@ impl<'a> DecoderGpu<'a> {
                 self.bar(&enc); // qkv/z/alpha/beta projections done (ran concurrently)
                 stage!("ssm_conv");
                 self.enc_reduce(&enc, "ssm_ab", &[(&self.st.ssm_gate, 0), (&self.st.ssm_beta, 1), (&self.wt.w32[&p("ssm_dt.bias")], 2), (&self.wt.w32[&p("ssm_a")], 3)], &[(4, m*hv), (5, hv)], &[], ((m*hv + 63)/64) as u64, 64);
-                {
+                for g in segments {
                     // Tokens in parallel (`conv1d_prefill_tiled`): 1.5 against 3.3 ms per
                     // 256-token chunk of Qwen3.5 4B for the token-serial kernel.
+                    let conv_o = self.conv_slot_off(l, g.slot);
                     enc.set_compute_pipeline_state(&self.p["conv1d_prefill_tiled"]);
-                    enc.set_buffer(0, Some(&self.st.ssm_qkv), 0);
-                    enc.set_buffer(1, Some(&self.st.conv_state[l]), conv_o(l));
+                    enc.set_buffer(0, Some(&self.st.ssm_qkv), at(g, conv_ch));
+                    enc.set_buffer(1, Some(&self.st.conv_state[l]), conv_o);
                     enc.set_buffer(2, Some(&self.wt.w32[&p("ssm_conv1d.weight")]), 0);
-                    ints(&enc, &[(3, conv_ch), (4, conv_k), (5, m)]);
+                    ints(&enc, &[(3, conv_ch), (4, conv_k), (5, rows(g))]);
                     enc.set_buffer(6, Some(if verify { &self.sp.conv_snap[l] } else { &self.st.conv_state[l] }),
-                                   if verify { 0 } else { conv_o(l) });
+                                   if verify { 0 } else { conv_o });
                     ints(&enc, &[(7, if verify { 0 } else { u32::MAX })]);
                     // 16 channels per threadgroup: the kernel's CONV_TILE_C.
                     enc.dispatch_thread_groups(MTLSize::new(conv_ch.div_ceil(16) as u64, 1, 1), MTLSize::new(256, 1, 1));
@@ -284,20 +435,23 @@ impl<'a> DecoderGpu<'a> {
                 enc.set_bytes(4, 4, &self.arch.eps as *const f32 as *const c_void);
                 enc.dispatch_thread_groups(MTLSize::new((2*hk) as u64, m as u64, 1), MTLSize::new(32, 1, 1));
                 self.bar(&enc); // q/k normalized
-                enc.set_compute_pipeline_state(&self.p["deltanet_fused"]);
-                enc.set_buffer(0, Some(&self.st.ssm_state[l]), ssm_o(l));
-                enc.set_buffer(1, Some(&self.st.ssm_qkv), 0);
-                enc.set_buffer(2, Some(&self.st.ssm_gate), 0);
-                enc.set_buffer(3, Some(&self.st.ssm_beta), 0);
-                enc.set_buffer(4, Some(&self.st.ssm_o), 0);
-                ints(&enc, &[(5, s_st), (6, hk), (7, hv), (8, conv_ch), (9, m)]);
-                enc.set_bytes(10, 4, &self.arch.eps as *const f32 as *const c_void);
-                enc.set_buffer(11, Some(if verify { &self.sp.ssm_snap[l] } else { &self.st.ssm_state[l] }),
-                                if verify { 0 } else { ssm_o(l) });
-                // OJAS_KMAP_DIV=1 selects the grouped value->key head mapping.
-                ints(&enc, &[(12, if verify { 0 } else { u32::MAX }),
-                             (13, self.cfg.moe_kmap_div as u32), (14, 2)]);
-                enc.dispatch_thread_groups(MTLSize::new((s_st/4) as u64, hv as u64, 1), MTLSize::new(128, 1, 1));
+                for g in segments {
+                    let ssm_o = self.ssm_slot_off(l, g.slot);
+                    enc.set_compute_pipeline_state(&self.p["deltanet_fused"]);
+                    enc.set_buffer(0, Some(&self.st.ssm_state[l]), ssm_o);
+                    enc.set_buffer(1, Some(&self.st.ssm_qkv), at(g, conv_ch));
+                    enc.set_buffer(2, Some(&self.st.ssm_gate), at(g, hv));
+                    enc.set_buffer(3, Some(&self.st.ssm_beta), at(g, hv));
+                    enc.set_buffer(4, Some(&self.st.ssm_o), at(g, d_inner));
+                    ints(&enc, &[(5, s_st), (6, hk), (7, hv), (8, conv_ch), (9, rows(g))]);
+                    enc.set_bytes(10, 4, &self.arch.eps as *const f32 as *const c_void);
+                    enc.set_buffer(11, Some(if verify { &self.sp.ssm_snap[l] } else { &self.st.ssm_state[l] }),
+                                    if verify { 0 } else { ssm_o });
+                    // OJAS_KMAP_DIV=1 selects the grouped value->key head mapping.
+                    ints(&enc, &[(12, if verify { 0 } else { u32::MAX }),
+                                 (13, self.cfg.moe_kmap_div as u32), (14, 2)]);
+                    enc.dispatch_thread_groups(MTLSize::new((s_st/4) as u64, hv as u64, 1), MTLSize::new(128, 1, 1));
+                }
                 self.bar(&enc); // deltanet done
                 stage!("ssm_norm");
                 enc.set_compute_pipeline_state(&self.p["gated_rmsnorm"]);
@@ -340,51 +494,61 @@ impl<'a> DecoderGpu<'a> {
                 // `rope_qk_store_m` writes the cache at `(base_pos + m) * kvdim`
                 // relative to the bound base, so a sequence slot is a buffer offset
                 // and the kernel needs no slot argument of its own.
-                self.enc_reduce_off(&enc, "rope_qk_store_m",
-                    &[(&self.st.q, 0, 0), (&self.st.k, 1, 0), (&self.st.v, 2, 0),
-                      (&self.st.kcache[l], 3, kv_o(l)), (&self.st.vcache[l], 4, kv_o(l)), (&self.st.mpos, 14, 0)],
-                    &[(5, hd), (6, base_pos as u32), (8, aq), (9, ak), (10, kvdim), (11, m), (12, neox_arg), (13, sc.n_rot)], &[(7, lp.rope_base)],
-                    ((m*(aq + ak + kvdim) + 63)/64) as u64, 64);
+                for (g, &mp) in segments.iter().zip(&mpos_at) {
+                    let kv_o = self.kv_slot_off(l, g.slot);
+                    self.enc_reduce_off(&enc, "rope_qk_store_m",
+                        &[(&self.st.q, 0, at(g, qdim)), (&self.st.k, 1, at(g, kvdim)), (&self.st.v, 2, at(g, kvdim)),
+                          (&self.st.kcache[l], 3, kv_o), (&self.st.vcache[l], 4, kv_o), (&self.st.mpos, 14, mp)],
+                        &[(5, hd), (6, g.base_pos as u32), (8, aq), (9, ak), (10, kvdim), (11, rows(g)), (12, neox_arg), (13, sc.n_rot)], &[(7, lp.rope_base)],
+                        ((rows(g)*(aq + ak + kvdim) + 63)/64) as u64, 64);
+                }
                 self.bar(&enc); // rope + cache store done
                 stage!("attention");
                 if self.arch.sparse_budget.is_some() {
                     // keep page min/max metadata current for the pages this chunk touched
-                    let pg0 = (base_pos / ojas_metal::kernels::attn::PAGE) as u32;
-                    let npg = ((base_pos + m as usize + ojas_metal::kernels::attn::PAGE - 1) / ojas_metal::kernels::attn::PAGE) as u32 - pg0;
-                    self.enc_reduce_off(&enc, "page_minmax",
-                        &[(&self.st.kcache[l], 0, kv_o(l)), (&self.st.pmeta[l], 1, 0)],
-                        &[(2, kvdim), (3, pg0), (4, (base_pos + m as usize) as u32)], &[],
-                        npg as u64, 256);
+                    for g in segments {
+                        let (base_pos, m) = (g.base_pos, rows(g));
+                        let pg0 = (base_pos / ojas_metal::kernels::attn::PAGE) as u32;
+                        let npg = ((base_pos + m as usize + ojas_metal::kernels::attn::PAGE - 1) / ojas_metal::kernels::attn::PAGE) as u32 - pg0;
+                        self.enc_reduce_off(&enc, "page_minmax",
+                            &[(&self.st.kcache[l], 0, self.kv_slot_off(l, g.slot)), (&self.st.pmeta[l], 1, 0)],
+                            &[(2, kvdim), (3, pg0), (4, (base_pos + m as usize) as u32)], &[],
+                            npg as u64, 256);
+                    }
                     self.bar(&enc); // metadata current before attention reads scores
                 }
                 // The MMA kernel serves every context length; the scalar
                 // `attention_m_short` serves only the head dims it cannot tile. At hd 256 the scalar
                 // kernel runs at 0.35 TFLOPS, 48.6 of 523 ms in a 512-token chunk of
                 // Qwen3.5 4B, and the MMA kernel takes pp512 from 946 to 1033 tok/s (M2 Max).
-                if hd <= 256 && hd % 64 != 0 {
-                    self.enc_reduce_off(&enc, "attention_m_short",
-                        &[(&self.st.q, 0, 0), (&self.st.kcache[l], 1, kv_o(l)), (&self.st.vcache[l], 2, kv_o(l)), (&self.st.attn, 3, 0)],
-                        &[(4, hd), (5, kvdim), (6, base_pos as u32), (7, group), (9, lp.n_head)], &[(8, lp.scale)],
-                        (m * lp.n_head) as u64, 256);
-                } else if hd > 256 || !self.gpu.native_reduce {
-                    self.enc_reduce_off(&enc, "attention_m",
-                        &[(&self.st.q, 0, 0), (&self.st.kcache[l], 1, kv_o(l)), (&self.st.vcache[l], 2, kv_o(l)), (&self.st.attn, 3, 0)],
-                        &[(4, hd), (5, kvdim), (6, base_pos as u32), (7, group), (9, lp.n_head)], &[(8, lp.scale)],
-                        (m * lp.n_head) as u64, 256);
-                } else {
-                    // MMA flash-attention: 32 queries/tg, simdgroup-matrix Q·K^T and P·V
-                    // (hd-specialized pipeline when available — loops fully unrolled)
-                    let kname = if ojas_metal::kernels::attn::ATTN_HD_SPECIAL.contains(&hd) {
-                        format!("attention_m_mma_{hd}")
-                    } else { "attention_m_mma".to_string() };
-                    enc.set_compute_pipeline_state(&self.p[&kname]);
-                    enc.set_buffer(0, Some(&self.st.q), 0);
-                    enc.set_buffer(1, Some(&self.st.kcache[l]), kv_o(l));
-                    enc.set_buffer(2, Some(&self.st.vcache[l]), kv_o(l));
-                    enc.set_buffer(3, Some(&self.st.attn), 0);
-                    ints(&enc, &[(4, hd), (5, kvdim), (6, base_pos as u32), (7, group), (9, lp.n_head), (10, m)]);
-                    enc.set_bytes(8, 4, &lp.scale as *const f32 as *const c_void);
-                    enc.dispatch_thread_groups(MTLSize::new(lp.n_head as u64, ((m + 31)/32) as u64, 1), MTLSize::new(256, 1, 1));
+                for g in segments {
+                    let (kv_o, base_pos, m) = (self.kv_slot_off(l, g.slot), g.base_pos as u32, rows(g));
+                    let (q_at, a_at) = (at(g, qdim), at(g, qdim));
+                    if hd <= 256 && hd % 64 != 0 {
+                        self.enc_reduce_off(&enc, "attention_m_short",
+                            &[(&self.st.q, 0, q_at), (&self.st.kcache[l], 1, kv_o), (&self.st.vcache[l], 2, kv_o), (&self.st.attn, 3, a_at)],
+                            &[(4, hd), (5, kvdim), (6, base_pos), (7, group), (9, lp.n_head)], &[(8, lp.scale)],
+                            (m * lp.n_head) as u64, 256);
+                    } else if hd > 256 || !self.gpu.native_reduce {
+                        self.enc_reduce_off(&enc, "attention_m",
+                            &[(&self.st.q, 0, q_at), (&self.st.kcache[l], 1, kv_o), (&self.st.vcache[l], 2, kv_o), (&self.st.attn, 3, a_at)],
+                            &[(4, hd), (5, kvdim), (6, base_pos), (7, group), (9, lp.n_head)], &[(8, lp.scale)],
+                            (m * lp.n_head) as u64, 256);
+                    } else {
+                        // MMA flash-attention: 32 queries/tg, simdgroup-matrix Q·K^T and P·V
+                        // (hd-specialized pipeline when available — loops fully unrolled)
+                        let kname = if ojas_metal::kernels::attn::ATTN_HD_SPECIAL.contains(&hd) {
+                            format!("attention_m_mma_{hd}")
+                        } else { "attention_m_mma".to_string() };
+                        enc.set_compute_pipeline_state(&self.p[&kname]);
+                        enc.set_buffer(0, Some(&self.st.q), q_at);
+                        enc.set_buffer(1, Some(&self.st.kcache[l]), kv_o);
+                        enc.set_buffer(2, Some(&self.st.vcache[l]), kv_o);
+                        enc.set_buffer(3, Some(&self.st.attn), a_at);
+                        ints(&enc, &[(4, hd), (5, kvdim), (6, base_pos), (7, group), (9, lp.n_head), (10, m)]);
+                        enc.set_bytes(8, 4, &lp.scale as *const f32 as *const c_void);
+                        enc.dispatch_thread_groups(MTLSize::new(lp.n_head as u64, ((m + 31)/32) as u64, 1), MTLSize::new(256, 1, 1));
+                    }
                 }
                 self.bar(&enc); // attention done
                 self.enc_reduce(&enc, "gate_mul_sigmoid", &[(&self.st.attn, 0), (&self.st.ssm_qkv, 1)], &[(2, hd), (3, qdim), (4, m)], &[], ((m*qdim + 63)/64) as u64, 64);

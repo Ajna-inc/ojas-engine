@@ -1,0 +1,44 @@
+{
+ "state": [
+  {
+   "role": "user",
+   "content": [
+    {
+     "type": "image_url",
+     "image_url": {
+      "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAACACAIAAAA04/g9AAAAjUlEQVR42u3bMQ0AMAwDQYMo4DJPMWTwUp30BG62nHOnXKoFAAAAAAAAAAAAAAAAAAAAAAAAAAAAAGANmDvlUg0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAYA+w0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAD4D1hoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAL4HPFWkIuCn2/bzAAAAAElFTkSuQmCC"
+     }
+    },
+    {
+     "type": "text",
+     "text": "I was charged twice for my order last week and nobody has replied."
+    }
+   ]
+  }
+ ],
+ "questions": {
+  "route": {
+   "type": "choice",
+   "instructions": "Which team should handle this?",
+   "criteria": {
+    "billing": "payments and refunds",
+    "shipping": null,
+    "technical": null
+   }
+  },
+  "urgency": {
+   "type": "score",
+   "instructions": "How urgent is this?",
+   "criteria": [
+    "can wait",
+    "this week",
+    "today",
+    "right now"
+   ]
+  },
+  "angry": {
+   "type": "noul",
+   "instructions": "Is the customer angry?"
+  }
+ }
+}

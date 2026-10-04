@@ -1943,6 +1943,83 @@ kernel void gemm_mm_q8(device const float* x [[buffer(0)]], device const char* w
     }
 }
 
+// gemm_mm_f16 for any N and K: the same 64(N)x32(tok) MMA tile, with loads past N or
+// K reading zero, and an output tile that reaches past N or M staged in threadgroup
+// memory and stored element by element. For the shapes gemm_mm_f16 cannot take
+// (N % 64 or K % 32 not zero); tokens past M are never stored.
+kernel void gemm_mm_f16_edge(device const float* x [[buffer(0)]], device const half* w16 [[buffer(1)]],
+    device float* y [[buffer(2)]], constant uint& K [[buffer(3)]], constant uint& N [[buffer(4)]],
+    constant uint& accum [[buffer(6)]], constant uint& M [[buffer(7)]],
+    uint2 tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup half sa[64*32];
+    threadgroup half sb[32*32];
+    threadgroup float stage[4*8*64];
+    const uint r0 = tgpig.y*64u;
+    const uint t0 = tgpig.x*32u;
+    uint lr0 = tiitg/2u;
+    uint il0 = tiitg%2u;
+    bool row_ok = r0 + lr0 < N;
+    device const half* arow = w16 + (ulong)(row_ok ? r0 + lr0 : 0u)*(ulong)K;
+    uint lr1 = tiitg/4u;
+    uint sxb = tiitg%4u;
+    bool tok_ok = t0 + lr1 < M;
+    device const float* xrow = x + (ulong)(tok_ok ? t0 + lr1 : 0u)*(ulong)K;
+    simdgroup_half8x8 ma[4];
+    simdgroup_half8x8 mb[2];
+    simdgroup_float8x8 mc[8];
+    for (short i = 0; i < 8; i++) { mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f); }
+    for (uint lk = 0u; lk < K; lk += 32u) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {   // A tile: 16 half elems of row lr0 at k = lk + il0*16 + i, zero past N or K
+            uint sy = lr0/8u, lx = lr0%8u;
+            for (short i = 0; i < 16; i++) {
+                uint k = lk + il0*16u + uint(i);
+                half v = (row_ok && k < K) ? arow[k] : half(0.0);
+                uint sx = 2u*il0 + uint(i)/8u;
+                sa[64u*(8u*sx+sy) + 8u*(uint(i)%8u) + lx] = v;
+            }
+        }
+        {   // B tile: token lr1, 8 k at lk + 8*sxb, zero past M or K
+            uint sy = lr1/8u, ly = lr1%8u;
+            uint ib = 4u*sxb + sy;
+            threadgroup half* dstb = sb + 64u*ib + 8u*ly;
+            for (short j = 0; j < 8; j++) {
+                uint k = lk + 8u*sxb + uint(j);
+                dstb[j] = (tok_ok && k < K) ? half(xrow[k]) : half(0.0);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup const half* lsma = sa + 4u*64u*(sgitg%2u);
+        threadgroup const half* lsmb = sb + 2u*64u*(sgitg/2u);
+        for (short ik = 0; ik < 4; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 4; i++) { simdgroup_load(ma[i], lsma + 64*i, 8, 0, false); }
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 2; i++) { simdgroup_load(mb[i], lsmb + 64*i, 8, 0, false); }
+            simdgroup_barrier(mem_flags::mem_none);
+            for (short i = 0; i < 8; i++) { simdgroup_multiply_accumulate(mc[i], mb[i/4], ma[i%4], mc[i]); }
+            lsma += 8*64; lsmb += 4*64;
+        }
+    }
+    // Block i of this simdgroup holds tokens t0 + 16*(sg>>1) + 8*(i/4) + r and
+    // columns r0 + 32*(sg&1) + 8*(i%4) + c, element (r, c).
+    threadgroup float* st = stage + 8u*64u*sgitg;
+    for (short i = 0; i < 8; i++) { simdgroup_store(mc[i], st + 64*i, 8, 0, false); }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = lane; e < 8u*64u; e += 32u) {
+        uint i = e/64u, r = (e%64u)/8u, c = e%8u;
+        uint t = t0 + 16u*(sgitg >> 1u) + 8u*(i/4u) + r;
+        uint n = r0 + 32u*(sgitg & 1u) + 8u*(i%4u) + c;
+        if (t < M && n < N) {
+            ulong o = (ulong)t*(ulong)N + n;
+            y[o] = accum != 0u ? y[o] + st[e] : st[e];
+        }
+    }
+}
+
 // F16 twin of gemm_mm_q8: weights are raw half (w16), loaded directly into the A tile —
 // no dequant, no scale. For the diffusion forward at prec=0 (f16), to test whether Q8 is
 // degrading the (RL-sharpened) model. Same 64(N)×32(tok) MMA tile. N%64==0, K%32==0.

@@ -12,8 +12,10 @@ ojas-metal = { path = "../ojas-metal", features = ["device"] }
 ojas-formats = { path = "../ojas-formats" }
 # The one backend-neutral model description, shared with the CUDA side.
 ojas-arch = { path = "../ojas-arch" }
-# Laya builds its token sequences with the engine's tokenizer.
 ojas-tokenize = { path = "../ojas-tokenize" }
+ojas-cpu = { path = "../ojas-cpu" }
+# The decision models' backend traits, implemented here on `DecoderGpu` (`decision_backend.rs`).
+ojas-decision = { path = "../ojas-decision" }
 anyhow = "1"
 half = "2"
 libc = "0.2"
@@ -32,6 +34,5 @@ metal = { version = "0.32", default-features = false }
 objc = "0.2"
 
 [dev-dependencies]
-ojas-cpu = { path = "../ojas-cpu" }   # CPU decoders used as the oracle in examples/moe_iq_gate
 ojas-infer = { path = "../ojas-infer" }        # examples/run drives the real generate_with path
 

@@ -9,10 +9,13 @@
 //!
 //! It does not plan execution — no kernel names, threadgroup sizes or weight layout —
 //! and does not yet cover MoE, SSM, MLA or the vision tower. Those configs live in
-//! `ojas-models` and move here as each gains a second backend.
+//! `ojas-models` and move here as each gains a second backend; the ModernBERT text
+//! encoder ([`text_encoder`]) has.
 //!
 //! The semantics mirror `ojas-models/src/decoder/load.rs` key for key: two readers of the
 //! same file that disagree are worse than one reader in the wrong crate.
+
+pub mod text_encoder;
 
 use anyhow::{anyhow, bail, Result};
 use ojas_formats::gguf::Gguf;

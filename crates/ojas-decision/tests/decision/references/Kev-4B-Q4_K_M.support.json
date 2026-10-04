@@ -1,0 +1,61 @@
+{
+ "answers": {
+  "intent": {
+   "type": "choice",
+   "choice": "refund",
+   "probabilities": {
+    "refund": 0.6945795944528285,
+    "cancel": 0.04920047978772395,
+    "track": 0.002194940030568926,
+    "other": 0.2540249857288787
+   },
+   "confidence": 0.5927727926037712
+  },
+  "urgent": {
+   "type": "noul",
+   "noul": 0.7005411117335681
+  },
+  "frustration": {
+   "type": "score",
+   "score": 1.5407006976290993,
+   "legend": {
+    "0": "calm",
+    "1": "mildly annoyed",
+    "2": "annoyed",
+    "3": "angry"
+   },
+   "probabilities": {
+    "0": 0.11328503325801938,
+    "1": 0.3478887631695765,
+    "2": 0.4236666762576895,
+    "3": 0.11515952731471457
+   },
+   "confidence": 0.3103816429996702
+  },
+  "refund": {
+   "type": "noul",
+   "noul": 0.9470473377589801
+  },
+  "team": {
+   "type": "choice",
+   "choice": "billing",
+   "probabilities": {
+    "billing": 0.46114345917981614,
+    "shipping": 0.011348972991103112,
+    "technical": 0.01738754374660534,
+    "sales": 0.1066386283257349,
+    "legal": 0.0070010630677368076,
+    "returns": 0.06463258729145618,
+    "fraud": 0.022687393385120803,
+    "accounts": 0.13750255549979296,
+    "retention": 0.02099376098986566,
+    "other": 0.15066403552276814
+   },
+   "confidence": 0.4012705101997957
+  }
+ },
+ "usage": {
+  "input_tokens": 406,
+  "output_tokens": 0
+ }
+}

@@ -1319,14 +1319,28 @@ impl<'a> DecoderGpu<'a> {
         enc.dispatch_thread_groups(MTLSize::new(((m + 31) / 32) as u64, (n / 64) as u64, 1), MTLSize::new(128, 1, 1));
     }
 
-    /// Projection over a weight stored as Q8 (w8+scale8) or f16 (w16), whichever the
-    /// loader chose for it. Serves the diffusion forward at either precision and the
-    /// vision tower, which stays f16 at every precision.
+    /// Projection over a weight stored as Q8 (w8+scale8), in the file's own quantized
+    /// blocks (wq), or f16 (w16), whichever the loader chose for it. Serves the
+    /// diffusion forward at either precision, the text encoder, and the vision tower,
+    /// which stays f16 at every precision.
     pub(crate) fn projm(&self, enc: &metal::ComputeCommandEncoderRef, x: &metal::Buffer, x_off: u64,
              wname: &str, y: &metal::Buffer, k: u32, n: u32, m: u32, accum: bool) {
         self.check_shape(wname, k, n);
-        if let (Some(w), Some(s)) = (self.wt.w8.get(wname), self.wt.scale8.get(wname)) {
+        if self.wt.wq.contains_key(wname) {
+            assert_eq!(x_off, 0, "{wname}: a native-format projection reads its input from the start of the buffer");
+            self.nat_batched(enc, wname, x, y, k, n, m, accum);
+        } else if let (Some(w), Some(s)) = (self.wt.w8.get(wname), self.wt.scale8.get(wname)) {
             self.gemm8_off(enc, x, x_off, w, s, y, k, n, m, accum);
+        } else if !n.is_multiple_of(64) || !k.is_multiple_of(32) {
+            // The aligned tiles need N % 64 == 0 and K % 32 == 0.
+            enc.set_compute_pipeline_state(&self.p["gemm_mm_f16_edge"]);
+            enc.set_buffer(0, Some(x), x_off);
+            enc.set_buffer(1, Some(&self.wt.w16[wname]), 0);
+            enc.set_buffer(2, Some(y), 0);
+            for (i, v) in [(3u64, k), (4, n), (6, accum as u32), (7, m)] {
+                enc.set_bytes(i, 4, &v as *const u32 as *const c_void);
+            }
+            enc.dispatch_thread_groups(MTLSize::new(m.div_ceil(32) as u64, n.div_ceil(64) as u64, 1), MTLSize::new(128, 1, 1));
         } else if self.p.contains_key("gemm_mm_f16_fat") {
             self.gemm_fat(enc, "gemm_mm_f16_fat", x, x_off, &self.wt.w16[wname], 0, y, k, n, m, accum, true);
         } else {

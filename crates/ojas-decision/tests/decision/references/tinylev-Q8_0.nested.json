@@ -1,0 +1,50 @@
+{
+ "answers": {
+  "route": {
+   "type": "choice",
+   "choice": "other",
+   "probabilities": {
+    "billing": 0.0904592009937934,
+    "shipping": 0.10927471689713161,
+    "technical": 0.10120700105195655,
+    "sales": 0.0958395920260105,
+    "legal": 0.10257366464438053,
+    "returns": 0.10254501122855161,
+    "fraud": 0.0955991910483556,
+    "retention": 0.1018747065525292,
+    "other": 0.10949608596708571,
+    "escalations": 0.09113082959020516
+   },
+   "confidence": 0.010551206630095226
+  },
+  "urgency": {
+   "type": "score",
+   "score": 1.5083177123396576,
+   "legend": {
+    "0": "can wait",
+    "1": "this week",
+    "2": "today",
+    "3": "right now"
+   },
+   "probabilities": {
+    "0": 0.23305325977828448,
+    "1": 0.2665376476144573,
+    "2": 0.25944721309657437,
+    "3": 0.24096187951068385
+   },
+   "confidence": 0.025575768103773378
+  },
+  "refund": {
+   "type": "noul",
+   "noul": 0.5026923652684026
+  },
+  "angry": {
+   "type": "noul",
+   "noul": 0.5001833548780689
+  }
+ },
+ "usage": {
+  "input_tokens": 978,
+  "output_tokens": 0
+ }
+}

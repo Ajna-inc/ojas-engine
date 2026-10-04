@@ -1,0 +1,31 @@
+{
+ "state": "I was charged twice for my order last week and nobody has replied.",
+ "questions": {
+  "route": {
+   "type": "choice",
+   "instructions": "Which team should handle this?",
+   "criteria": {
+    "billing": "payments and refunds",
+    "shipping": null,
+    "technical": null
+   }
+  },
+  "urgency": {
+   "type": "score",
+   "instructions": "How urgent is this?",
+   "criteria": [
+    "can wait",
+    "this week",
+    "today",
+    "right now"
+   ]
+  },
+  "angry": {
+   "type": "noul",
+   "instructions": "Is the customer angry?"
+  }
+ },
+ "images": [
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAKAAAABgCAIAAAAVRe7OAAAA9klEQVR42u3RQQ0AMAgEQeTgX0Xl1AHVwKskTMN7k95EZa66Zd+tAAwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAEDBgwYMGDAgAGPB77Nlydbp/+3DxgwAMAAAOsD1gesD1gfMGADAQYAGABgfcD6gPUBAzYQYACAAQDWB6wPWB+wPmDABgIMALA+YH3A+oD1AQM2EGAAgAEA1gesD1gfMGADAQYAGABgfcD6gPUB6wMGbCDAAMb3H4PU37BoiVysAAAAAElFTkSuQmCC"
+ ]
+}
