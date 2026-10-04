@@ -563,6 +563,7 @@ dependencies = [
  "ojas-decision",
  "ojas-formats",
  "ojas-metal",
+ "ojas-prefix",
  "ojas-tokenize",
  "serde_json",
  "tracing",
@@ -657,7 +658,18 @@ dependencies = [
  "ojas-formats",
  "ojas-infer",
  "ojas-metal",
+ "ojas-prefix",
  "ojas-tokenize",
+ "tracing",
+]
+
+[[package]]
+name = "ojas-prefix"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "libc",
+ "ojas-core",
  "tracing",
 ]
 

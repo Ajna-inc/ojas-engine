@@ -88,7 +88,7 @@ impl VitAttn {
 }
 
 /// Load options for [`CudaSsm::load_with`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct CudaSsmOpts {
     pub gemm: GemmMode,
     /// KV cache rows to allocate (the context capacity).
@@ -102,6 +102,9 @@ pub struct CudaSsmOpts {
     /// Independent sequence slots: each holds its own recurrent state and `context` KV rows.
     /// Generation uses slot 0; the decision readouts prefill one prompt per slot.
     pub slots: usize,
+    /// The prompt-prefix cache for slot 0's generation prompts ([`crate::prefix`]); `None`
+    /// keeps none.
+    pub prefix: Option<crate::PrefixOptions>,
 }
 
 impl Default for CudaSsmOpts {
@@ -113,6 +116,7 @@ impl Default for CudaSsmOpts {
             vit_attn: VitAttn::from_env(),
             ordinal: 0,
             slots: 1,
+            prefix: None,
         }
     }
 }
@@ -240,7 +244,7 @@ enum Mixer {
     Attn { wqkv: Lin, q_norm: CuBuf, k_norm: CuBuf, wo: Lin },
 }
 
-struct Layer {
+pub(crate) struct Layer {
     attn_norm: CuBuf,
     post_norm: CuBuf,
     mixer: Mixer,
@@ -248,17 +252,22 @@ struct Layer {
     down: Lin,
 }
 
+impl Layer {
+    /// Whether the layer attends over a KV cache (else it carries a recurrent state).
+    pub(crate) fn has_kv(&self) -> bool { matches!(self.mixer, Mixer::Attn { .. }) }
+}
+
 /// Recurrent state, KV cache and per-chunk scratch. The state buffers hold every slot's
 /// region back to back: `conv` / `ssm` / `kc` / `vc` of slot `s` start at
 /// `s * conv_bytes` / `s * ssm_bytes` / `s * kv_bytes` ([`CudaSsm::slot_bytes`]); `conv`
 /// and `ssm` have one region more than there are slots, the saved state.
-struct State {
+pub(crate) struct State {
     /// Fused-projection output rows (see [`Mixer`]).
     comb: CuBuf,
-    conv: Vec<Option<CuBuf>>,
-    ssm: Vec<Option<CuBuf>>,
-    kc: Vec<Option<CuBuf>>,
-    vc: Vec<Option<CuBuf>>,
+    pub(crate) conv: Vec<Option<CuBuf>>,
+    pub(crate) ssm: Vec<Option<CuBuf>>,
+    pub(crate) kc: Vec<Option<CuBuf>>,
+    pub(crate) vc: Vec<Option<CuBuf>>,
     x: CuBuf,
     h: CuBuf,
     qkv: CuBuf,
@@ -319,7 +328,7 @@ struct Seg<'a> {
 
 /// What a forward leaves behind for its last row.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Want {
+pub(crate) enum Want {
     /// Nothing (prefill).
     Nothing,
     /// Logits on the device (`st.logits`), not read back — `forward_id` argmaxes them there.
@@ -333,13 +342,13 @@ const KSPLIT: usize = 256;
 const SPLIT_MAX_M: usize = 16;
 
 pub struct CudaSsm {
-    gpu: CudaGpu,
+    pub(crate) gpu: CudaGpu,
     enc: Arc<CudaStream>,
-    opts: CudaSsmOpts,
+    pub(crate) opts: CudaSsmOpts,
     d: usize,
     n_head: usize,
-    n_kv: usize,
-    hd: usize,
+    pub(crate) n_kv: usize,
+    pub(crate) hd: usize,
     n_rot: usize,
     s_st: usize,
     h_k: usize,
@@ -354,19 +363,21 @@ pub struct CudaSsm {
     eps: f32,
     mrope_sections: [u32; 4],
     mrope_mode: u32,
-    layers: Vec<Layer>,
+    pub(crate) layers: Vec<Layer>,
     output_norm: CuBuf,
     embd: Embd,
     head: Option<Lin>,
     max_split: usize,
     vit: Option<CudaVit>,
-    st: RefCell<State>,
+    pub(crate) st: RefCell<State>,
     tracer: RefCell<Option<Tracer>>,
     /// The one-token decode step recorded as a CUDA graph (captured on first use).
     graph: RefCell<Option<crate::Recorded>>,
     /// Accumulated wall time spent in decoder forwards / vision encodes (seconds).
     pub timing: RefCell<Timing>,
     profile: crate::KernelProfile,
+    /// The prompt-prefix cache and the prefill in progress against it.
+    pub(crate) prefix: RefCell<crate::prefix::PrefixSession>,
 }
 
 /// Coarse timing counters.
@@ -409,8 +420,11 @@ pub(crate) fn blocks(n: usize, b: usize) -> u32 {
 
 impl CudaSsm {
     /// Load with default options and the given context.
+    /// The generation runner: `context` KV rows, one slot, and the prompt-prefix cache
+    /// the engine's settings ask for.
     pub fn load(g: &mut Gguf, context: usize) -> Result<CudaSsm> {
-        Self::load_with(g, CudaSsmOpts { context, ..CudaSsmOpts::default() })
+        let prefix = crate::PrefixOptions::from_config(&ojas_core::config::EngineConfig::current());
+        Self::load_with(g, CudaSsmOpts { context, prefix: Some(prefix), ..CudaSsmOpts::default() })
     }
 
     pub fn load_with(g: &mut Gguf, opts: CudaSsmOpts) -> Result<CudaSsm> {
@@ -510,15 +524,20 @@ impl CudaSsm {
             "loaded {n_layers} layers in {:.1}s | d={d} attn {n_head}/{n_kv} hd={hd} rot={n_rot} sections={mrope_sections:?} \
              | GDN S={s_st} Hk={h_k} Hv={h_v} d_inner={d_inner} | ctx={} chunk={} gemm={:?}",
             t0.elapsed().as_secs_f64(), opts.context, opts.chunk, opts.gemm);
-        Ok(CudaSsm {
+        let prefix = RefCell::new(crate::prefix::PrefixSession::new(opts.prefix.as_ref(), opts.chunk));
+        let model = CudaSsm {
             gpu, enc, opts, d, n_head, n_kv, hd, n_rot, s_st, h_k, h_v, d_inner, head_v, conv_ch, conv_k, ffn, vocab,
             rope_base, eps, mrope_sections, mrope_mode: 2, layers, output_norm, embd, head, max_split, vit: None,
-            st: RefCell::new(st),
+            st: RefCell::new(st), prefix,
             tracer: RefCell::new(None),
             graph: RefCell::new(None),
             timing: RefCell::new(Timing::default()),
             profile: crate::KernelProfile::from_env(),
-        })
+        };
+        if let Some(prefix) = model.opts.prefix.clone() {
+            model.open_prefix_dir(&prefix, &g.shard_paths());
+        }
+        Ok(model)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -593,7 +612,7 @@ impl CudaSsm {
     pub fn gpu(&self) -> &CudaGpu { &self.gpu }
     /// Sequence slots this runner holds state for.
     pub fn slots(&self) -> usize { self.opts.slots }
-    pub fn opts(&self) -> CudaSsmOpts { self.opts }
+    pub fn opts(&self) -> &CudaSsmOpts { &self.opts }
     pub fn vocab(&self) -> usize { self.vocab }
     pub fn mrope(&self) -> ([u32; 4], u32) { (self.mrope_sections, self.mrope_mode) }
     pub fn has_vit(&self) -> bool { self.vit.is_some() }
@@ -708,12 +727,12 @@ impl CudaSsm {
     // --------------------------------------------------------------- state
 
     /// Bytes of one slot's region of a layer's conv state, SSM state and KV cache.
-    fn slot_bytes(&self) -> (usize, usize, usize) {
+    pub(crate) fn slot_bytes(&self) -> (usize, usize, usize) {
         ((self.conv_k - 1) * self.conv_ch * 4, self.h_v * self.s_st * self.s_st * 4, self.opts.context * self.n_kv * self.hd * self.kv_elem())
     }
 
     /// Bytes per K/V cache element: f16, or f32 in the exact mode (no rounding anywhere).
-    fn kv_elem(&self) -> usize { if self.opts.gemm == GemmMode::Exact { 4 } else { 2 } }
+    pub(crate) fn kv_elem(&self) -> usize { if self.opts.gemm == GemmMode::Exact { 4 } else { 2 } }
 
     /// Zero every slot's recurrent state (fresh sequences). KV rows need no clearing:
     /// attention only ever reads rows it has written in this sequence.
@@ -909,7 +928,7 @@ impl CudaSsm {
     /// Forward `n` rows (ids or injected residual rows) at cache rows `base..base+n`, in
     /// internal chunks. `pos3 = None` ropes from the scalar cache row. Returns the last row's
     /// logits when asked.
-    fn forward(&self, ids: Option<&[u32]>, rows: Option<&[f32]>, n: usize, pos3: Option<&[[u32; 4]]>, base: usize,
+    pub(crate) fn forward(&self, ids: Option<&[u32]>, rows: Option<&[f32]>, n: usize, pos3: Option<&[[u32; 4]]>, base: usize,
                want: Want) -> Result<Option<Vec<f32>>> {
         ensure!(base + n <= self.opts.context,
             "rows {base}..{} exceed the CUDA context of {} (raise -c)", base + n, self.opts.context);
@@ -1236,9 +1255,22 @@ impl Model for CudaSsm {
 
     fn prefill(&self, tokens: &[u32], base_pos: usize) {
         if tokens.is_empty() { return; }
+        if self.uses_prefix_cache() { return self.prefill_cached(tokens, base_pos); }
         if base_pos == 0 { self.reset(); }
         self.forward(Some(tokens), None, tokens.len(), None, base_pos, Want::Nothing).expect("CUDA qwen35 prefill");
     }
+
+    fn reuse_prefix_len(&self, full_prompt: &[u32]) -> usize { CudaSsm::reuse_prefix_len(self, full_prompt) }
+    fn set_prefix_reuse(&self, on: bool) { CudaSsm::set_prefix_reuse(self, on) }
+    fn set_prefix_marks(&self, positions: &[usize]) { CudaSsm::set_prefix_marks(self, positions) }
+    fn prefix_cache_stats(&self) -> Option<ojas_core::PrefixCacheStats> {
+        self.uses_prefix_cache().then(|| CudaSsm::prefix_cache_stats(self))
+    }
+    fn save_prefix_cache(&self) { CudaSsm::save_prefix_cache(self) }
+    fn warm_prefix(&self, tokens: &[u32], pin: bool) -> Option<usize> {
+        self.uses_prefix_cache().then(|| CudaSsm::warm_prefix(self, tokens, pin))
+    }
+    fn unpin_prefix_cache(&self) { CudaSsm::unpin_prefix_cache(self) }
 
     fn prefill_embeds(&self, tokens: &[u32], x: &[f32], base_pos: usize, pos3: Option<&[[u32; 4]]>) -> bool {
         if let Some(p3) = pos3 {

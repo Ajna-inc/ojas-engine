@@ -199,6 +199,7 @@ installed llama.cpp.
 | `ojas-cpu` | CPU kernels and the numerical oracle |
 | `ojas-metal`, `ojas-cuda`, `ojas-vulkan` | GPU backends |
 | `ojas-models` | Decoder graphs, state, expert streaming |
+| `ojas-prefix` | Prompt-prefix and document caches, and the cache directory, shared by the backends |
 | `ojas-infer` | Generation, sampling, speculative decoding |
 | `ojas-vision` | ONNX import, vision IR and execution |
 | `ojas-learn` | Training tape and DETR-family training |

@@ -23,14 +23,14 @@
 //! This module is the bookkeeping only. Copying state in and out of the model is
 //! the decoder's job, and file I/O is `prefix_disk`'s.
 
-use super::prefix_disk::{Bytes, Disk, Opened, Part, Record, Wanted};
+use crate::prefix_disk::{Bytes, Disk, Opened, Part, Record, Wanted};
 use ojas_core::config::PrefixCacheSave;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Tokens per block. A multiple of the prefill chunk, so a run resumed at a block
 /// boundary prefills the rest in the same chunks a fresh run would.
-pub(crate) const BLOCK: usize = 256;
+pub const BLOCK: usize = 256;
 
 /// Prompts after which every use count halves. A prefix reused every few prompts
 /// stays ahead of new entries; one unused for a few hundred falls level with them.
@@ -41,12 +41,12 @@ const HALF_LIFE: u64 = 128;
 const INDEX_EVERY: u64 = 32;
 
 /// Key of the empty prefix, the parent of every first block.
-pub(crate) const ROOT: u64 = 0xcbf2_9ce4_8422_2325;
+pub const ROOT: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// Chain `parent` with one block of tokens (FNV-1a). A collision cannot serve the
 /// wrong state: lookups compare the stored parent and tokens, and a block is only
 /// added to, or given a snapshot, under a key whose stored block matches.
-pub(crate) fn chain(parent: u64, tokens: &[u32]) -> u64 {
+pub fn chain(parent: u64, tokens: &[u32]) -> u64 {
     let mut h = parent;
     for &t in tokens {
         for b in t.to_le_bytes() {
@@ -58,7 +58,7 @@ pub(crate) fn chain(parent: u64, tokens: &[u32]) -> u64 {
 }
 
 /// The keys of every full block of `tokens`.
-pub(crate) fn block_keys(tokens: &[u32]) -> Vec<u64> {
+pub fn block_keys(tokens: &[u32]) -> Vec<u64> {
     let mut keys = Vec::with_capacity(tokens.len() / BLOCK);
     let mut parent = ROOT;
     for block in tokens.as_chunks::<BLOCK>().0 {
@@ -70,24 +70,24 @@ pub(crate) fn block_keys(tokens: &[u32]) -> Vec<u64> {
 
 /// What a prefill in progress adds to the cache: its prompt, the prompt's block
 /// keys, and where to keep recurrent snapshots.
-pub(crate) struct Plan {
-    pub(crate) tokens: Vec<u32>,
-    pub(crate) keys: Vec<u64>,
+pub struct Plan {
+    pub tokens: Vec<u32>,
+    pub keys: Vec<u64>,
     /// Leading blocks the prompt shares with the cache. When no snapshot exists
     /// there, the run re-prefills through this boundary and leaves one, so the next
     /// prompt that branches at the same place resumes there.
-    pub(crate) branch: usize,
+    pub branch: usize,
     /// Blocks restored from the cache; prefill starts after them.
-    pub(crate) resume: usize,
+    pub resume: usize,
     /// Whether a prefill has taken up this plan.
-    pub(crate) started: bool,
+    pub started: bool,
     /// Block counts where the prompt has a boundary a later prompt may diverge at.
     marks: Vec<usize>,
     /// Snapshots taken at marks and intervals so far.
     extra: usize,
     /// Tokens through which the sequence is exact. A document reused from the
     /// document cache is approximate, and no block after it is cached.
-    pub(crate) exact: usize,
+    pub exact: usize,
 }
 
 /// Snapshots a prompt may keep besides the ones at its branch point and its end.
@@ -97,7 +97,7 @@ impl Plan {
     /// A plan for `tokens` (whose block keys are `keys`) after a lookup that found
     /// `hit`. `marks` are token positions of boundaries in the prompt; each keeps a
     /// snapshot at the block boundary at or before it.
-    pub(crate) fn new(tokens: Vec<u32>, keys: Vec<u64>, hit: Hit, marks: &[usize]) -> Self {
+    pub fn new(tokens: Vec<u32>, keys: Vec<u64>, hit: Hit, marks: &[usize]) -> Self {
         let mut marks: Vec<usize> = marks.iter().map(|&p| p / BLOCK).filter(|&b| b > 0).collect();
         marks.dedup();
         Plan { tokens, keys, branch: hit.blocks, resume: hit.resume, started: false, marks, extra: 0, exact: usize::MAX }
@@ -107,13 +107,13 @@ impl Plan {
     /// branch point and at the end of the prompt; at marks and every `every` tokens
     /// (rounded down to whole blocks) inside a long prompt, up to `EXTRA_SNAPSHOTS`
     /// of them.
-    pub(crate) fn wants_snapshot(&self, blocks: usize, every: usize) -> bool {
+    pub fn wants_snapshot(&self, blocks: usize, every: usize) -> bool {
         if blocks == self.branch || blocks == self.keys.len() { return true; }
         self.extra < EXTRA_SNAPSHOTS && (self.marks.contains(&blocks) || blocks.is_multiple_of((every / BLOCK).max(1)))
     }
 
     /// Count a snapshot taken after the first `blocks` blocks.
-    pub(crate) fn took_snapshot(&mut self, blocks: usize) {
+    pub fn took_snapshot(&mut self, blocks: usize) {
         if blocks != self.branch && blocks != self.keys.len() { self.extra += 1; }
     }
 }
@@ -199,30 +199,30 @@ impl Block {
 
 /// The longest cached prefix of a prompt.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Hit {
+pub struct Hit {
     /// Leading blocks present (KV rows cached).
-    pub(crate) blocks: usize,
+    pub blocks: usize,
     /// Leading blocks the run can resume after: the deepest block among them with
     /// a snapshot, or all of them when the model keeps no recurrent state.
-    pub(crate) resume: usize,
+    pub resume: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Stats {
-    pub(crate) blocks: usize,
-    pub(crate) snapshots: usize,
-    pub(crate) bytes: usize,
-    pub(crate) budget: usize,
-    pub(crate) disk_blocks: usize,
-    pub(crate) disk_snapshots: usize,
-    pub(crate) disk_bytes: usize,
-    pub(crate) disk_budget: usize,
-    pub(crate) disk_reads: u64,
-    pub(crate) pinned: usize,
-    pub(crate) evictions: u64,
-    pub(crate) lookups: u64,
-    pub(crate) hits: u64,
-    pub(crate) reused_tokens: u64,
+pub struct Stats {
+    pub blocks: usize,
+    pub snapshots: usize,
+    pub bytes: usize,
+    pub budget: usize,
+    pub disk_blocks: usize,
+    pub disk_snapshots: usize,
+    pub disk_bytes: usize,
+    pub disk_budget: usize,
+    pub disk_reads: u64,
+    pub pinned: usize,
+    pub evictions: u64,
+    pub lookups: u64,
+    pub hits: u64,
+    pub reused_tokens: u64,
 }
 
 /// A tier's byte budget and the bytes it holds.
@@ -244,7 +244,7 @@ struct DiskTier {
     indexed_at: u64,
 }
 
-pub(crate) struct PrefixCache {
+pub struct PrefixCache {
     blocks: HashMap<u64, Block>,
     ram: Room,
     disk: Option<DiskTier>,
@@ -253,18 +253,18 @@ pub(crate) struct PrefixCache {
 }
 
 impl PrefixCache {
-    pub(crate) fn new(budget: usize) -> Self {
+    pub fn new(budget: usize) -> Self {
         PrefixCache { blocks: HashMap::new(), ram: Room { budget, used: 0 }, disk: None, clock: 0, stats: Stats::default() }
     }
 
-    pub(crate) fn enabled(&self) -> bool { self.ram.budget > 0 }
+    pub fn enabled(&self) -> bool { self.ram.budget > 0 }
 
     /// Back the cache with an opened directory holding at most `budget` bytes. Its
     /// blocks become cached prefixes at once; records whose payload sizes are not
     /// `kv_len` and `snapshot_len`, or whose key does not match their tokens, are
     /// left out of the next index, and their files are removed the next time the
     /// directory is opened.
-    pub(crate) fn attach_disk(&mut self, opened: Opened, budget: usize, save: PrefixCacheSave, kv_len: usize,
+    pub fn attach_disk(&mut self, opened: Opened, budget: usize, save: PrefixCacheSave, kv_len: usize,
                               snapshot_len: usize) {
         let Opened { disk, records, clock } = opened;
         let mut used = 0;
@@ -299,7 +299,7 @@ impl PrefixCache {
         }
     }
 
-    pub(crate) fn stats(&self) -> Stats {
+    pub fn stats(&self) -> Stats {
         let mut s = Stats { blocks: self.blocks.len(), bytes: self.ram.used, budget: self.ram.budget, ..self.stats };
         for b in self.blocks.values() {
             s.snapshots += usize::from(b.snapshot.is_some());
@@ -315,13 +315,13 @@ impl PrefixCache {
 
     /// Whether `key` holds the block `tokens` after `parent`, rather than another
     /// block whose key collides with it.
-    pub(crate) fn matches(&self, key: u64, parent: u64, tokens: &[u32]) -> bool {
+    pub fn matches(&self, key: u64, parent: u64, tokens: &[u32]) -> bool {
         self.blocks.get(&key).is_some_and(|b| b.parent == parent && *b.tokens == *tokens)
     }
 
     /// The longest cached prefix of `tokens` (full blocks only). `stateful` models
     /// can resume only after a block with a snapshot.
-    pub(crate) fn lookup(&self, tokens: &[u32], keys: &[u64], stateful: bool) -> Hit {
+    pub fn lookup(&self, tokens: &[u32], keys: &[u64], stateful: bool) -> Hit {
         let mut hit = Hit::default();
         let mut parent = ROOT;
         for (i, (&key, block)) in keys.iter().zip(tokens.as_chunks::<BLOCK>().0).enumerate() {
@@ -337,7 +337,7 @@ impl PrefixCache {
     /// KV of each, and the snapshot after the last if it has one. `None` when a copy
     /// on disk is unreadable or damaged; that entry is dropped, so a new lookup finds
     /// what is still usable.
-    pub(crate) fn load(&mut self, keys: &[u64]) -> Option<(Vec<Bytes>, Option<Bytes>)> {
+    pub fn load(&mut self, keys: &[u64]) -> Option<(Vec<Bytes>, Option<Bytes>)> {
         let Some(&last) = keys.last() else { return Some((Vec::new(), None)) };
         let mut wanted: Vec<(u64, Part)> = keys.iter().map(|&key| (key, Part::Kv)).collect();
         if self.blocks.get(&last)?.snapshot.is_some() { wanted.push((last, Part::Snapshot)); }
@@ -380,7 +380,7 @@ impl PrefixCache {
     /// the lookup are skipped, with those after them. An entry is saved to the
     /// directory on its second use under the `Reused` policy, and under `Always`
     /// if an earlier save was skipped.
-    pub(crate) fn record(&mut self, used: &[u64], resume: usize) {
+    pub fn record(&mut self, used: &[u64], resume: usize) {
         let used = &used[..used.iter().take_while(|key| self.blocks.contains_key(key)).count()];
         self.stats.lookups += 1;
         if self.stats.lookups.is_multiple_of(HALF_LIFE) {
@@ -414,18 +414,18 @@ impl PrefixCache {
 
     /// Whether KV restored from the directory is bit-identical to processing:
     /// true without a directory, false for one that stores KV as Q8_0.
-    pub(crate) fn disk_kv_exact(&self) -> bool { self.disk.as_ref().is_none_or(|d| d.io.exact_kv()) }
+    pub fn disk_kv_exact(&self) -> bool { self.disk.as_ref().is_none_or(|d| d.io.exact_kv()) }
 
-    pub(crate) fn contains(&self, key: u64) -> bool { self.blocks.contains_key(&key) }
+    pub fn contains(&self, key: u64) -> bool { self.blocks.contains_key(&key) }
 
-    pub(crate) fn has_snapshot(&self, key: u64) -> bool {
+    pub fn has_snapshot(&self, key: u64) -> bool {
         self.blocks.get(&key).is_some_and(|b| b.snapshot.is_some())
     }
 
     /// Admit a block whose parent is cached (or the root). Returns whether the
     /// cache now holds it: false, storing nothing, when it cannot fit even after
     /// eviction, or when another block holds its key.
-    pub(crate) fn insert(&mut self, parent: u64, tokens: &[u32], kv: Vec<u8>) -> bool {
+    pub fn insert(&mut self, parent: u64, tokens: &[u32], kv: Vec<u8>) -> bool {
         let key = chain(parent, tokens);
         if self.blocks.contains_key(&key) {
             return self.matches(key, parent, tokens);
@@ -452,7 +452,7 @@ impl PrefixCache {
     }
 
     /// Attach a recurrent-state snapshot to a cached block.
-    pub(crate) fn attach_snapshot(&mut self, key: u64, snapshot: Vec<u8>) -> bool {
+    pub fn attach_snapshot(&mut self, key: u64, snapshot: Vec<u8>) -> bool {
         if !self.blocks.contains_key(&key) || self.has_snapshot(key) { return self.has_snapshot(key); }
         if !self.make_room(Tier::Ram, snapshot.len(), Some(key)) { return false; }
         self.ram.used += snapshot.len();
@@ -466,7 +466,7 @@ impl PrefixCache {
     /// Pin the cached leading blocks of `keys` and the snapshot after the last of
     /// them, and save them to the directory whatever the save policy. Returns the
     /// blocks pinned.
-    pub(crate) fn pin(&mut self, keys: &[u64]) -> usize {
+    pub fn pin(&mut self, keys: &[u64]) -> usize {
         let keys = &keys[..keys.iter().take_while(|key| self.blocks.contains_key(key)).count()];
         let Some(&last) = keys.last() else { return 0 };
         for &key in keys {
@@ -479,14 +479,14 @@ impl PrefixCache {
     }
 
     /// Release every pin; the blocks stay cached and compete on use again.
-    pub(crate) fn unpin_all(&mut self) {
+    pub fn unpin_all(&mut self) {
         for b in self.blocks.values_mut() { b.pinned = false; }
         if let Some(d) = self.disk.as_mut() { d.dirty = true; }
     }
 
     /// Take in finished writes, and queue a new index if what is on disk changed,
     /// or if only use counts did and `INDEX_EVERY` prompts have passed.
-    pub(crate) fn sync(&mut self) { self.sync_index(false); }
+    pub fn sync(&mut self) { self.sync_index(false); }
 
     fn sync_index(&mut self, always: bool) {
         let Some(d) = self.disk.as_mut() else { return };
@@ -515,7 +515,7 @@ impl PrefixCache {
     /// everything cached so far. Two passes: the first queues an index and waits
     /// for the writes before it, the second takes in their results and writes the
     /// index that reflects them.
-    pub(crate) fn flush(&mut self) {
+    pub fn flush(&mut self) {
         for _ in 0..2 {
             self.sync_index(true);
             if let Some(d) = &self.disk { d.io.flush(); }
@@ -723,7 +723,7 @@ impl Drop for PrefixCache {
 
 #[cfg(test)]
 mod tests {
-    use super::super::prefix_disk::{tests::scratch, DiskOptions};
+    use crate::prefix_disk::{tests::scratch, DiskOptions};
     use super::*;
     use std::path::Path;
 

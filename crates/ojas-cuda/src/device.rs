@@ -193,6 +193,11 @@ impl CudaGpu {
         p
     }
 
+    /// The device's name, as the driver reports it.
+    pub fn device_name(&self) -> String {
+        self.ctx.name().unwrap_or_else(|_| "cuda".into())
+    }
+
     /// Zero `len` bytes of `buf` from byte offset `off`, in stream order.
     pub fn zero_bytes(&self, buf: &CuBuf, off: usize, len: usize) -> Result<()> {
         if len == 0 { return Ok(()); }

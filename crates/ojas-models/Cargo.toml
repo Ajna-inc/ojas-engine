@@ -16,6 +16,8 @@ ojas-tokenize = { path = "../ojas-tokenize" }
 ojas-cpu = { path = "../ojas-cpu" }
 # The decision models' backend traits, implemented here on `DecoderGpu` (`decision_backend.rs`).
 ojas-decision = { path = "../ojas-decision" }
+# The prompt-prefix and document caches, shared with the CUDA side.
+ojas-prefix = { path = "../ojas-prefix" }
 anyhow = "1"
 half = "2"
 libc = "0.2"

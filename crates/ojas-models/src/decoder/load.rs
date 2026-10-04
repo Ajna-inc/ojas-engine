@@ -111,37 +111,7 @@ impl DecoderGpu<'_> {
     }
 }
 
-/// Bytes for the prompt-prefix cache: `prefix_cache_gb` when set (0 disables it),
-/// else a sixteenth of physical memory, at most 4 GB.
-fn prefix_cache_budget(cfg: &EngineConfig) -> usize {
-    match cfg.prefix_cache_gb {
-        Some(gb) => (gb.max(0.0) * 1e9) as usize,
-        None => (physical_ram_bytes() / 16).min(4_000_000_000) as usize,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn physical_ram_bytes() -> u64 {
-    let mut v: u64 = 0;
-    let mut len = std::mem::size_of::<u64>();
-    let name = std::ffi::CString::new("hw.memsize").unwrap();
-    let ok = unsafe {
-        libc::sysctlbyname(name.as_ptr(), &mut v as *mut u64 as *mut c_void, &mut len,
-                           std::ptr::null_mut(), 0)
-    };
-    if ok == 0 && v > 0 { v } else { 64u64 << 30 }
-}
-
-/// `sysctlbyname("hw.memsize")` has no portable twin; `_SC_PHYS_PAGES` is the POSIX one. Same
-/// 64 GiB fallback as the macOS path uses when the query fails.
-#[cfg(not(target_os = "macos"))]
-fn physical_ram_bytes() -> u64 {
-    let (pages, page) = unsafe {
-        (libc::sysconf(libc::_SC_PHYS_PAGES), libc::sysconf(libc::_SC_PAGESIZE))
-    };
-    if pages > 0 && page > 0 { pages as u64 * page as u64 } else { 64u64 << 30 }
-}
- // re-export
+use ojas_prefix::physical_ram_bytes;
 
 impl IndexerConfig {
     /// Read `{arch}.attention.indexer.{head_count,key_length,top_k}`. Absent keys
@@ -2072,7 +2042,7 @@ impl<'a> DecoderGpu<'a> {
             sess: Session {
                 model_name: std::path::Path::new(&g.path).file_stem()
                     .map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-                cache: std::cell::RefCell::new(super::prefix_cache::PrefixCache::new(prefix_cache_budget(&ecfg))),
+                cache: std::cell::RefCell::new(super::prefix_cache::PrefixCache::new(ojas_prefix::budget(&ecfg, physical_ram_bytes()))),
                 docs: std::cell::RefCell::new(super::doc_cache::DocCache::new((ecfg.doc_cache_gb.max(0.0) * 1e9) as usize)),
                 cache_last: std::cell::Cell::new(ojas_core::PrefixRestore::default()),
                 seqs: (0..slots).map(|_| super::SeqState::default()).collect(),

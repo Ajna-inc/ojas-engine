@@ -16,7 +16,7 @@
 //!
 //! This module holds the spans and does the rotation; placing them is the decoder's.
 
-use super::prefix_cache::{chain, ROOT};
+use crate::prefix_cache::{chain, ROOT};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -29,16 +29,16 @@ struct Doc {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct DocStats {
-    pub(crate) docs: usize,
-    pub(crate) bytes: usize,
-    pub(crate) budget: usize,
-    pub(crate) hits: u64,
-    pub(crate) reused_tokens: u64,
+pub struct DocStats {
+    pub docs: usize,
+    pub bytes: usize,
+    pub budget: usize,
+    pub hits: u64,
+    pub reused_tokens: u64,
 }
 
 /// Spans by content, least recently used evicted first, within a byte budget.
-pub(crate) struct DocCache {
+pub struct DocCache {
     docs: HashMap<u64, Doc>,
     budget: usize,
     used: usize,
@@ -48,19 +48,19 @@ pub(crate) struct DocCache {
 }
 
 impl DocCache {
-    pub(crate) fn new(budget: usize) -> Self {
+    pub fn new(budget: usize) -> Self {
         DocCache { docs: HashMap::new(), budget, used: 0, clock: 0, hits: 0, reused_tokens: 0 }
     }
 
-    pub(crate) fn enabled(&self) -> bool { self.budget > 0 }
+    pub fn enabled(&self) -> bool { self.budget > 0 }
 
-    pub(crate) fn stats(&self) -> DocStats {
+    pub fn stats(&self) -> DocStats {
         DocStats { docs: self.docs.len(), bytes: self.used, budget: self.budget, hits: self.hits,
                    reused_tokens: self.reused_tokens }
     }
 
     /// The rows cached for exactly `tokens`, and the position they were computed at.
-    pub(crate) fn get(&mut self, tokens: &[u32]) -> Option<(Arc<Vec<u8>>, usize)> {
+    pub fn get(&mut self, tokens: &[u32]) -> Option<(Arc<Vec<u8>>, usize)> {
         self.clock += 1;
         let clock = self.clock;
         let doc = self.docs.get_mut(&chain(ROOT, tokens)).filter(|d| *d.tokens == *tokens)?;
@@ -68,19 +68,19 @@ impl DocCache {
         Some((doc.kv.clone(), doc.base))
     }
 
-    pub(crate) fn contains(&self, tokens: &[u32]) -> bool {
+    pub fn contains(&self, tokens: &[u32]) -> bool {
         self.docs.get(&chain(ROOT, tokens)).is_some_and(|d| *d.tokens == *tokens)
     }
 
     /// Count a reuse of `tokens` cached tokens.
-    pub(crate) fn record(&mut self, tokens: usize) {
+    pub fn record(&mut self, tokens: usize) {
         self.hits += 1;
         self.reused_tokens += tokens as u64;
     }
 
     /// Keep the rows of `tokens`, computed with its first token at `base`. False when
     /// they cannot fit even with everything else evicted.
-    pub(crate) fn insert(&mut self, tokens: &[u32], base: usize, kv: Vec<u8>) -> bool {
+    pub fn insert(&mut self, tokens: &[u32], base: usize, kv: Vec<u8>) -> bool {
         if kv.len() > self.budget { return false; }
         let key = chain(ROOT, tokens);
         if let Some(old) = self.docs.remove(&key) { self.used -= old.kv.len(); }
@@ -99,14 +99,14 @@ impl DocCache {
 /// style as `(j, j + rd/2)`, at frequency `base^(-2j/rd)`. The convention of the
 /// `rope_qk_store` kernel.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Rope {
-    pub(crate) hd: usize,
-    pub(crate) rd: usize,
-    pub(crate) base: f32,
+pub struct Rope {
+    pub hd: usize,
+    pub rd: usize,
+    pub base: f32,
 }
 
 /// Rotate f16 key rows (`kvdim` halves each) by `delta` positions.
-pub(crate) fn rotate_keys(rows: &mut [u8], kvdim: usize, rope: Rope, delta: i64) {
+pub fn rotate_keys(rows: &mut [u8], kvdim: usize, rope: Rope, delta: i64) {
     if delta == 0 { return; }
     let half_rd = rope.rd / 2;
     let turn: Vec<(f32, f32)> = (0..half_rd).map(|j| {

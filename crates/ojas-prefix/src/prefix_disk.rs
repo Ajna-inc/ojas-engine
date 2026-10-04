@@ -28,7 +28,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
 /// A payload shared between the cache and the writer.
-pub(crate) type Bytes = Arc<Vec<u8>>;
+pub type Bytes = Arc<Vec<u8>>;
 
 const PAYLOAD_MAGIC: u64 = u64::from_le_bytes(*b"OJPCBLK1");
 const INDEX_MAGIC: u64 = u64::from_le_bytes(*b"OJPCIDX1");
@@ -42,7 +42,7 @@ const PARALLEL_READS: usize = 8;
 const MAX_PENDING: u64 = 1 << 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum Part {
+pub enum Part {
     Kv,
     Snapshot,
 }
@@ -58,22 +58,22 @@ impl Part {
 
 /// One block as the index stores it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Record {
-    pub(crate) key: u64,
-    pub(crate) parent: u64,
-    pub(crate) tokens: Box<[u32]>,
-    pub(crate) uses: u32,
-    pub(crate) snapshot_uses: u32,
-    pub(crate) last_used: u64,
-    pub(crate) kv_len: u64,
+pub struct Record {
+    pub key: u64,
+    pub parent: u64,
+    pub tokens: Box<[u32]>,
+    pub uses: u32,
+    pub snapshot_uses: u32,
+    pub last_used: u64,
+    pub kv_len: u64,
     /// Zero when the block's snapshot is not on disk.
-    pub(crate) snapshot_len: u64,
-    pub(crate) pinned: bool,
+    pub snapshot_len: u64,
+    pub pinned: bool,
 }
 
 /// How the directory stores KV payloads. Snapshots are always stored exactly.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum KvFormat {
+pub enum KvFormat {
     /// The f16 rows as computed: a restore is bit-identical to processing.
     #[default]
     F16,
@@ -84,31 +84,31 @@ pub(crate) enum KvFormat {
 
 /// How a directory is opened.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct DiskOptions {
-    pub(crate) readonly: bool,
+pub struct DiskOptions {
+    pub readonly: bool,
     /// Free space every write must leave on the volume.
-    pub(crate) reserve: u64,
+    pub reserve: u64,
     /// The length every record's token list must have.
-    pub(crate) block_tokens: usize,
-    pub(crate) kv: KvFormat,
+    pub block_tokens: usize,
+    pub kv: KvFormat,
 }
 
 /// A payload to read back, and what it must match.
-pub(crate) struct Wanted<'a> {
-    pub(crate) key: u64,
-    pub(crate) part: Part,
-    pub(crate) parent: u64,
-    pub(crate) tokens: &'a [u32],
-    pub(crate) len: usize,
+pub struct Wanted<'a> {
+    pub key: u64,
+    pub part: Part,
+    pub parent: u64,
+    pub tokens: &'a [u32],
+    pub len: usize,
 }
 
 /// The outcome of a queued write, named by the number `Disk::write` gave it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Written {
-    pub(crate) key: u64,
-    pub(crate) part: Part,
-    pub(crate) seq: u64,
-    pub(crate) ok: bool,
+pub struct Written {
+    pub key: u64,
+    pub part: Part,
+    pub seq: u64,
+    pub ok: bool,
 }
 
 enum Job {
@@ -132,7 +132,7 @@ struct Shared {
 }
 
 /// An open cache directory.
-pub(crate) struct Disk {
+pub struct Disk {
     shared: Arc<Shared>,
     /// The job queue and the writer thread; absent when read-only.
     writer: Option<(mpsc::Sender<Job>, JoinHandle<()>)>,
@@ -140,18 +140,18 @@ pub(crate) struct Disk {
 }
 
 /// A directory as `Disk::open` found it.
-pub(crate) struct Opened {
-    pub(crate) disk: Disk,
+pub struct Opened {
+    pub disk: Disk,
     /// The index's blocks whose payload files are present, parents before children.
-    pub(crate) records: Vec<Record>,
-    pub(crate) clock: u64,
+    pub records: Vec<Record>,
+    pub clock: u64,
 }
 
 impl Disk {
     /// Open `root/<salt>`, creating it unless read-only. The directory is opened
     /// read-only when asked, or when another process already writes to it. In
     /// read-write mode, payload files the index does not reference are removed.
-    pub(crate) fn open(root: &Path, salt: u64, about: &str, options: DiskOptions) -> io::Result<Opened> {
+    pub fn open(root: &Path, salt: u64, about: &str, options: DiskOptions) -> io::Result<Opened> {
         let DiskOptions { readonly, reserve, block_tokens, kv } = options;
         let dir = root.join(format!("{salt:016x}"));
         let lock = if readonly {
@@ -186,18 +186,18 @@ impl Disk {
         Ok(Opened { disk: Disk { shared, writer, _lock: lock }, records, clock })
     }
 
-    pub(crate) fn writable(&self) -> bool { self.writer.is_some() }
+    pub fn writable(&self) -> bool { self.writer.is_some() }
 
-    pub(crate) fn dir(&self) -> &Path { &self.shared.dir }
+    pub fn dir(&self) -> &Path { &self.shared.dir }
 
     /// Whether a KV payload read back is bit-identical to the rows written.
-    pub(crate) fn exact_kv(&self) -> bool { self.shared.kv == KvFormat::F16 }
+    pub fn exact_kv(&self) -> bool { self.shared.kv == KvFormat::F16 }
 
     /// Bytes a payload of `len` bytes takes in the directory.
-    pub(crate) fn stored_len(&self, part: Part, len: usize) -> usize { stored_len(self.shared.kv, part, len) }
+    pub fn stored_len(&self, part: Part, len: usize) -> usize { stored_len(self.shared.kv, part, len) }
 
     /// Read a payload and verify it is the one the index describes.
-    pub(crate) fn read(&self, key: u64, part: Part, parent: u64, tokens: &[u32], len: usize) -> io::Result<Vec<u8>> {
+    pub fn read(&self, key: u64, part: Part, parent: u64, tokens: &[u32], len: usize) -> io::Result<Vec<u8>> {
         let mut file = File::open(self.shared.path(key, part))?;
         bypass_page_cache(&file);
         let mut head = vec![0; header_len(tokens.len())];
@@ -214,7 +214,7 @@ impl Disk {
     }
 
     /// Read several payloads at once; results are in the order of `wanted`.
-    pub(crate) fn read_many(&self, wanted: &[Wanted<'_>]) -> Vec<io::Result<Vec<u8>>> {
+    pub fn read_many(&self, wanted: &[Wanted<'_>]) -> Vec<io::Result<Vec<u8>>> {
         let mut results: Vec<io::Result<Vec<u8>>> = Vec::with_capacity(wanted.len());
         std::thread::scope(|scope| {
             let per = wanted.len().div_ceil(PARALLEL_READS).max(1);
@@ -234,7 +234,7 @@ impl Disk {
     /// Queue a payload for writing, returning the number its `Written` will carry.
     /// `None`, queueing nothing, when the directory is read-only or the queue is
     /// full.
-    pub(crate) fn write(&self, key: u64, part: Part, parent: u64, tokens: &[u32], data: Bytes) -> Option<u64> {
+    pub fn write(&self, key: u64, part: Part, parent: u64, tokens: &[u32], data: Bytes) -> Option<u64> {
         let (tx, _) = self.writer.as_ref()?;
         let len = data.len() as u64;
         if self.shared.pending.fetch_add(len, Ordering::Relaxed) + len > MAX_PENDING {
@@ -246,24 +246,24 @@ impl Disk {
     }
 
     /// Delete a payload, after any write of it already queued.
-    pub(crate) fn remove(&self, key: u64, part: Part) {
+    pub fn remove(&self, key: u64, part: Part) {
         if let Some((tx, _)) = &self.writer {
             let _ = tx.send(Job::Remove(self.shared.path(key, part)));
         }
     }
 
     /// Replace the index, after the payload writes already queued.
-    pub(crate) fn save_index(&self, records: &[Record], clock: u64) {
+    pub fn save_index(&self, records: &[Record], clock: u64) {
         let Some((tx, _)) = &self.writer else { return };
         *self.shared.index.lock().unwrap() = Some(encode_index(records, clock));
         let _ = tx.send(Job::Index);
     }
 
     /// Writes finished since the last call.
-    pub(crate) fn written(&self) -> Vec<Written> { std::mem::take(&mut *self.shared.written.lock().unwrap()) }
+    pub fn written(&self) -> Vec<Written> { std::mem::take(&mut *self.shared.written.lock().unwrap()) }
 
     /// Wait until every job queued so far is done.
-    pub(crate) fn flush(&self) {
+    pub fn flush(&self) {
         let Some((tx, _)) = &self.writer else { return };
         let (ack, done) = mpsc::channel();
         if tx.send(Job::Flush(ack)).is_ok() {
@@ -423,7 +423,7 @@ fn present(dir: &Path, records: Vec<Record>, kv: KvFormat) -> Vec<Record> {
         let expect = stored_len(kv, part, len as usize) + header_len(r.tokens.len());
         fs::metadata(path).is_ok_and(|m| m.len() == expect as u64)
     };
-    let mut kept = std::collections::HashSet::from([super::prefix_cache::ROOT]);
+    let mut kept = std::collections::HashSet::from([crate::prefix_cache::ROOT]);
     let mut out = Vec::with_capacity(records.len());
     for mut r in records {
         if !kept.contains(&r.parent) || !size(&r, Part::Kv, r.kv_len) { continue; }
@@ -482,7 +482,7 @@ fn lock(dir: &Path) -> io::Result<Option<File>> {
 
 /// Bytes available to this process on the volume holding `path`.
 #[cfg(unix)]
-pub(crate) fn free_space(path: &Path) -> u64 {
+pub fn free_space(path: &Path) -> u64 {
     use std::os::unix::ffi::OsStrExt;
     let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return 0 };
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -491,7 +491,7 @@ pub(crate) fn free_space(path: &Path) -> u64 {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn free_space(_path: &Path) -> u64 { u64::MAX }
+pub fn free_space(_path: &Path) -> u64 { u64::MAX }
 
 fn stored_len(kv: KvFormat, part: Part, len: usize) -> usize {
     match (part, kv) {
@@ -532,7 +532,7 @@ fn q8_decode(data: &[u8]) -> Vec<u8> {
 /// A 64-bit checksum, four lanes wide so it runs near memory speed. Each lane is
 /// a bijection of its state and the next word, so any single changed word changes
 /// the result.
-pub(crate) fn checksum(data: &[u8]) -> u64 {
+pub fn checksum(data: &[u8]) -> u64 {
     const K: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut lanes = [0x243f_6a88_85a3_08d3_u64, 0x1319_8a2e_0370_7344, 0xa409_3822_299f_31d0, 0x082e_fa98_ec4e_6c89];
     let (chunks, tail) = data.as_chunks::<32>();
@@ -552,7 +552,7 @@ pub(crate) fn checksum(data: &[u8]) -> u64 {
 /// Identity of a model's weight files: each file's size, its first 16 MiB (header,
 /// metadata and vocabulary) and 64 pages sampled across the rest. Cheap at startup,
 /// and different for any two models that differ in their weights.
-pub(crate) fn fingerprint(paths: &[PathBuf]) -> io::Result<u64> {
+pub fn fingerprint(paths: &[PathBuf]) -> io::Result<u64> {
     const HEAD: u64 = 16 << 20;
     const PAGE: u64 = 4096;
     let mut h = Vec::new();
@@ -576,12 +576,12 @@ pub(crate) fn fingerprint(paths: &[PathBuf]) -> io::Result<u64> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+pub mod tests {
     use super::*;
-    use crate::decoder::prefix_cache::{chain, BLOCK, ROOT};
+    use crate::prefix_cache::{chain, BLOCK, ROOT};
 
     /// A fresh, empty directory under the system temporary directory.
-    pub(crate) fn scratch(name: &str) -> PathBuf {
+    pub fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ojas-prefix-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();

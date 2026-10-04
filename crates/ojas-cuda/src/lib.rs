@@ -13,10 +13,12 @@ pub mod device;
 pub mod expert_cache;
 pub mod kernels;
 pub mod nvdec;
+pub mod prefix;
 pub mod qwen35;
 
 pub use bert::CudaBert;
 pub use decision::CudaDecision;
 pub use device::{CuBuf, CudaGpu, KernelProfile, Recorded};
 pub use expert_cache::{ExpertCache, GatherStats};
+pub use prefix::PrefixOptions;
 pub use qwen35::{CudaSsm, CudaSsmOpts, CudaVit, GemmMode, VitAttn};

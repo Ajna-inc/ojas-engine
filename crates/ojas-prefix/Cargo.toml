@@ -1,0 +1,16 @@
+[package]
+name = "ojas-prefix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Prompt-prefix and document caches for the ojas decoders: blocks, eviction, and a cache directory."
+repository.workspace = true
+
+# Backend-neutral bookkeeping and file I/O. `ojas-models` (Metal) and `ojas-cuda` copy the
+# state in and out of their models.
+[dependencies]
+tracing = { workspace = true }
+ojas-core = { path = "../ojas-core" }
+libc = "0.2"
+half = "2"

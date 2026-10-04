@@ -19,6 +19,8 @@ ojas-cpu = { path = "../ojas-cpu" }
 ojas-arch = { path = "../ojas-arch" }
 # The decision models' backend traits, implemented here on `CudaSsm` and `CudaBert`.
 ojas-decision = { path = "../ojas-decision" }
+# The prompt-prefix cache's bookkeeping and directory format, shared with Metal.
+ojas-prefix = { path = "../ojas-prefix" }
 tracing = { workspace = true }
 cudarc = { version = "0.16", default-features = false, features = [
     "std", "driver", "nvrtc", "dynamic-loading", "cuda-12040",
