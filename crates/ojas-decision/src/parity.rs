@@ -91,7 +91,7 @@ pub fn compare(decision: &Decision, reference: &Json, tolerance: f64) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decision::Answer;
+    use crate::Answer;
 
     fn decision(p: &[f64], tokens: usize) -> Decision {
         Decision {

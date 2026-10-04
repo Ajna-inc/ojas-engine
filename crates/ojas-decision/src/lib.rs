@@ -21,20 +21,22 @@
 //! and a confidence. [`parity`] compares a decision with another implementation's
 //! response for the same request.
 
+pub mod backend;
 mod causal;
 pub mod json;
 mod marker;
 mod media;
 pub mod parity;
 mod template;
+pub mod testkit;
 
+pub use backend::{CausalBackend, CausalLoad, DecisionGpu, MarkerBackend, MarkerHeadOut, PromptRows, SlotPrefill, MAX_SLOTS};
 pub use media::{Image, MAX_IMAGES};
 
 use anyhow::{bail, Context, Result};
 use json::Json;
 use causal::{Causal, LabelSet, Read};
 use ojas_formats::gguf::{Gguf, Meta};
-use ojas_metal::MetalGpu;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -404,19 +406,19 @@ struct Scored {
     gpu_s: f64,
 }
 
-enum Engine<'a> {
-    Markers(marker::MarkerHead<'a>),
-    Causal(causal::CausalHead<'a>),
+enum Engine<M, C> {
+    Markers(marker::MarkerHead<M>),
+    Causal(causal::CausalHead<C>),
 }
 
-/// A loaded decision model.
-pub struct DecisionModel<'a> {
+/// A loaded decision model, on the backend `G` loaded it with.
+pub struct DecisionModel<'a, G: DecisionGpu + 'a> {
     name: String,
     /// The file's `decision.type`.
     kind: String,
     profile: Profile,
     calibration: Calibration,
-    engine: Engine<'a>,
+    engine: Engine<G::Marker<'a>, G::Causal<'a>>,
 }
 
 /// The `decision.type` a GGUF names, read from its header.
@@ -428,8 +430,8 @@ pub fn decision_type(path: &str) -> Option<String> {
     }
 }
 
-impl<'a> DecisionModel<'a> {
-    pub fn load(gpu: &'a MetalGpu, path: &str) -> Result<Self> {
+impl<'a, G: DecisionGpu + 'a> DecisionModel<'a, G> {
+    pub fn load(gpu: &'a G, path: &str) -> Result<Self> {
         let mut g = Gguf::open(path).with_context(|| format!("opening {path}"))?;
         let prefix = format!("{}.decision.", g.arch());
         let kind = match g.meta.get(&format!("{prefix}type")) {

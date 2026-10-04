@@ -11,7 +11,7 @@
 //!        runs `decision::BENCH_REQUEST`, the 7-question email case.
 
 use anyhow::{ensure, Context, Result};
-use ojas_models::decision::{json::Json, DecisionModel, Request, BENCH_REQUEST};
+use ojas_decision::{json::Json, DecisionModel, Request, BENCH_REQUEST};
 
 fn stats(mut v: Vec<f64>) -> (f64, f64) {
     v.sort_by(f64::total_cmp);
@@ -28,7 +28,8 @@ fn main() -> Result<()> {
         Some(path) => std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?,
         None => BENCH_REQUEST.to_string(),
     };
-    let gpu = ojas_metal::MetalGpu::new()?;
+    let metal = ojas_metal::MetalGpu::new()?;
+    let gpu = ojas_models::decision_backend::MetalDecision(&metal);
     let model = DecisionModel::load(&gpu, &args[0])?;
     let req = model.request(&Json::parse(&text)?)?;
     let mut sizes: Vec<usize> = vec![1, req.questions.len().div_ceil(2), req.questions.len()];

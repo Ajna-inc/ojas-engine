@@ -2,7 +2,7 @@
 //!
 //! The model files are not in the repository. These tests run when
 //! `OJAS_DECISION_MODELS` names the directory holding them (the models of
-//! `crates/ojas-models/tests/decision/cases.json`):
+//! `crates/ojas-decision/tests/decision/cases.json`):
 //!
 //! ```text
 //! OJAS_DECISION_MODELS=~/models/decision cargo test --release -p ojas-cli \
@@ -30,7 +30,7 @@ fn questions() -> Value {
 
 /// A request fixture shared with the model-level tests.
 fn fixture(name: &str) -> Value {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../ojas-models/tests/decision/requests/{name}.json"));
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../ojas-decision/tests/decision/requests/{name}.json"));
     serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap()
 }
 

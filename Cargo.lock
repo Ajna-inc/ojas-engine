@@ -513,6 +513,7 @@ dependencies = [
  "ojas-core",
  "ojas-cpu",
  "ojas-cuda",
+ "ojas-decision",
  "ojas-formats",
  "ojas-grammar",
  "ojas-infer",
@@ -559,11 +560,25 @@ dependencies = [
  "ojas-arch",
  "ojas-core",
  "ojas-cpu",
+ "ojas-decision",
  "ojas-formats",
  "ojas-metal",
  "ojas-tokenize",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "ojas-decision"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "half",
+ "minijinja",
+ "ojas-core",
+ "ojas-cpu",
+ "ojas-formats",
+ "ojas-tokenize",
 ]
 
 [[package]]
@@ -634,11 +649,11 @@ dependencies = [
  "half",
  "libc",
  "metal",
- "minijinja",
  "objc",
  "ojas-arch",
  "ojas-core",
  "ojas-cpu",
+ "ojas-decision",
  "ojas-formats",
  "ojas-infer",
  "ojas-metal",

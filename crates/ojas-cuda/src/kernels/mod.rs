@@ -2,7 +2,7 @@
 //! Entry names are Metal-canonical wherever a counterpart op exists.
 //!
 //! Families here: ops / gemv / gemv_iq / gemv_q8 / moe / moe_iq / attn_core / attn / ssm / cnn /
-//! learn (training). Metal-only families (mla) have no CUDA dialect yet — `family_source`
+//! learn (training) / bert (the text encoder). Metal-only families (mla) have no CUDA dialect yet — `family_source`
 //! returns None.
 //!
 //! `gemv_iq` is split out for the reason Metal splits `requant_iq`: the IQ codebooks are ~41 KB
@@ -10,6 +10,7 @@
 pub mod attn;
 pub mod attn_bidir;
 pub mod attn_core;
+pub mod bert;
 pub mod cnn;
 pub mod gemm_f16;
 pub mod gemm_q;
@@ -48,6 +49,7 @@ const SPLIT: &[(&str, &str, &[&str])] = &[
     ("moe_iq", moe_iq::BODY, moe_iq::NAMES),
     ("rope_m", rope_m::BODY, rope_m::NAMES),
     ("vision", vision::BODY, vision::NAMES),
+    ("bert", bert::BODY, bert::NAMES),
     ("qwen35", qwen35::BODY, qwen35::NAMES),
 ];
 

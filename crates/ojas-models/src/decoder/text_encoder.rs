@@ -24,14 +24,7 @@ use super::*;
 use anyhow::{ensure, Result};
 use objc::{msg_send, sel, sel_impl};
 
-/// Per-sequence results of [`DecoderGpu::marker_head_forward`].
-pub struct MarkerHeadOut {
-    /// For each sequence, for each marker position asked for: the scorer's hidden
-    /// vector after its GELU, `d` floats.
-    pub scorer_hidden: Vec<Vec<Vec<f32>>>,
-    /// GPU execution time, from the command buffer's timestamps.
-    pub gpu_s: f64,
-}
+pub use ojas_decision::MarkerHeadOut;
 
 /// Row buffers for packed requests, kept on the decoder and reused. Allocating them per
 /// request (up to 15 MB each, two of them zero-filled) put about 9 ms of host time on

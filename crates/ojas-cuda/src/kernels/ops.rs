@@ -104,6 +104,16 @@ extern "C" __global__ void copy_buf(float* dst, const float* src, int n) {
     if (g < n) dst[g] = src[g];
 }
 
+// Several copies in one launch: entry y of `tab` is [dst address, src address, words];
+// grid.x strides over the longest one.
+extern "C" __global__ void copy_regions(const unsigned long long* tab) {
+    const unsigned long long* e = tab + 3 * blockIdx.y;
+    float* dst = (float*)e[0];
+    const float* src = (const float*)e[1];
+    const unsigned n = (unsigned)e[2];
+    for (unsigned g = blockIdx.x * blockDim.x + threadIdx.x; g < n; g += gridDim.x * blockDim.x) dst[g] = src[g];
+}
+
 // GPU argmax over `n` logits, one block; shared-mem tree reduction. out[0]=index.
 extern "C" __global__ void argmax(const float* logits, unsigned int* out, int n) {
     __shared__ float vals[1024];
@@ -577,6 +587,7 @@ pub const NAMES: &[&str] = &[
     "add_inplace",
     "mul_scalar",
     "copy_buf",
+    "copy_regions",
     "argmax",
     "argmax_ctl",
     "rope_qk_g",

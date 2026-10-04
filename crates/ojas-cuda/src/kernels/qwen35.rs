@@ -18,7 +18,9 @@
 //! | q35_embed_f16   | emb(half), ids(u32), x                                | d, M                                                                | 1-D over M*d |
 //! | q35_split_lo    | x, lo                                                 | n                                                                   | 1-D over n |
 //! | q35_qk_prep     | qfull, kin, vin, qw, kw, mpos(u32), q, kc, vc, ctl(u32) | hd, nh, nkv, rd, M, s0, s1, s2, s3, mode, theta(f32), eps(f32)      | grid ceil(M*(nh+2nkv)/4), block 128 |
+//! | q35_qk_prep_h   | the same, kc / vc f16                                 |                                                                     |                                   |
 //! | q35_attn_256    | q, kc, vc, out, po, pml, ctl(u32)                     | kvdim, M, group, n_head, chunk, causal, scale(f32)                  | grid [ceil(M/(32/group)), n_kv, nsplit], block 128 |
+//! | q35_attn_256_h  | the same, kc / vc f16                                 |                                                                     |                                   |
 //! | q35_attn_64     | (same)                                                | (same)                                                              | (same) |
 //! | q35_attn_merge  | po, pml, out                                          | hd, n_head, M, nsplit                                               | grid M*n_head, block 128 |
 //! | q35_unpack4     | src, d0, d1, d2, d3                                   | n0, n1, n2, n3, M                                                   | 1-D over M*(n0+n1+n2+n3) |
@@ -45,6 +47,26 @@
 //! decode step be recorded once as a CUDA graph and replayed at every position (with the
 //! split count fixed at its maximum; splits past `total` exit writing an empty partial).
 pub const BODY: &str = r#"
+// Embed M tokens from a Q4_K table read in place: x[m, i] = row ids[m] of emb, 144-byte
+// super-blocks of 256 (half d, half dmin, 12 packed 6-bit scale/min pairs, 128 nibble bytes;
+// elements 64j..64j+32 are the low nibbles of bytes 32j.., the next 32 the high nibbles).
+extern "C" __global__ void q35_embed_q4k(const unsigned char* emb, const unsigned* ids, float* x,
+    unsigned d, unsigned M) {
+    unsigned long long g = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= (unsigned long long)M * d) return;
+    unsigned m = (unsigned)(g / d), col = (unsigned)(g % d);
+    const unsigned char* blk = emb + ((unsigned long long)ids[m] * (d >> 8) + (col >> 8)) * 144;
+    unsigned e = col & 255u, b64 = e >> 6, r = e & 63u, hi = r >> 5, is = 2u * b64 + hi;
+    float dd = __half2float(*(const __half*)blk), dm = __half2float(*(const __half*)(blk + 2));
+    const unsigned char* sc = blk + 4;
+    unsigned s_, m_;
+    if (is < 4u) { s_ = sc[is] & 63u; m_ = sc[is + 4] & 63u; }
+    else { s_ = (sc[is + 4] & 0xFu) | ((sc[is - 4] >> 6) << 4); m_ = (sc[is + 4] >> 4) | ((sc[is] >> 6) << 4); }
+    unsigned char by = blk[16 + b64 * 32 + (r & 31u)];
+    unsigned q = hi ? (by >> 4) : (by & 15u);
+    x[g] = dd * (float)s_ * (float)q - dm * (float)m_;
+}
+
 extern "C" __global__ void q35_embed_f16(const __half* emb, const unsigned* ids, float* x,
     unsigned d, unsigned M) {
     unsigned long long g = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -88,8 +110,19 @@ __device__ __forceinline__ void q35_sel(const unsigned* p4, unsigned s0, unsigne
 //   slots [nh, nh+nkv)     k head: RMSNorm(kw), rope -> kc row (base + m)
 //   slots [nh+nkv, +nkv)   v head: copy -> vc row (base + m)
 // Partial NEOX rope over the first rd dims (pairs (j, j + rd/2)); mpos is (t,h,w,e) per row.
-extern "C" __global__ void q35_qk_prep(const float* qfull, const float* kin, const float* vin,
-    const float* qw, const float* kw, const unsigned* mpos, float* q, float* kc, float* vc,
+__device__ __forceinline__ void q35_st(float* d, float v) { *d = v; }
+__device__ __forceinline__ void q35_st(__half* d, float v) { *d = __float2half_rn(v); }
+__device__ __forceinline__ float4 q35_ld4(const float* p) { return *(const float4*)p; }
+__device__ __forceinline__ float4 q35_ld4(const __half* p) {
+    uint2 u = *(const uint2*)p;
+    float2 a = __half22float2(*(const __half2*)&u.x), b = __half22float2(*(const __half2*)&u.y);
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+
+// KVT: the cache's element type, f32 (the exact mode) or f16.
+template <class KVT>
+__device__ __forceinline__ void q35_qk_prep_core(const float* qfull, const float* kin, const float* vin,
+    const float* qw, const float* kw, const unsigned* mpos, float* q, KVT* kc, KVT* vc,
     const unsigned* ctl, unsigned hd, unsigned nh, unsigned nkv, unsigned rd, unsigned M,
     unsigned s0, unsigned s1, unsigned s2, unsigned s3, unsigned mode, float theta, float eps) {
     const unsigned base = ctl[0];
@@ -104,19 +137,17 @@ extern "C" __global__ void q35_qk_prep(const float* qfull, const float* kin, con
     if (s >= nh + nkv) {
         unsigned h = s - nh - nkv;
         const float* src = vin + (unsigned long long)m * kvdim + h * hd;
-        for (unsigned i = lane; i < hd; i += 32u) vc[crow + h * hd + i] = src[i];
+        for (unsigned i = lane; i < hd; i += 32u) q35_st(vc + crow + h * hd + i, src[i]);
         return;
     }
-    const float* src; const float* w; float* dst;
+    const float* src; const float* w;
     if (s < nh) {
         src = qfull + (unsigned long long)m * (2u * nh * hd) + s * 2u * hd;
         w = qw;
-        dst = q + (unsigned long long)m * nh * hd + s * hd;
     } else {
         unsigned h = s - nh;
         src = kin + (unsigned long long)m * kvdim + h * hd;
         w = kw;
-        dst = kc + crow + h * hd;
     }
     float* v = sh[warp];
     float ss = 0.0f;
@@ -139,7 +170,27 @@ extern "C" __global__ void q35_qk_prep(const float* qfull, const float* kin, con
         v[j + rf] = x0 * sn + x1 * cs;
     }
     __syncwarp();
-    for (unsigned i = lane; i < hd; i += 32u) dst[i] = v[i];
+    if (s < nh) {
+        float* dst = q + (unsigned long long)m * nh * hd + s * hd;
+        for (unsigned i = lane; i < hd; i += 32u) dst[i] = v[i];
+    } else {
+        KVT* dst = kc + crow + (s - nh) * hd;
+        for (unsigned i = lane; i < hd; i += 32u) q35_st(dst + i, v[i]);
+    }
+}
+
+extern "C" __global__ void q35_qk_prep(const float* qfull, const float* kin, const float* vin,
+    const float* qw, const float* kw, const unsigned* mpos, float* q, float* kc, float* vc,
+    const unsigned* ctl, unsigned hd, unsigned nh, unsigned nkv, unsigned rd, unsigned M,
+    unsigned s0, unsigned s1, unsigned s2, unsigned s3, unsigned mode, float theta, float eps) {
+    q35_qk_prep_core<float>(qfull, kin, vin, qw, kw, mpos, q, kc, vc, ctl, hd, nh, nkv, rd, M, s0, s1, s2, s3, mode, theta, eps);
+}
+
+extern "C" __global__ void q35_qk_prep_h(const float* qfull, const float* kin, const float* vin,
+    const float* qw, const float* kw, const unsigned* mpos, float* q, __half* kc, __half* vc,
+    const unsigned* ctl, unsigned hd, unsigned nh, unsigned nkv, unsigned rd, unsigned M,
+    unsigned s0, unsigned s1, unsigned s2, unsigned s3, unsigned mode, float theta, float eps) {
+    q35_qk_prep_core<__half>(qfull, kin, vin, qw, kw, mpos, q, kc, vc, ctl, hd, nh, nkv, rd, M, s0, s1, s2, s3, mode, theta, eps);
 }
 
 // Split fused-projection rows [a | b | c | d] (row stride n0+n1+n2+n3) into four contiguous
@@ -213,8 +264,8 @@ __device__ __forceinline__ float q35_treduce32(float (&v)[32], unsigned lane) {
 #define QA_BK 32
 #define QA_NEG -1e30f
 
-template <int HD>
-__device__ __forceinline__ void q35_attn_core(const float* q, const float* kc, const float* vc,
+template <int HD, class KVT>
+__device__ __forceinline__ void q35_attn_core(const float* q, const KVT* kc, const KVT* vc,
     float* out, float* po, float* pml, const unsigned* ctl, unsigned kvdim, unsigned M,
     unsigned group, unsigned n_head, unsigned chunk, unsigned causal, float scale) {
     const unsigned base = ctl[0], total = ctl[1];
@@ -255,7 +306,7 @@ __device__ __forceinline__ void q35_attn_core(const float* q, const float* kc, c
         for (unsigned e = threadIdx.x; e < QA_BK * (HD / 4); e += blockDim.x) {
             unsigned kk = e / (HD / 4), c = (e % (HD / 4)) * 4u, t = t0 + kk;
             float4 v4 = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (t < khi) v4 = *(const float4*)(kc + (unsigned long long)t * kvdim + kv_off + c);
+            if (t < khi) v4 = q35_ld4(kc + (unsigned long long)t * kvdim + kv_off + c);
             *(float4*)(sm + kk * SROW + c) = v4;
         }
         __syncthreads();
@@ -303,7 +354,7 @@ __device__ __forceinline__ void q35_attn_core(const float* q, const float* kc, c
         for (unsigned e = threadIdx.x; e < QA_BK * (HD / 4); e += blockDim.x) {
             unsigned kk = e / (HD / 4), c = (e % (HD / 4)) * 4u, t = t0 + kk;
             float4 v4 = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (t < khi) v4 = *(const float4*)(vc + (unsigned long long)t * kvdim + kv_off + c);
+            if (t < khi) v4 = q35_ld4(vc + (unsigned long long)t * kvdim + kv_off + c);
             *(float4*)(sm + kk * SROW + c) = v4;
         }
         __syncthreads();
@@ -345,16 +396,25 @@ extern "C" __global__ void __launch_bounds__(128) q35_attn_256(const float* q, c
     const float* vc, float* out, float* po, float* pml, const unsigned* ctl, unsigned kvdim,
     unsigned M, unsigned group, unsigned n_head, unsigned chunk,
     unsigned causal, float scale) {
-    q35_attn_core<256>(q, kc, vc, out, po, pml, ctl, kvdim, M, group, n_head, chunk,
-                       causal, scale);
+    q35_attn_core<256, float>(q, kc, vc, out, po, pml, ctl, kvdim, M, group, n_head, chunk,
+                              causal, scale);
+}
+
+// The same over an f16 K/V cache.
+extern "C" __global__ void __launch_bounds__(128) q35_attn_256_h(const float* q, const __half* kc,
+    const __half* vc, float* out, float* po, float* pml, const unsigned* ctl, unsigned kvdim,
+    unsigned M, unsigned group, unsigned n_head, unsigned chunk,
+    unsigned causal, float scale) {
+    q35_attn_core<256, __half>(q, kc, vc, out, po, pml, ctl, kvdim, M, group, n_head, chunk,
+                               causal, scale);
 }
 
 extern "C" __global__ void __launch_bounds__(128) q35_attn_64(const float* q, const float* kc,
     const float* vc, float* out, float* po, float* pml, const unsigned* ctl, unsigned kvdim,
     unsigned M, unsigned group, unsigned n_head, unsigned chunk,
     unsigned causal, float scale) {
-    q35_attn_core<64>(q, kc, vc, out, po, pml, ctl, kvdim, M, group, n_head, chunk,
-                      causal, scale);
+    q35_attn_core<64, float>(q, kc, vc, out, po, pml, ctl, kvdim, M, group, n_head, chunk,
+                             causal, scale);
 }
 
 // ---- vision tower attention, split-f16 tensor cores ("x3") ----
@@ -584,10 +644,12 @@ extern "C" __global__ void q35_attn_merge(const float* po, const float* pml, flo
 "#;
 
 pub const NAMES: &[&str] = &[
-    "q35_embed_f16",
+    "q35_embed_f16", "q35_embed_q4k",
     "q35_split_lo",
     "q35_qk_prep",
+    "q35_qk_prep_h",
     "q35_attn_256",
+    "q35_attn_256_h",
     "q35_attn_64",
     "q35_attn_merge",
     "q35_split_half",

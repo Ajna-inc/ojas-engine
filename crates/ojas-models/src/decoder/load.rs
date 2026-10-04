@@ -1,6 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 use super::*;
-use ojas_formats::gguf::{Gguf, Meta};
+use ojas_formats::gguf::Gguf;
 use ojas_metal::MetalGpu;
 use anyhow::Result;
 use metal::MTLResourceOptions;
@@ -219,100 +219,29 @@ impl VisionConfig {
     }
 }
 
-impl TextEncoderConfig {
-    /// The `<arch>.*` encoder keys, and the `<arch>.decision.*` keys of a decision
-    /// head over the last blocks. Shapes are checked against the tensors here, so a
-    /// truncated or foreign file fails with a key name rather than inside graph
-    /// construction.
-    fn from_gguf(g: &Gguf) -> Result<TextEncoderConfig> {
-        let arch = g.arch();
-        let mu = |k: &str| g.meta_u32(&format!("{arch}.{k}"));
-        let total = mu("block_count").unwrap_or(0);
-        let head_blocks = mu("decision.block_count").unwrap_or(0);
-        anyhow::ensure!(head_blocks < total, "{arch}: decision.block_count {head_blocks} leaves no encoder blocks");
-        let layers = total - head_blocks;
-        // One width for every encoder block; the head's blocks have their own.
-        let ffn = match g.meta.get(&format!("{arch}.feed_forward_length")) {
-            Some(Meta::IntArr(per_block)) => {
-                let encoder = &per_block[..(layers as usize).min(per_block.len())];
-                anyhow::ensure!(!encoder.is_empty() && encoder.iter().all(|&f| f == encoder[0]),
-                    "{arch}: the encoder blocks do not share one feed_forward_length");
-                encoder[0] as u32
-            }
-            _ => mu("feed_forward_length").unwrap_or(0),
-        };
-        let (d, n_head) = (mu("embedding_length").unwrap_or(0), mu("attention.head_count").unwrap_or(0));
-        anyhow::ensure!(d > 0 && layers > 0 && n_head > 0 && ffn > 0 && d % n_head == 0,
-            "{arch}: incomplete encoder metadata (embd={d} blocks={layers} heads={n_head} ffn={ffn})");
-        let hd = d / n_head;
-        // The bidirectional attention kernels keep a head in 16 accumulators per lane
-        // across a 32-lane simdgroup: hd % 32 == 0 and hd <= 512.
-        anyhow::ensure!(hd % 32 == 0 && hd <= 512,
-            "{arch}: head_dim {hd} is not supported by the bidirectional attention kernels");
-        let act = match g.meta.get(&format!("{arch}.hidden_activation")) {
-            Some(Meta::Str(s)) => s.clone(),
-            _ => "gelu".to_string(),
-        };
-        anyhow::ensure!(act == "gelu", "{arch}: hidden_activation {act:?} is not implemented (only \"gelu\", the erf form)");
-        let eps = g.meta_f32(&format!("{arch}.attention.layer_norm_epsilon")).unwrap_or(1e-5);
-        let rope_base = g.meta_f32(&format!("{arch}.rope.freq_base")).unwrap_or(160000.0);
-        let rope_base_local = g.meta_f32(&format!("{arch}.rope.freq_base_swa")).unwrap_or(rope_base);
-        let sliding = mu("attention.sliding_window").unwrap_or(0);
-        let swa_pattern = if sliding > 0 { mu("attention.sliding_window_pattern").unwrap_or(3) } else { 0 };
-        let max_positions = mu("context_length").unwrap_or(8192);
-        for (name, want) in [("blk.0.attn_qkv.weight", [d as u64, 3 * d as u64]),
-                             ("blk.0.ffn_up.weight", [d as u64, 2 * ffn as u64]),
-                             ("blk.0.ffn_down.weight", [ffn as u64, d as u64])] {
-            let t = g.tensors.get(name).ok_or_else(|| anyhow::anyhow!("{arch}: missing {name}"))?;
-            anyhow::ensure!(t.dims == want, "{arch}: {name} is {:?}, expected {want:?}", t.dims);
+/// Every tensor the GPU reads for a text encoder, in upload order.
+fn text_encoder_tensors(te: &TextEncoderConfig, g: &Gguf) -> Vec<String> {
+    let mut names: Vec<String> = vec!["token_embd.weight".into(), "token_embd_norm.weight".into(),
+                                      "output_norm.weight".into()];
+    for i in 0..te.layers {
+        if g.tensors.contains_key(&format!("blk.{i}.attn_norm.weight")) {
+            names.push(format!("blk.{i}.attn_norm.weight"));
         }
-        let marker_head = if head_blocks == 0 {
-            None
-        } else {
-            let up = format!("blk.{layers}.ffn_up.weight");
-            let t = g.tensors.get(&up).ok_or_else(|| anyhow::anyhow!("decision head: missing {up}"))?;
-            anyhow::ensure!(t.dims.len() == 2 && t.dims[0] == d as u64, "decision head: {up} is {:?}", t.dims);
-            let head = MarkerHeadConfig { first: layers, blocks: head_blocks, n_head, ffn: t.dims[1] as u32, eps };
-            for i in layers..total {
-                let name = format!("blk.{i}.ffn_up.weight");
-                let t = g.tensors.get(&name).ok_or_else(|| anyhow::anyhow!("decision head: missing {name}"))?;
-                anyhow::ensure!(t.dims == [d as u64, head.ffn as u64], "decision head: {name} is {:?}", t.dims);
-            }
-            for name in ["token_types.weight", "cls.norm.weight", "cls.weight", "cls.output.weight"] {
-                anyhow::ensure!(g.tensors.contains_key(name), "decision head: missing {name}");
-            }
-            Some(head)
-        };
-        Ok(TextEncoderConfig {
-            d, layers, n_head, hd, ffn, eps, rope_base, rope_base_local,
-            window: sliding / 2, swa_pattern, max_positions, marker_head,
-        })
+        for s in ["attn_qkv.weight", "attn_output.weight", "ffn_norm.weight", "ffn_up.weight", "ffn_down.weight"] {
+            names.push(format!("blk.{i}.{s}"));
+        }
     }
-
-    /// Every tensor the GPU reads, in upload order.
-    fn gpu_tensors(&self, g: &Gguf) -> Vec<String> {
-        let mut names: Vec<String> = vec!["token_embd.weight".into(), "token_embd_norm.weight".into(),
-                                          "output_norm.weight".into()];
-        for i in 0..self.layers {
-            if g.tensors.contains_key(&format!("blk.{i}.attn_norm.weight")) {
-                names.push(format!("blk.{i}.attn_norm.weight"));
-            }
-            for s in ["attn_qkv.weight", "attn_output.weight", "ffn_norm.weight", "ffn_up.weight", "ffn_down.weight"] {
-                names.push(format!("blk.{i}.{s}"));
+    if let Some(h) = &te.marker_head {
+        for i in h.first..h.first + h.blocks {
+            for s in ["attn_norm", "attn_qkv", "attn_output", "ffn_norm", "ffn_up", "ffn_down"] {
+                for kind in ["weight", "bias"] { names.push(format!("blk.{i}.{s}.{kind}")); }
             }
         }
-        if let Some(h) = &self.marker_head {
-            for i in h.first..h.first + h.blocks {
-                for s in ["attn_norm", "attn_qkv", "attn_output", "ffn_norm", "ffn_up", "ffn_down"] {
-                    for kind in ["weight", "bias"] { names.push(format!("blk.{i}.{s}.{kind}")); }
-                }
-            }
-            for s in ["token_types.weight", "cls.norm.weight", "cls.norm.bias", "cls.weight", "cls.bias"] {
-                names.push(s.into());
-            }
+        for s in ["token_types.weight", "cls.norm.weight", "cls.norm.bias", "cls.weight", "cls.bias"] {
+            names.push(s.into());
         }
-        names
     }
+    names
 }
 
 /// The precision argument that asks [`DecoderGpu::load`] to choose the tier for the
@@ -914,7 +843,7 @@ impl<'a> DecoderGpu<'a> {
             && !g.tensors.contains_key("blk.0.attn_kv_b.weight");
         if !tied_embed { names.push("output.weight".into()); }
         if let Some(te) = &text_encoder {
-            names = te.gpu_tensors(g);
+            names = text_encoder_tensors(te, g);
         } else if arch == "qwen35" || arch == "qwen35moe" {
             // Gated-DeltaNet hybrid: SSM layers vs attention layers have different tensors.
             let interval = g.meta_u32(&format!("{arch}.full_attention_interval")).unwrap_or(4);
@@ -2263,6 +2192,7 @@ impl<'a> DecoderGpu<'a> {
             want_topk: std::cell::Cell::new(false),
             cur_slot: std::cell::Cell::new(0),
             text_arena: std::cell::RefCell::new(None),
+            saved_state: std::cell::RefCell::new(Vec::new()),
             tune: Tune { max_tg, gemv_plan: HashMap::new(), xv_plan: HashMap::new(), q4l_tg: HashMap::new() },
         };
         // OJAS_EXPERT_PRUNE=<saliency.bin>:<pct>: REAP-style prune×IQ2 sub-100GB sim

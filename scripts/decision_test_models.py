@@ -4,7 +4,7 @@ pointer readouts.
 
 `tinylev` and `tinykev` are `tinyopenjev` (a four-layer Qwen3.5 with random
 weights) under another decision type: the same tensors, the type's own prompt
-template (from `crates/ojas-models/tests/decision/templates/`) and temperatures,
+template (from `crates/ojas-decision/tests/decision/templates/`) and temperatures,
 and for the pointer readout a seeded random `cls.output` projection. They exercise
 every code path of the full-size models in a file of 46 MB.
 
@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 from gguf import GGUFReader, GGUFValueType, GGUFWriter
 
-TEMPLATES = Path(__file__).resolve().parent.parent / "crates/ojas-models/tests/decision/templates"
+TEMPLATES = Path(__file__).resolve().parent.parent / "crates/ojas-decision/tests/decision/templates"
 
 # Temperatures by type: `<question type>[.<option-count bucket>]`.
 TEMPERATURES = {

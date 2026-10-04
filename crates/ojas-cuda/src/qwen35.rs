@@ -99,6 +99,9 @@ pub struct CudaSsmOpts {
     pub vit_attn: VitAttn,
     /// Device ordinal.
     pub ordinal: usize,
+    /// Independent sequence slots: each holds its own recurrent state and `context` KV rows.
+    /// Generation uses slot 0; the decision readouts prefill one prompt per slot.
+    pub slots: usize,
 }
 
 impl Default for CudaSsmOpts {
@@ -109,6 +112,7 @@ impl Default for CudaSsmOpts {
             chunk: 256,
             vit_attn: VitAttn::from_env(),
             ordinal: 0,
+            slots: 1,
         }
     }
 }
@@ -137,11 +141,94 @@ struct Tracer {
     rows: Vec<TraceRow>,
 }
 
-/// An f16 `[n, k]` matmul weight on the device.
-struct Lin {
-    w: CuBuf,
-    n: usize,
-    k: usize,
+/// How a matmul weight is held on the device: the file's own blocks where a GEMM kernel reads
+/// them in place (`gemm_q.rs`), else f16.
+pub(crate) enum Repr {
+    F16(CuBuf),
+    /// Q4_K relaid by `quant::relayout_q4k_q4l`: nibbles and per-32 f16 `qa`, `qb`.
+    Q4L { w4: CuBuf, qa: CuBuf, qb: CuBuf },
+    /// Q6_K super-blocks as in the file.
+    Q6K(CuBuf),
+    /// Q8_0 blocks as in the file.
+    Q80(CuBuf),
+}
+
+impl Repr {
+    fn f16_buf(self) -> Option<CuBuf> { match self { Repr::F16(b) => Some(b), _ => None } }
+}
+
+/// A `[n, k]` matmul weight on the device.
+pub(crate) struct Lin {
+    pub(crate) w: Repr,
+    pub(crate) n: usize,
+    pub(crate) k: usize,
+}
+
+impl Lin {
+    /// Several `[n_i, k]` GGUF tensors stacked along n into one `[sum n_i, k]` weight, held in
+    /// the file's format when every part shares one the GEMMs read in place (Q4_K, Q6_K,
+    /// Q8_0, with the block-aligned K they need), else dequantized to f16.
+    pub(crate) fn load(gpu: &CudaGpu, g: &mut Gguf, names: &[String]) -> Result<Lin> { Self::load_as(gpu, g, names, true) }
+
+    /// [`Lin::load`] dequantized to f16 whatever the file holds.
+    pub(crate) fn load_f16(gpu: &CudaGpu, g: &mut Gguf, name: &str) -> Result<Lin> { Self::load_as(gpu, g, &[name.to_string()], false) }
+
+    fn load_as(gpu: &CudaGpu, g: &mut Gguf, names: &[String], native: bool) -> Result<Lin> {
+        let (mut raw, mut n, mut k0, mut ty0) = (Vec::new(), 0usize, None, None);
+        for name in names {
+            let info = g.tensors.get(name).with_context(|| format!("missing tensor {name}"))?;
+            let k = info.dims.first().copied().unwrap_or(1) as usize;
+            let rows = info.dims.get(1).copied().unwrap_or(1) as usize;
+            ensure!(k0.is_none_or(|k0| k0 == k), "{name}: K {k} differs from the fused group's");
+            ensure!(ty0.is_none_or(|t| t == info.ggml_type), "{name}: type differs from the fused group's; the group is dequantized");
+            let (_, ty, b) = g.read_tensor_raw(name).with_context(|| format!("reading {name}"))?;
+            raw.push(b);
+            n += rows;
+            k0 = Some(k);
+            ty0 = Some(ty);
+        }
+        let k = k0.unwrap_or(1);
+        let in_place = native && match ty0 {
+            Some(12) => k % 256 == 0,
+            Some(14) => k % 256 == 0,
+            Some(8) => k % 32 == 0,
+            _ => false,
+        };
+        let w = if in_place {
+            let bytes: Vec<u8> = raw.concat();
+            match ty0 {
+                Some(12) => {
+                    let (nib, qa, qb) = ojas_formats::quant::relayout_q4k_q4l(&bytes, k, n);
+                    Repr::Q4L { w4: gpu.upload_bytes(&nib)?, qa: gpu.upload_bytes(ojas_formats::quant::bytes_of_u16(&qa))?, qb: gpu.upload_bytes(ojas_formats::quant::bytes_of_u16(&qb))? }
+                }
+                Some(14) => Repr::Q6K(gpu.upload_bytes(&bytes)?),
+                _ => Repr::Q80(gpu.upload_bytes(&bytes)?),
+            }
+        } else {
+            let mut f16 = Vec::new();
+            for name in names {
+                let (_, ty, b) = g.read_tensor(name).with_context(|| format!("reading {name}"))?;
+                match ty {
+                    1 => f16.extend_from_slice(&b),
+                    0 => f16.extend(bytes_f32(&b).iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes())),
+                    t => bail!("{name}: unsupported GGUF type {t}"),
+                }
+            }
+            ensure!(f16.len() == n * k * 2, "{}: {} f16 bytes for [{n}, {k}]", names.join("|"), f16.len());
+            Repr::F16(gpu.upload_bytes(&f16)?)
+        };
+        Ok(Lin { w, n, k })
+    }
+
+    pub(crate) fn f16(gpu: &CudaGpu, bytes: &[u8], n: usize, k: usize) -> Result<Lin> {
+        Ok(Lin { w: Repr::F16(gpu.upload_bytes(bytes)?), n, k })
+    }
+}
+
+/// The token table: f16, or a Q4_K file's blocks gathered in place.
+enum Embd {
+    F16(CuBuf),
+    Q4K(CuBuf),
 }
 
 /// Input projections are fused at load into one weight each (rows concatenated, so each output
@@ -161,7 +248,10 @@ struct Layer {
     down: Lin,
 }
 
-/// Recurrent state, KV cache and per-chunk scratch.
+/// Recurrent state, KV cache and per-chunk scratch. The state buffers hold every slot's
+/// region back to back: `conv` / `ssm` / `kc` / `vc` of slot `s` start at
+/// `s * conv_bytes` / `s * ssm_bytes` / `s * kv_bytes` ([`CudaSsm::slot_bytes`]); `conv`
+/// and `ssm` have one region more than there are slots, the saved state.
 struct State {
     /// Fused-projection output rows (see [`Mixer`]).
     comb: CuBuf,
@@ -192,6 +282,39 @@ struct State {
     mpos: CuBuf,
     /// `[base, total]` of the current chunk, read by `q35_qk_prep` / `q35_attn_256`.
     ctl: CuBuf,
+    /// One `[base, total, slot, first row]` per segment of a multi-sequence chunk (`slots` entries).
+    ctls: CuBuf,
+    /// `[dst, src, words]` per region of a state copy (`copy_regions`): two per layer.
+    copytab: CuBuf,
+    /// The chunk's activations as f16 for the quantized split-K GEMMs, `chunk * widest K`.
+    xh: CuBuf,
+}
+
+/// The most split-K partitions.
+const SPLITK_MAX: usize = 8;
+
+/// Split-K partitions for a chunk on the 64x128 tile: enough to put about
+/// [`SPLITK_BLOCKS`] blocks in flight (eight per SM on a 28-SM card, the fastest count on a
+/// 4B model's prefill), at most [`SPLITK_MAX`], each at least one 32-block; 1 when the
+/// tiles alone fill the card.
+const SPLITK_BLOCKS: usize = 224;
+
+fn nsplit_for(m: usize, k: usize, n: usize) -> usize {
+    let tiles = m.div_ceil(64) * n.div_ceil(128);
+    let mut ns = SPLITK_BLOCKS.div_ceil(tiles.max(1)).clamp(1, SPLITK_MAX);
+    while ns > 1 && k / ns < 32 { ns -= 1; }
+    ns
+}
+
+/// One sequence's run of consecutive rows in a chunk: the rows continue `slot` at cache
+/// rows `base..`, and `ctl` holds their `[base, base + rows]` on the device.
+struct Seg<'a> {
+    rows: std::ops::Range<usize>,
+    slot: usize,
+    base: usize,
+    /// Its `[base, base + rows, slot, rows.start]` u32 words on the device; the segments
+    /// of a chunk are consecutive, so the first one's is the table of them all.
+    ctl: (&'a CuBuf, u64),
 }
 
 /// What a forward leaves behind for its last row.
@@ -233,7 +356,7 @@ pub struct CudaSsm {
     mrope_mode: u32,
     layers: Vec<Layer>,
     output_norm: CuBuf,
-    embd: CuBuf,
+    embd: Embd,
     head: Option<Lin>,
     max_split: usize,
     vit: Option<CudaVit>,
@@ -241,10 +364,9 @@ pub struct CudaSsm {
     tracer: RefCell<Option<Tracer>>,
     /// The one-token decode step recorded as a CUDA graph (captured on first use).
     graph: RefCell<Option<crate::Recorded>>,
-    /// `base + m` of the chunk being forwarded (host copy of `st.ctl[1]`).
-    cur_total: std::cell::Cell<usize>,
     /// Accumulated wall time spent in decoder forwards / vision encodes (seconds).
     pub timing: RefCell<Timing>,
+    profile: crate::KernelProfile,
 }
 
 /// Coarse timing counters.
@@ -257,15 +379,15 @@ pub struct Timing {
     pub vit_s: f64,
 }
 
-fn f32_bytes(v: &[f32]) -> Vec<u8> {
+pub(crate) fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-fn bytes_f32(b: &[u8]) -> Vec<f32> {
+pub(crate) fn bytes_f32(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
-fn read_f32_tensor(g: &mut Gguf, name: &str) -> Result<Vec<f32>> {
+pub(crate) fn read_f32_tensor(g: &mut Gguf, name: &str) -> Result<Vec<f32>> {
     let (_d, ty, b) = g.read_tensor(name).with_context(|| format!("reading {name}"))?;
     match ty {
         0 => Ok(bytes_f32(&b)),
@@ -274,11 +396,14 @@ fn read_f32_tensor(g: &mut Gguf, name: &str) -> Result<Vec<f32>> {
     }
 }
 
-fn u32s_bytes(v: &[u32]) -> Vec<u8> {
+pub(crate) fn u32s_bytes(v: &[u32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-fn blocks(n: usize, b: usize) -> u32 {
+/// `b` moved `r0` rows of `stride` f32 down: a segment's view of a `[M, stride]` buffer.
+fn at_rows(b: (&CuBuf, u64), r0: u64, stride: usize) -> (&CuBuf, u64) { (b.0, b.1 + r0 * stride as u64 * 4) }
+
+pub(crate) fn blocks(n: usize, b: usize) -> u32 {
     n.div_ceil(b).max(1) as u32
 }
 
@@ -292,7 +417,7 @@ impl CudaSsm {
         let arch = g.arch();
         ensure!(arch == "qwen35", "CudaSsm runs dense qwen35 (surya-2); got {arch}");
         let mut gpu = CudaGpu::new(opts.ordinal)?;
-        for fam in ["ops", "ssm", "gemm_f16", "qwen35", "vision", "attn_bidir"] {
+        for fam in ["ops", "ssm", "gemm_f16", "gemm_q", "qwen35", "vision", "attn_bidir", "bert"] {
             gpu.ensure_family(fam).with_context(|| format!("compiling CUDA family {fam}"))?;
         }
         let enc = gpu.begin();
@@ -330,30 +455,11 @@ impl CudaSsm {
         ensure!(d % 4 == 0 && (n_kv * hd) % 4 == 0, "f32x4 loads need 4-aligned rows");
 
         let t0 = std::time::Instant::now();
-        let up_lin = |gpu: &CudaGpu, g: &mut Gguf, name: &str| -> Result<Lin> {
-            let (dims, ty, bytes) = g.read_tensor(name).with_context(|| format!("reading {name}"))?;
-            ensure!(ty == 1, "{name}: CudaSsm keeps matmul weights in the file's f16; got GGUF type {ty}");
-            let k = dims.first().copied().unwrap_or(1) as usize;
-            let n = bytes.len() / 2 / k.max(1);
-            Ok(Lin { w: gpu.upload_bytes(&bytes)?, n, k })
-        };
+        let up_lin = |gpu: &CudaGpu, g: &mut Gguf, name: &str| -> Result<Lin> { Lin::load(gpu, g, &[name.to_string()]) };
         let up_f32 = |gpu: &CudaGpu, g: &mut Gguf, name: &str| -> Result<CuBuf> {
             gpu.upload_bytes(&f32_bytes(&read_f32_tensor(g, name)?))
         };
-        // several [n_i, k] f16 weights stacked along n into one [sum n_i, k]
-        let up_fused = |gpu: &CudaGpu, g: &mut Gguf, names: &[String]| -> Result<Lin> {
-            let (mut bytes, mut n, mut k0) = (Vec::new(), 0usize, None);
-            for name in names {
-                let (dims, ty, b) = g.read_tensor(name).with_context(|| format!("reading {name}"))?;
-                ensure!(ty == 1, "{name}: CudaSsm keeps matmul weights in the file's f16; got GGUF type {ty}");
-                let k = dims.first().copied().unwrap_or(1) as usize;
-                ensure!(k0.is_none_or(|k0| k0 == k), "{name}: K {k} differs from the fused group's");
-                k0 = Some(k);
-                n += b.len() / 2 / k.max(1);
-                bytes.extend_from_slice(&b);
-            }
-            Ok(Lin { w: gpu.upload_bytes(&bytes)?, n, k: k0.unwrap_or(1) })
-        };
+        let up_fused = |gpu: &CudaGpu, g: &mut Gguf, names: &[String]| -> Result<Lin> { Lin::load(gpu, g, names) };
         let mut layers = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let p = |s: &str| format!("blk.{i}.{s}");
@@ -383,14 +489,22 @@ impl CudaSsm {
             });
         }
         let output_norm = up_f32(&gpu, g, "output_norm.weight")?;
-        let embd_lin = up_lin(&gpu, g, "token_embd.weight")?;
-        ensure!(embd_lin.k == d && embd_lin.n == vocab, "token_embd is [{}, {}], expected [{vocab}, {d}]", embd_lin.n, embd_lin.k);
+        let embd = {
+            let info = g.tensors.get("token_embd.weight").context("missing token_embd.weight")?;
+            ensure!(info.dims.first().copied() == Some(d as u64) && info.dims.get(1).copied() == Some(vocab as u64),
+                "token_embd is {:?}, expected [{d}, {vocab}]", info.dims);
+            if info.ggml_type == 12 && d % 256 == 0 {
+                Embd::Q4K(gpu.upload_bytes(&g.read_tensor_raw("token_embd.weight")?.2)?)
+            } else {
+                Embd::F16(Lin::load_f16(&gpu, g, "token_embd.weight")?.w.f16_buf().expect("load_f16 holds f16"))
+            }
+        };
         let head = if g.tensors.contains_key("output.weight") { Some(up_lin(&gpu, g, "output.weight")?) } else { None };
-        let embd = embd_lin.w;
 
-        let opts = CudaSsmOpts { context: opts.context.max(16), chunk: opts.chunk.clamp(16, 4096), ..opts };
+        let opts = CudaSsmOpts { context: opts.context.max(16), chunk: opts.chunk.clamp(16, 4096), slots: opts.slots.max(1), ..opts };
         let max_split = opts.context.div_ceil(KSPLIT).max(1);
-        let st = Self::alloc_state(&gpu, &layers, &opts, d, n_head, n_kv, hd, conv_ch, conv_k, h_v, s_st, d_inner, ffn, vocab, max_split)?;
+        let kv_elem = if opts.gemm == GemmMode::Exact { 4 } else { 2 };
+        let st = Self::alloc_state(&gpu, &layers, &opts, d, n_head, n_kv, hd, conv_ch, conv_k, h_v, s_st, d_inner, ffn, vocab, max_split, kv_elem)?;
         gpu.sync()?;
         tracing::info!(target: "cuda:qwen35",
             "loaded {n_layers} layers in {:.1}s | d={d} attn {n_head}/{n_kv} hd={hd} rot={n_rot} sections={mrope_sections:?} \
@@ -402,15 +516,15 @@ impl CudaSsm {
             st: RefCell::new(st),
             tracer: RefCell::new(None),
             graph: RefCell::new(None),
-            cur_total: std::cell::Cell::new(0),
             timing: RefCell::new(Timing::default()),
+            profile: crate::KernelProfile::from_env(),
         })
     }
 
     #[allow(clippy::too_many_arguments)]
     fn alloc_state(gpu: &CudaGpu, layers: &[Layer], o: &CudaSsmOpts, d: usize, n_head: usize, n_kv: usize, hd: usize,
                    conv_ch: usize, conv_k: usize, h_v: usize, s_st: usize, d_inner: usize, ffn: usize, vocab: usize,
-                   max_split: usize) -> Result<State> {
+                   max_split: usize, kv_elem: usize) -> Result<State> {
         let f = |n: usize| gpu.alloc_bytes(n * 4);
         let c = o.chunk;
         let (qdim, kvdim) = (n_head * hd, n_kv * hd);
@@ -421,16 +535,17 @@ impl CudaSsm {
         for l in layers {
             match l.mixer {
                 Mixer::Ssm { .. } => {
-                    conv.push(Some(f((conv_k - 1) * conv_ch)?));
-                    ssm.push(Some(f(h_v * s_st * s_st)?));
+                    // one extra slot: the saved state (`save_state`), on the device
+                    conv.push(Some(f((o.slots + 1) * (conv_k - 1) * conv_ch)?));
+                    ssm.push(Some(f((o.slots + 1) * h_v * s_st * s_st)?));
                     kc.push(None);
                     vc.push(None);
                 }
                 Mixer::Attn { .. } => {
                     conv.push(None);
                     ssm.push(None);
-                    kc.push(Some(f(o.context * kvdim)?));
-                    vc.push(Some(f(o.context * kvdim)?));
+                    kc.push(Some(gpu.alloc_bytes(o.slots * o.context * kvdim * kv_elem)?));
+                    vc.push(Some(gpu.alloc_bytes(o.slots * o.context * kvdim * kv_elem)?));
                 }
             }
         }
@@ -461,6 +576,9 @@ impl CudaSsm {
             ids: f(c)?,
             mpos: f(c * 4)?,
             ctl: f(4)?,
+            ctls: f(4 * o.slots)?,
+            copytab: gpu.alloc_bytes(layers.len() * 2 * 24)?,
+            xh: gpu.alloc_bytes(c * maxk * 2)?,
         })
     }
 
@@ -473,6 +591,8 @@ impl CudaSsm {
     }
 
     pub fn gpu(&self) -> &CudaGpu { &self.gpu }
+    /// Sequence slots this runner holds state for.
+    pub fn slots(&self) -> usize { self.opts.slots }
     pub fn opts(&self) -> CudaSsmOpts { self.opts }
     pub fn vocab(&self) -> usize { self.vocab }
     pub fn mrope(&self) -> ([u32; 4], u32) { (self.mrope_sections, self.mrope_mode) }
@@ -494,23 +614,46 @@ impl CudaSsm {
     // ------------------------------------------------------------ dispatch
 
     fn k(&self, name: &str, bufs: &[(&CuBuf, u64)], consts: &[u32], grid: [u32; 3], block: [u32; 3]) -> Result<()> {
-        self.gpu.dispatch(&self.enc, name, bufs, consts, grid, block).with_context(|| format!("launching {name}"))
+        self.gpu.dispatch_profiled(&self.profile, name, bufs, consts, grid, block).with_context(|| format!("launching {name}"))
+    }
+
+    /// `x[m] = token_embd[ids[m]]` for `m` rows.
+    fn embed(&self, st: &State, m: usize) -> Result<()> {
+        let d = self.d;
+        let (name, table) = match &self.embd { Embd::F16(t) => ("q35_embed_f16", t), Embd::Q4K(t) => ("q35_embed_q4k", t) };
+        self.k(name, &[(table, 0), (&st.ids, 0), (&st.x, 0)], &[d as u32, m as u32], [blocks(m * d, 256), 1, 1], [256, 1, 1])
+    }
+
+    /// `st.logits = head · st.h[0]`: the LM head (or the tied embedding) over one row.
+    fn head_logits(&self, st: &State) -> Result<()> {
+        let (d, vocab) = (self.d as u32, self.vocab as u32);
+        match (&self.head, &self.embd) {
+            (Some(h), _) => match &h.w {
+                Repr::F16(w) => self.k("gemv_f16", &[(&st.h, 0), (w, 0), (&st.logits, 0)], &[d, vocab], [blocks(self.vocab, 8), 1, 1], [256, 1, 1]),
+                _ => self.mm(st, &st.h, h, &st.logits, 1, false),
+            },
+            (None, Embd::F16(w)) => self.k("gemv_f16", &[(&st.h, 0), (w, 0), (&st.logits, 0)], &[d, vocab], [blocks(self.vocab, 8), 1, 1], [256, 1, 1]),
+            (None, Embd::Q4K(_)) => bail!("a tied LM head over a Q4_K token table is not implemented"),
+        }
     }
 
     /// `y[m, n] (+)= x[m, :] · W[n, :]` for `m` rows. `accum` adds into `y` (which must then be
-    /// the `d`-wide residual; `tmp` stages the GEMV forms).
+    /// the `d`-wide residual; `tmp` stages the GEMV forms). An f16 weight takes the GEMV
+    /// forms for a few rows and `GemmMode::Exact`; a quantized one always goes through its
+    /// tensor-core GEMM, which rounds the activations to f16 (`Exact` has no quantized form).
     fn mm(&self, st: &State, x: &CuBuf, w: &Lin, y: &CuBuf, m: usize, accum: bool) -> Result<()> {
         let (k, n) = (w.k as u32, w.n as u32);
         let gemv_grid = [blocks(w.n, 8), 1, 1];
-        if m == 1 || m <= 8 || self.opts.gemm == GemmMode::Exact {
+        let f16 = match &w.w { Repr::F16(b) => Some(b), _ => None };
+        if let Some(wb) = f16.filter(|_| m <= 8 || self.opts.gemm == GemmMode::Exact) {
             let dst = if accum { &st.tmp } else { y };
             if accum {
                 ensure!(m * w.n <= self.opts.chunk * self.d, "accumulating GEMV wider than the residual");
             }
             if m == 1 {
-                self.k("gemv_f16", &[(x, 0), (&w.w, 0), (dst, 0)], &[k, n], gemv_grid, [256, 1, 1])?;
+                self.k("gemv_f16", &[(x, 0), (wb, 0), (dst, 0)], &[k, n], gemv_grid, [256, 1, 1])?;
             } else {
-                self.k("gemv_m_f16", &[(x, 0), (&w.w, 0), (dst, 0)], &[k, n, m as u32], gemv_grid, [256, 1, 1])?;
+                self.k("gemv_m_f16", &[(x, 0), (wb, 0), (dst, 0)], &[k, n, m as u32], gemv_grid, [256, 1, 1])?;
             }
             if accum {
                 let t = (m * w.n) as u32;
@@ -518,12 +661,42 @@ impl CudaSsm {
             }
             return Ok(());
         }
-        let grid = [blocks(w.n, 128), blocks(m, 128), 1];
-        self.k("gemm_mm_f16", &[(x, 0), (&w.w, 0), (y, 0)], &[k, n, accum as u32, m as u32], grid, [256, 1, 1])?;
+        // A short chunk, or a narrow N, is a few rows of N/128 blocks: split K across the
+        // idle SMs instead, each slice adding into y.
+        let nsplit = nsplit_for(m, w.k, w.n);
+        // the one-pass mode takes the `_h` entries (f16 partial sums), the others every
+        // product in f32
+        let h = if self.opts.gemm == GemmMode::Fast { "_h" } else { "" };
+        let gemm = |x: &CuBuf, accum: u32| -> Result<()> {
+            let mu = m as u32;
+            if nsplit > 1 {
+                let grid = [blocks(w.n, 128), blocks(m, 64), nsplit as u32];
+                let ns = nsplit as u32;
+                if accum == 0 { self.gpu.zero_bytes(y, 0, m * w.n * 4)?; }
+                if !matches!(w.w, Repr::F16(_)) {
+                    let t = m * w.k;
+                    self.k("copy_f32_half", &[(x, 0), (&st.xh, 0)], &[t as u32], [blocks(t, 256), 1, 1], [256, 1, 1])?;
+                }
+                let xh = &st.xh;
+                return match &w.w {
+                    Repr::F16(wb) => self.k("gemm_mm_f16_sk", &[(x, 0), (wb, 0), (y, 0)], &[k, n, mu, ns], grid, [256, 1, 1]),
+                    Repr::Q4L { w4, qa, qb } => self.k(&format!("gemm_mm_q4l_sk{h}"), &[(xh, 0), (w4, 0), (y, 0), (qa, 0), (qb, 0)], &[k, n, mu, ns], grid, [256, 1, 1]),
+                    Repr::Q6K(wb) => self.k("gemm_mm_q6k_sk", &[(xh, 0), (wb, 0), (y, 0)], &[k, n, mu, ns], grid, [256, 1, 1]),
+                    Repr::Q80(wb) => self.k(&format!("gemm_mm_q8_0_sk{h}"), &[(xh, 0), (wb, 0), (y, 0)], &[k, n, mu, ns], grid, [256, 1, 1]),
+                };
+            }
+            match &w.w {
+                Repr::F16(wb) => self.k("gemm_mm_f16", &[(x, 0), (wb, 0), (y, 0)], &[k, n, accum, mu], [blocks(w.n, 128), blocks(m, 128), 1], [256, 1, 1]),
+                Repr::Q4L { w4, qa, qb } => self.k(&format!("gemm_mm_q4l{h}"), &[(x, 0), (w4, 0), (y, 0), (qa, 0), (qb, 0)], &[k, n, accum, mu], [blocks(w.n, 128), blocks(m, 64), 1], [256, 1, 1]),
+                Repr::Q6K(wb) => self.k("gemm_mm_q6k", &[(x, 0), (wb, 0), (y, 0)], &[k, n, accum, mu], [blocks(w.n, 128), blocks(m, 64), 1], [256, 1, 1]),
+                Repr::Q80(wb) => self.k(&format!("gemm_mm_q8_0{h}"), &[(x, 0), (wb, 0), (y, 0)], &[k, n, accum, mu], [blocks(w.n, 128), blocks(m, 64), 1], [256, 1, 1]),
+            }
+        };
+        gemm(x, accum as u32)?;
         if self.opts.gemm == GemmMode::Split {
             let tot = m * w.k;
             self.k("q35_split_lo", &[(x, 0), (&st.lo, 0)], &[tot as u32], [blocks(tot, 256), 1, 1], [256, 1, 1])?;
-            self.k("gemm_mm_f16", &[(&st.lo, 0), (&w.w, 0), (y, 0)], &[k, n, 1, m as u32], grid, [256, 1, 1])?;
+            gemm(&st.lo, 1)?;
         }
         Ok(())
     }
@@ -534,13 +707,201 @@ impl CudaSsm {
 
     // --------------------------------------------------------------- state
 
-    /// Zero the recurrent state (fresh sequence). KV rows need no clearing: attention only ever
-    /// reads rows it has written in this sequence.
+    /// Bytes of one slot's region of a layer's conv state, SSM state and KV cache.
+    fn slot_bytes(&self) -> (usize, usize, usize) {
+        ((self.conv_k - 1) * self.conv_ch * 4, self.h_v * self.s_st * self.s_st * 4, self.opts.context * self.n_kv * self.hd * self.kv_elem())
+    }
+
+    /// Bytes per K/V cache element: f16, or f32 in the exact mode (no rounding anywhere).
+    fn kv_elem(&self) -> usize { if self.opts.gemm == GemmMode::Exact { 4 } else { 2 } }
+
+    /// Zero every slot's recurrent state (fresh sequences). KV rows need no clearing:
+    /// attention only ever reads rows it has written in this sequence.
     pub fn reset(&self) {
         let st = &mut *self.st.borrow_mut();
         for b in st.conv.iter_mut().chain(st.ssm.iter_mut()).flatten() {
             self.enc.memset_zeros(&mut b.bytes).expect("cuda memset");
         }
+    }
+
+    /// Zero one slot's recurrent state.
+    pub fn reset_slot(&self, slot: usize) {
+        assert!(slot < self.opts.slots, "slot {slot} of {}", self.opts.slots);
+        let (cb, sb, _) = self.slot_bytes();
+        let st = &mut *self.st.borrow_mut();
+        for (b, n) in st.conv.iter_mut().map(|b| (b, cb)).chain(st.ssm.iter_mut().map(|b| (b, sb))) {
+            if let Some(b) = b {
+                let mut region = b.bytes.slice_mut(slot * n..(slot + 1) * n);
+                self.enc.memset_zeros(&mut region).expect("cuda memset");
+            }
+        }
+    }
+
+    /// Keep slot 0's recurrent state as the saved state: a device-side copy into the
+    /// state buffers' extra slot, so the state (50 MB for a 4B model) never crosses to
+    /// the host.
+    pub fn save_state(&self) -> Result<()> {
+        let st = &mut *self.st.borrow_mut();
+        self.copy_slots(st, 0, self.opts.slots, 0)
+    }
+
+    /// Restore slot 0's recurrent state from the saved one.
+    pub fn restore_state(&self) -> Result<()> {
+        let st = &mut *self.st.borrow_mut();
+        self.copy_slots(st, self.opts.slots, 0, 0)
+    }
+
+    /// Copy slot `from`'s recurrent state and its first `rows` cache rows into slot `to`.
+    pub fn copy_slot_prefix(&self, from: usize, to: usize, rows: usize) -> Result<()> {
+        ensure!(from < self.opts.slots && to < self.opts.slots && rows <= self.opts.context, "copy_slot_prefix: slot or rows out of range");
+        if from == to { return Ok(()); }
+        let st = &mut *self.st.borrow_mut();
+        let kv_rows = rows * self.n_kv * self.hd * self.kv_elem();
+        self.copy_slots(st, from, to, kv_rows)
+    }
+
+    /// Every SSM layer's conv and SSM state, slot `from` to slot `to` (slot `slots` is the
+    /// saved state), and `kv_bytes` of each attention layer's K and V rows. One launch
+    /// over a table of regions (a 4B model has 64), stream-ordered like the kernels that
+    /// read the state.
+    fn copy_slots(&self, st: &mut State, from: usize, to: usize, kv_bytes: usize) -> Result<()> {
+        let (cb, sb, kb) = self.slot_bytes();
+        let mut tab: Vec<u64> = Vec::with_capacity(self.layers.len() * 6);
+        let mut longest = 0;
+        let mut add = |b: &CuBuf, region: usize, bytes: usize| {
+            if bytes == 0 { return; }
+            let p = self.gpu.device_ptr(b);
+            tab.extend([p + (to * region) as u64, p + (from * region) as u64, (bytes / 4) as u64]);
+            longest = longest.max(bytes / 4);
+        };
+        for l in 0..self.layers.len() {
+            match (&st.conv[l], &st.ssm[l], &st.kc[l], &st.vc[l]) {
+                (Some(c), Some(s), _, _) => { add(c, cb, cb); add(s, sb, sb); }
+                (_, _, Some(kc), Some(vc)) => { add(kc, kb, kv_bytes); add(vc, kb, kv_bytes); }
+                _ => unreachable!("a layer has either a recurrent state or a KV cache"),
+            }
+        }
+        if tab.is_empty() { return Ok(()); }
+        let bytes: Vec<u8> = tab.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.gpu.write_bytes(&mut st.copytab, 0, &bytes)?;
+        let grid_x = blocks(longest, 256).min(256);
+        self.k("copy_regions", &[(&st.copytab, 0)], &[], [grid_x, (tab.len() / 3) as u32, 1], [256, 1, 1])
+    }
+
+    /// The merged token grid `(columns, rows)` an image of this size encodes to.
+    pub fn vision_grid(&self, width: usize, height: usize) -> Option<(usize, usize)> {
+        let v = self.vit.as_ref()?;
+        Some((width / v.patch / v.merge, height / v.patch / v.merge))
+    }
+
+    /// The vision tower's patch side and spatial merge.
+    pub fn vision_patch_merge(&self) -> Option<(usize, usize)> { self.vit.as_ref().map(|v| (v.patch, v.merge)) }
+
+    /// Wall time spent in decoder forwards and vision encodes so far, seconds.
+    pub fn gpu_seconds(&self) -> f64 {
+        let t = self.timing.borrow();
+        t.prefill_s + t.decode_s + t.vit_s
+    }
+
+    /// Prefill several prompts at once, each in its own slot, and return the final hidden
+    /// state (after `output_norm`) of each prompt's `read` rows (ascending prompt indices
+    /// inside its span). Every pass holds rows of as many prompts as fit in a chunk, one
+    /// segment each ([`CudaSsm::forward_segments`]), so the weights are read once for all
+    /// of them. Rows a prompt gives as embeddings enter the residual stream directly; rows
+    /// with explicit rotary coordinates are roped at those rather than at their cache row.
+    pub fn prefill_hidden_slots(&self, jobs: &[ojas_decision::SlotPrefill]) -> Result<Vec<Vec<Vec<f32>>>> {
+        ensure!(jobs.len() <= self.opts.slots && jobs.iter().enumerate().all(|(i, j)| jobs[..i].iter().all(|k| k.slot != j.slot)),
+            "prefill_hidden_slots: one slot per prompt, at most {} slots", self.opts.slots);
+        for j in jobs {
+            ensure!(j.slot < self.opts.slots && j.span.end <= j.prompt.ids.len() && j.span.end <= self.opts.context
+                && j.prompt.positions.is_none_or(|p| p.len() == j.prompt.ids.len()),
+                "prefill_hidden_slots: the span or the positions do not fit the prompt or the context");
+            ensure!(j.read.windows(2).all(|w| w[0] < w[1]) && j.read.iter().all(|r| j.span.contains(r)),
+                "prefill_hidden_slots: rows to read must be ascending and inside the span");
+        }
+        let d = self.d;
+        let chunk = self.opts.chunk;
+        let positioned = jobs.iter().any(|j| j.prompt.positions.is_some());
+        let t0 = std::time::Instant::now();
+        let mut next: Vec<usize> = jobs.iter().map(|j| j.span.start).collect();
+        let mut out: Vec<Vec<Vec<f32>>> = jobs.iter().map(|j| Vec::with_capacity(j.read.len())).collect();
+        let mut total_rows = 0;
+        loop {
+            let (mut tokens, mut segments, mut given, mut positions) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for (i, j) in jobs.iter().enumerate() {
+                let room = chunk - tokens.len();
+                if next[i] == j.span.end || room == 0 { continue; }
+                let take = (j.span.end - next[i]).min(room);
+                let (from, r0) = (next[i], tokens.len());
+                tokens.extend_from_slice(&j.prompt.ids[from..from + take]);
+                for p in from..from + take {
+                    positions.push(j.prompt.positions.map_or([p as u32, p as u32, p as u32, 0], |pos| pos[p]));
+                }
+                for &(first, rows) in j.prompt.embedded {
+                    let (lo, hi) = (first.max(from), (first + rows.len() / d).min(from + take));
+                    if lo < hi { given.push((r0 + lo - from, &rows[(lo - first) * d..(hi - first) * d])); }
+                }
+                segments.push((i, r0..r0 + take, j.slot, from));
+                next[i] += take;
+            }
+            if tokens.is_empty() { break; }
+            total_rows += tokens.len();
+            let reads: Vec<usize> = segments.iter().flat_map(|(i, rows, _, base)| {
+                jobs[*i].read.iter().filter(move |&&r| (*base..*base + rows.len()).contains(&r)).map(move |&r| rows.start + r - base)
+            }).collect();
+            let segs: Vec<(std::ops::Range<usize>, usize, usize)> = segments.iter().map(|(_, rows, slot, base)| (rows.clone(), *slot, *base)).collect();
+            let hidden = self.forward_segments(&tokens, &given, positioned.then_some(positions.as_slice()), &segs, &reads)?;
+            let mut h = hidden.into_iter();
+            for (i, rows, _, base) in &segments {
+                for _ in jobs[*i].read.iter().filter(|&&r| (*base..*base + rows.len()).contains(&r)) {
+                    out[*i].push(h.next().expect("one hidden row per read"));
+                }
+            }
+        }
+        let mut tm = self.timing.borrow_mut();
+        tm.prefill_s += t0.elapsed().as_secs_f64();
+        tm.prefill_rows += total_rows;
+        drop(tm);
+        self.profile.report(&self.gpu, &format!("prefill_hidden_slots, {total_rows} rows in {:.1} ms", t0.elapsed().as_secs_f64() * 1e3));
+        Ok(out)
+    }
+
+    /// One chunk of several sequences: `tokens` tile the chunk's rows, `segs` are
+    /// `(rows, slot, base)` runs of one sequence each, `given` are rows written as
+    /// embeddings instead of gathered, `pos3` the rotary coordinate of every row. Returns
+    /// the post-`output_norm` hidden state of the chunk rows `reads` names.
+    fn forward_segments(&self, tokens: &[u32], given: &[(usize, &[f32])], pos3: Option<&[[u32; 4]]>,
+                        segs: &[(std::ops::Range<usize>, usize, usize)], reads: &[usize]) -> Result<Vec<Vec<f32>>> {
+        let (d, m) = (self.d, tokens.len());
+        ensure!(m > 0 && m <= self.opts.chunk && segs.len() <= self.opts.slots, "forward_segments: chunk of {m} rows, {} segments", segs.len());
+        ensure!(tokens.iter().all(|&t| (t as usize) < self.vocab), "forward_segments: a token id is outside the {}-token vocabulary", self.vocab);
+        let st = &mut *self.st.borrow_mut();
+        let (p4, mode): (Vec<u32>, u32) = match pos3 {
+            Some(p) => (p.iter().flat_map(|v| v.iter().copied()).collect(), self.mrope_mode),
+            None => (segs.iter().flat_map(|(rows, _, base)| (0..rows.len()).flat_map(move |i| { let p = (base + i) as u32; [p, p, p, 0] })).collect(), 0),
+        };
+        self.gpu.write_bytes(&mut st.mpos, 0, &u32s_bytes(&p4))?;
+        let ctls: Vec<u32> = segs.iter().flat_map(|(rows, slot, base)| [*base as u32, (base + rows.len()) as u32, *slot as u32, rows.start as u32]).collect();
+        self.gpu.write_bytes(&mut st.ctls, 0, &u32s_bytes(&ctls))?;
+        self.gpu.write_bytes(&mut st.ids, 0, &u32s_bytes(tokens))?;
+        self.embed(st, m)?;
+        for &(row, rows) in given {
+            self.gpu.write_bytes(&mut st.x, row * d * 4, &f32_bytes(rows))?;
+        }
+        let st: &State = st;
+        let seg_list: Vec<Seg> = segs.iter().enumerate()
+            .map(|(i, (rows, slot, base))| Seg { rows: rows.clone(), slot: *slot, base: *base, ctl: (&st.ctls, 16 * i as u64) }).collect();
+        self.run_layers(st, m, mode, false, &seg_list, &mut |_| Ok(()))?;
+        let mut out = Vec::with_capacity(reads.len());
+        if let (Some(&lo), Some(&hi)) = (reads.iter().min(), reads.iter().max()) {
+            // the rows between the first and the last read come along, in one copy
+            self.rmsnorm(&st.x, 0, &self.output_norm, &st.h, 0, m)?;
+            let mut b = vec![0u8; (hi + 1 - lo) * d * 4];
+            self.gpu.read_bytes(&st.h, lo * d * 4, &mut b)?;
+            for &r in reads { out.push(bytes_f32(&b[(r - lo) * d * 4..(r + 1 - lo) * d * 4])); }
+        }
+        self.gpu.sync()?;
+        Ok(out)
     }
 
     // ------------------------------------------------------------- forward
@@ -596,13 +957,11 @@ impl CudaSsm {
             None => ((0..m).flat_map(|i| { let p = (base + i) as u32; [p, p, p, 0] }).collect(), 0),
         };
         self.gpu.write_bytes(&mut st.mpos, 0, &u32s_bytes(&p4))?;
-        self.gpu.write_bytes(&mut st.ctl, 0, &u32s_bytes(&[base as u32, (base + m) as u32]))?;
-        self.cur_total.set(base + m);
+        self.gpu.write_bytes(&mut st.ctl, 0, &u32s_bytes(&[base as u32, (base + m) as u32, 0, 0]))?;
         match (ids, rows) {
             (Some(ids), _) => {
                 self.gpu.write_bytes(&mut st.ids, 0, &u32s_bytes(ids))?;
-                self.k("q35_embed_f16", &[(&self.embd, 0), (&st.ids, 0), (&st.x, 0)], &[d as u32, m as u32],
-                       [blocks(m * d, 256), 1, 1], [256, 1, 1])?;
+                self.embed(st, m)?;
             }
             (None, Some(x)) => self.gpu.write_bytes(&mut st.x, 0, &f32_bytes(x))?,
             _ => bail!("forward_chunk needs ids or rows"),
@@ -630,14 +989,13 @@ impl CudaSsm {
         }
 
         let st: &State = st;
-        self.run_layers(st, m, mode, false, &mut |_l| if t_hidden { read_rows(&st.x, &mut hid) } else { Ok(()) })?;
+        let one = [Seg { rows: 0..m, slot: 0, base, ctl: (&st.ctl, 0) }];
+        self.run_layers(st, m, mode, false, &one, &mut |_l| if t_hidden { read_rows(&st.x, &mut hid) } else { Ok(()) })?;
 
         // final norm + head for the rows that need it (the last row, and traced rows)
-        let head = self.head.as_ref().map(|h| &h.w).unwrap_or(&self.embd);
         let head_row = |r: usize| -> Result<()> {
             self.rmsnorm(&st.x, (r * d * 4) as u64, &self.output_norm, &st.h, 0, 1)?;
-            self.k("gemv_f16", &[(&st.h, 0), (head, 0), (&st.logits, 0)], &[d as u32, self.vocab as u32],
-                   [blocks(self.vocab, 8), 1, 1], [256, 1, 1])
+            self.head_logits(st)
         };
         let read_logits = || -> Result<Vec<f32>> {
             let mut b = vec![0u8; self.vocab * 4];
@@ -685,12 +1043,17 @@ impl CudaSsm {
         }
     }
 
-    /// Every decoder layer over the `m` rows in `st.x` (positions in `st.mpos` / `st.ctl`).
-    /// `fixed_split` sizes decode attention for the whole context (the CUDA-graph form).
-    fn run_layers(&self, st: &State, m: usize, mode: u32, fixed_split: bool,
+    /// Every decoder layer over the `m` rows in `st.x` (positions in `st.mpos`), the rows
+    /// tiled by `segs`: the projections and every row-wise kernel run once over all rows, and
+    /// the work that carries a sequence's state (convolution, recurrence, rope and KV store,
+    /// attention) runs per segment at its rows and its slot's state. `fixed_split` sizes
+    /// decode attention for the whole context (the CUDA-graph form).
+    fn run_layers(&self, st: &State, m: usize, mode: u32, fixed_split: bool, segs: &[Seg],
                   after_layer: &mut dyn FnMut(usize) -> Result<()>) -> Result<()> {
         let qdim = self.n_head * self.hd;
         let mu = m as u32;
+        let (conv_bytes, ssm_bytes, kv_bytes) = self.slot_bytes();
+        debug_assert!(segs.iter().map(|g| g.rows.len()).sum::<usize>() == m);
         for (l, ly) in self.layers.iter().enumerate() {
             self.rmsnorm(&st.x, 0, &ly.attn_norm, &st.h, 0, m)?;
             match &ly.mixer {
@@ -709,12 +1072,14 @@ impl CudaSsm {
                     let nab = m * hv;
                     self.k("ssm_ab", &[al, be, (dt, 0), (a, 0)], &[nab as u32, hv as u32], [blocks(nab, 256), 1, 1], [256, 1, 1])?;
                     let cs = st.conv[l].as_ref().unwrap();
-                    self.k("conv1d_prefill", &[qkv, (cs, 0), (conv_w, 0)],
-                           &[self.conv_ch as u32, self.conv_k as u32, mu], [blocks(self.conv_ch, 128), 1, 1], [128, 1, 1])?;
                     let ss = st.ssm[l].as_ref().unwrap();
-                    self.k("deltanet_fused", &[(ss, 0), qkv, al, be, (&st.o, 0)],
-                           &[self.s_st as u32, self.h_k as u32, self.h_v as u32, self.conv_ch as u32, mu, self.eps.to_bits()],
-                           [(self.s_st / 4) as u32, self.h_v as u32, 1], [128, 1, 1])?;
+                    // every segment in one launch each, from the table of segments
+                    let (tab, nseg) = (segs[0].ctl, segs.len() as u32);
+                    self.k("conv1d_prefill", &[qkv, (cs, 0), (conv_w, 0), tab],
+                           &[self.conv_ch as u32, self.conv_k as u32, (conv_bytes / 4) as u32], [blocks(self.conv_ch, 128), nseg, 1], [128, 1, 1])?;
+                    self.k("deltanet_fused", &[(ss, 0), qkv, al, be, (&st.o, 0), tab],
+                           &[self.s_st as u32, self.h_k as u32, self.h_v as u32, self.conv_ch as u32, (ssm_bytes / 4) as u32, self.eps.to_bits()],
+                           [(self.s_st / 16) as u32, self.h_v as u32, nseg], [128, 1, 1])?;
                     self.k("gated_rmsnorm", &[(&st.o, 0), (norm, 0), z],
                            &[self.head_v as u32, self.eps.to_bits(), self.d_inner as u32], [self.h_v as u32, mu, 1], [32, 1, 1])?;
                     self.mm(st, &st.o, wout, &st.x, m, true)?;
@@ -733,13 +1098,18 @@ impl CudaSsm {
                     let kc = st.kc[l].as_ref().unwrap();
                     let vc = st.vc[l].as_ref().unwrap();
                     let [s0, s1, s2, s3] = self.mrope_sections;
-                    let warps = m * (self.n_head + 2 * self.n_kv);
-                    self.k("q35_qk_prep",
-                           &[qf, kin, vin, (q_norm, 0), (k_norm, 0), (&st.mpos, 0), (&st.q, 0), (kc, 0), (vc, 0), (&st.ctl, 0)],
-                           &[self.hd as u32, self.n_head as u32, self.n_kv as u32, self.n_rot as u32, mu,
-                             s0, s1, s2, s3, mode, self.rope_base.to_bits(), self.eps.to_bits()],
-                           [blocks(warps, 4), 1, 1], [128, 1, 1])?;
-                    self.attention(st, kc, vc, m, fixed_split)?;
+                    for g in segs {
+                        let (r0, n) = (g.rows.start as u64, g.rows.len());
+                        let warps = n * (self.n_head + 2 * self.n_kv);
+                        let kv_at = (g.slot * kv_bytes) as u64;
+                        self.k(if self.kv_elem() == 2 { "q35_qk_prep_h" } else { "q35_qk_prep" },
+                               &[at_rows(qf, r0, 2 * qdim), at_rows(kin, r0, kvdim), at_rows(vin, r0, kvdim), (q_norm, 0), (k_norm, 0), (&st.mpos, r0 * 16),
+                                 (&st.q, r0 * qdim as u64 * 4), (kc, kv_at), (vc, kv_at), g.ctl],
+                               &[self.hd as u32, self.n_head as u32, self.n_kv as u32, self.n_rot as u32, n as u32,
+                                 s0, s1, s2, s3, mode, self.rope_base.to_bits(), self.eps.to_bits()],
+                               [blocks(warps, 4), 1, 1], [128, 1, 1])?;
+                        self.attention(st, kc, vc, g, fixed_split && segs.len() == 1)?;
+                    }
                     self.k("gate_mul_sigmoid", &[(&st.att, 0), qf], &[self.hd as u32, qdim as u32, mu],
                            [blocks(m * qdim, 256), 1, 1], [256, 1, 1])?;
                     self.mm(st, &st.att, wo, &st.x, m, true)?;
@@ -756,18 +1126,24 @@ impl CudaSsm {
         Ok(())
     }
 
-    /// Causal GQA attention of the `m` query rows at cache rows `st.ctl[0]..` into `st.att`.
-    fn attention(&self, st: &State, kc: &CuBuf, vc: &CuBuf, m: usize, fixed_split: bool) -> Result<()> {
+    /// Causal GQA attention of one segment's query rows at its slot's cache rows into
+    /// `st.att`. The key range is split (flash-decoding) only for a lone short segment: the
+    /// partial buffers are sized for one.
+    fn attention(&self, st: &State, kc: &CuBuf, vc: &CuBuf, g: &Seg, fixed_split: bool) -> Result<()> {
         let group = (self.n_head / self.n_kv) as u32;
         let rpt = kernels::qwen35::attn_rows_per_block(group) as usize;
         let kvdim = (self.n_kv * self.hd) as u32;
+        let qdim = self.n_head * self.hd;
         let scale = 1.0f32 / (self.hd as f32).sqrt();
-        // the host knows `total` except inside a recorded graph, where every split is launched
-        let total = self.cur_total.get();
+        let m = g.rows.len();
+        let total = g.base + m;
+        let lone = g.rows.start == 0 && g.slot == 0;
         let nsplit = if fixed_split { self.max_split }
-            else if m <= SPLIT_MAX_M { total.div_ceil(KSPLIT).clamp(1, self.max_split) } else { 1 };
+            else if lone && m <= SPLIT_MAX_M { total.div_ceil(KSPLIT).clamp(1, self.max_split) } else { 1 };
         let chunk = if nsplit > 1 { KSPLIT } else { total.max(1) };
-        self.k("q35_attn_256", &[(&st.q, 0), (kc, 0), (vc, 0), (&st.att, 0), (&st.po, 0), (&st.pml, 0), (&st.ctl, 0)],
+        let (r0, kv_at) = (g.rows.start as u64, (g.slot * self.slot_bytes().2) as u64);
+        self.k(if self.kv_elem() == 2 { "q35_attn_256_h" } else { "q35_attn_256" },
+               &[(&st.q, r0 * qdim as u64 * 4), (kc, kv_at), (vc, kv_at), (&st.att, r0 * qdim as u64 * 4), (&st.po, 0), (&st.pml, 0), g.ctl],
                &[kvdim, m as u32, group, self.n_head as u32, chunk as u32, 1, scale.to_bits()],
                [blocks(m, rpt), self.n_kv as u32, nsplit as u32], [128, 1, 1])?;
         if nsplit > 1 {
@@ -801,7 +1177,7 @@ impl CudaSsm {
             let p = pos as u32;
             self.gpu.write_bytes(&mut st.ids, 0, &u32s_bytes(&[token]))?;
             self.gpu.write_bytes(&mut st.mpos, 0, &u32s_bytes(&[p, p, p, 0]))?;
-            self.gpu.write_bytes(&mut st.ctl, 0, &u32s_bytes(&[p, p + 1]))?;
+            self.gpu.write_bytes(&mut st.ctl, 0, &u32s_bytes(&[p, p + 1, 0, 0]))?;
         }
         let mut g = self.graph.borrow_mut();
         if g.is_none() {
@@ -822,13 +1198,11 @@ impl CudaSsm {
     /// The launches of one decode step, for graph capture: embed, every layer (attention split
     /// over the whole context), final norm, LM head, on-device argmax.
     fn decode_body(&self, st: &State) -> Result<()> {
-        let d = self.d;
-        self.k("q35_embed_f16", &[(&self.embd, 0), (&st.ids, 0), (&st.x, 0)], &[d as u32, 1], [blocks(d, 256), 1, 1], [256, 1, 1])?;
-        self.run_layers(st, 1, 0, true, &mut |_| Ok(()))?;
-        let head = self.head.as_ref().map(|h| &h.w).unwrap_or(&self.embd);
+        self.embed(st, 1)?;
+        let one = [Seg { rows: 0..1, slot: 0, base: 0, ctl: (&st.ctl, 0) }];
+        self.run_layers(st, 1, 0, true, &one, &mut |_| Ok(()))?;
         self.rmsnorm(&st.x, 0, &self.output_norm, &st.h, 0, 1)?;
-        self.k("gemv_f16", &[(&st.h, 0), (head, 0), (&st.logits, 0)], &[d as u32, self.vocab as u32],
-               [blocks(self.vocab, 8), 1, 1], [256, 1, 1])?;
+        self.head_logits(st)?;
         self.k("argmax", &[(&st.logits, 0), (&st.amax, 0)], &[self.vocab as u32], [1, 1, 1], [1024, 1, 1])
     }
 
@@ -971,7 +1345,7 @@ impl CudaVit {
         let eps = g.meta_f32("clip.vision.attention.layer_norm_epsilon").unwrap_or(1e-6);
         ensure!(n_embd > 0 && n_layers > 0 && n_head > 0 && patch > 0 && image_size > 0, "mmproj is missing clip.vision.* metadata");
         let head_dim = n_embd / n_head;
-        ensure!(head_dim == 64, "the CUDA tower's attention is compiled for head_dim 64 (got {head_dim})");
+        ensure!(head_dim % 8 == 0 && head_dim <= 512, "the CUDA tower's attention takes a head_dim that is a multiple of 8 up to 512 (got {head_dim})");
         ensure!(merge == 2, "only spatial_merge_size=2 is implemented (got {merge})");
         ensure!(!g.int_arr("clip.vision.is_deepstack_layers").is_some_and(|v| v.iter().any(|&b| b != 0)),
             "this mmproj declares deepstack layers; the CUDA tower does not implement deepstack");
@@ -986,7 +1360,7 @@ impl CudaVit {
                 t => bail!("{name}: unsupported GGUF type {t}"),
             };
             let n = b.len() / 2 / k.max(1);
-            Ok(Lin { w: gpu.upload_bytes(&b)?, n, k })
+            Lin::f16(gpu, &b, n, k)
         };
         let vf = |g: &mut Gguf, name: &str| -> Result<CuBuf> { gpu.upload_bytes(&f32_bytes(&read_f32_tensor(g, name)?)) };
         let ln = |g: &mut Gguf, n: &str| -> Result<(CuBuf, CuBuf)> { Ok((vf(g, &format!("{n}.weight"))?, vf(g, &format!("{n}.bias"))?)) };
@@ -1000,7 +1374,7 @@ impl CudaVit {
         let folded = ojas_cpu::cpu_vit::fold_patch_weights(&w0, &w1)?;
         let fb: Vec<u8> = folded.iter().flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes()).collect();
         let kpatch = channels * patch * patch;
-        let patch_w = Lin { w: gpu.upload_bytes(&fb)?, n: n_embd, k: kpatch };
+        let patch_w = Lin::f16(gpu, &fb, n_embd, kpatch)?;
 
         let mut blocks_v = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
@@ -1060,7 +1434,10 @@ impl CudaVit {
         let q = f(n_pos * dv)?;
         let kb = f(n_pos * dv)?;
         let vb = f(n_pos * dv)?;
-        let attn_mode = m.opts.vit_attn;
+        // The tensor-core kernels are compiled for head_dim 64; any other width streams
+        // every key through `attention_m_bidir_span` over one whole-sequence span.
+        let attn_mode = if hd == 64 { m.opts.vit_attn } else { VitAttn::F16 };
+        let span = if hd == 64 { None } else { Some(gpu.upload_bytes(&u32s_bytes(&vec![0u32, n_pos as u32].repeat(n_pos)))?) };
         let halves = |on: bool| -> Result<Option<CuBuf>> { if on { Ok(Some(gpu.alloc_bytes((n_pos + 64) * dv * 2)?)) } else { Ok(None) } };
         let khb = halves(attn_mode != VitAttn::F32)?;
         let vhb = halves(attn_mode != VitAttn::F32)?;
@@ -1089,16 +1466,17 @@ impl CudaVit {
         let lo = if m.opts.gemm == GemmMode::Split { Some(f(lo_need)?) } else { None };
         let mmv = |xb: &CuBuf, w: &Lin, yb: &CuBuf, rows: usize, accum: bool| -> Result<()> {
             let (k, n) = (w.k as u32, w.n as u32);
+            let Repr::F16(wb) = &w.w else { bail!("the vision tower's weights are held in f16") };
             if m.opts.gemm == GemmMode::Exact {
                 ensure!(!accum, "exact ViT matmuls do not accumulate");
-                return m.k("gemv_m_f16", &[(xb, 0), (&w.w, 0), (yb, 0)], &[k, n, rows as u32], [blocks(w.n, 8), 1, 1], [256, 1, 1]);
+                return m.k("gemv_m_f16", &[(xb, 0), (wb, 0), (yb, 0)], &[k, n, rows as u32], [blocks(w.n, 8), 1, 1], [256, 1, 1]);
             }
             let grid = [blocks(w.n, 128), blocks(rows, 128), 1];
-            m.k("gemm_mm_f16", &[(xb, 0), (&w.w, 0), (yb, 0)], &[k, n, accum as u32, rows as u32], grid, [256, 1, 1])?;
+            m.k("gemm_mm_f16", &[(xb, 0), (wb, 0), (yb, 0)], &[k, n, accum as u32, rows as u32], grid, [256, 1, 1])?;
             if let Some(lo) = &lo {
                 let tot = rows * w.k;
                 m.k("q35_split_lo", &[(xb, 0), (lo, 0)], &[tot as u32], [blocks(tot, 256), 1, 1], [256, 1, 1])?;
-                m.k("gemm_mm_f16", &[(lo, 0), (&w.w, 0), (yb, 0)], &[k, n, 1, rows as u32], grid, [256, 1, 1])?;
+                m.k("gemm_mm_f16", &[(lo, 0), (wb, 0), (yb, 0)], &[k, n, 1, rows as u32], grid, [256, 1, 1])?;
             }
             Ok(())
         };
@@ -1156,8 +1534,12 @@ impl CudaVit {
                 (VitAttn::F16, Some(kh), Some(vh), _, _) => {
                     m.k("copy_f32_half", &[(&kb, 0), (kh, 0)], &[tot as u32], el(tot), [256, 1, 1])?;
                     m.k("copy_f32_half", &[(&vb, 0), (vh, 0)], &[tot as u32], el(tot), [256, 1, 1])?;
-                    m.k("attention_m_mma_bidir_64", &[(&q, 0), (kh, 0), (vh, 0), (&hb, 0)],
-                        &[hd as u32, d32, np, 1, scale.to_bits(), nh as u32, np], grid, block)?;
+                    match &span {
+                        None => m.k("attention_m_mma_bidir_64", &[(&q, 0), (kh, 0), (vh, 0), (&hb, 0)],
+                            &[hd as u32, d32, np, 1, scale.to_bits(), nh as u32, np], grid, block)?,
+                        Some(sp) => m.k("attention_m_bidir_span", &[(&q, 0), (kh, 0), (vh, 0), (&hb, 0), (sp, 0)],
+                            &[hd as u32, d32, np, 1, scale.to_bits(), nh as u32], [(n_pos * nh) as u32, 1, 1], [256, 1, 1])?,
+                    }
                 }
                 (VitAttn::X3, Some(kh), Some(vh), Some(kl), Some(vl)) => {
                     m.k("q35_split_half", &[(&kb, 0), (kh, 0), (kl, 0)], &[tot as u32], el(tot), [256, 1, 1])?;

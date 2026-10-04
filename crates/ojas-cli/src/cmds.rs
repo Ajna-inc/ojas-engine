@@ -279,7 +279,6 @@ pub fn chat(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
 }
 
 pub fn bench(model: &str, opts: &RunOpts, positional: Option<&str>, context: usize) -> Result<()> {
-    #[cfg(target_os = "macos")]
     if crate::decide::is_decision_model(model) {
         return crate::decide::bench(model, opts);
     }

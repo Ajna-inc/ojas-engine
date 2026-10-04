@@ -4,16 +4,6 @@ use metal::MTLSize;
 use std::ffi::c_void;
  // re-export
 
-/// One prompt's share of [`DecoderGpu::prefill_hidden_slots`]: rows `span` of
-/// `prompt`, prefilled into `slot` at cache rows `span`, reading the hidden states
-/// of the rows `read`.
-pub(crate) struct SlotPrefill<'p> {
-    pub(crate) prompt: &'p PromptRows<'p>,
-    pub(crate) span: std::ops::Range<usize>,
-    pub(crate) slot: usize,
-    pub(crate) read: &'p [usize],
-}
-
 /// One sequence's run of consecutive rows in a multi-sequence chunk
 /// ([`DecoderGpu::forward_segments_enc`]).
 #[derive(Clone, Debug)]
@@ -24,18 +14,6 @@ pub(crate) struct ChunkSegment {
     pub(crate) slot: usize,
     /// The cache row, within the slot, of the segment's first row.
     pub(crate) base_pos: usize,
-}
-
-/// A prompt for [`DecoderGpu::prefill_hidden`]: token ids, some runs of which are
-/// given as embedding rows (an image), and optionally a rotary coordinate per row.
-pub(crate) struct PromptRows<'p> {
-    /// One id per row. An embedded row's id is a placeholder and is never gathered.
-    pub(crate) ids: &'p [u32],
-    /// `(first row, rows)`: runs of rows given directly, `d` f32 per row, in
-    /// ascending order and not overlapping.
-    pub(crate) embedded: &'p [(usize, &'p [f32])],
-    /// `(t, h, w, e)` per row; `None` ropes every row at its cache row.
-    pub(crate) positions: Option<&'p [[u32; 4]]>,
 }
 
 impl<'a> DecoderGpu<'a> {
@@ -149,18 +127,12 @@ impl<'a> DecoderGpu<'a> {
     /// Whether the model keeps a recurrent state, which `prefill_hidden` needs.
     pub(crate) fn is_recurrent(&self) -> bool { self.arch.ssm.is_some() }
 
-    /// Prefill rows `span` of `prompt` into cache rows `span` of the current slot,
-    /// and return the final hidden state (after `output_norm`) of the rows `read`
-    /// names: ascending prompt indices inside `span`. Recurrent (qwen35) models only.
-    pub(crate) fn prefill_hidden(&self, prompt: &PromptRows, span: std::ops::Range<usize>, read: &[usize]) -> Vec<Vec<f32>> {
-        let job = SlotPrefill { prompt, span, slot: self.cur_slot.get(), read };
-        self.prefill_hidden_slots(std::slice::from_ref(&job)).pop().unwrap()
-    }
-
-    /// [`DecoderGpu::prefill_hidden`] for several prompts at once, each in its own
-    /// slot: every pass holds rows of as many prompts as fit in a chunk, one segment
-    /// each ([`DecoderGpu::forward_segments_enc`]), so the weights are read once for
-    /// all of them.
+    /// Prefill several prompts at once, each in its own slot, and return the final
+    /// hidden state (after `output_norm`) of each prompt's `read` rows (ascending
+    /// prompt indices inside its span). Recurrent (qwen35) models only. Every pass holds
+    /// rows of as many prompts as fit in a chunk, one segment each
+    /// ([`DecoderGpu::forward_segments_enc`]), so the weights are read once for all of
+    /// them.
     ///
     /// Rows the prompt gives as embeddings enter the residual stream directly, and
     /// rows with explicit rotary coordinates are roped at those rather than at their

@@ -2,14 +2,14 @@
 //!
 //! The reference is the response another implementation returned for the same model
 //! file and request (`{"model", "answers", "usage"}`); the checks are
-//! [`ojas_models::decision::parity`]'s.
+//! [`ojas_decision::parity`]'s.
 //!
 //! usage: decision_gate <model.gguf> <request.json> <reference.json> [tolerance]
 
 use anyhow::{bail, ensure, Result};
-use ojas_models::decision::json::Json;
-use ojas_models::decision::parity::{compare, CHOICE_MARGIN, MAX_PROBABILITY_DIFF};
-use ojas_models::decision::{DecisionModel, QuestionKind};
+use ojas_decision::json::Json;
+use ojas_decision::parity::{compare, CHOICE_MARGIN, MAX_PROBABILITY_DIFF};
+use ojas_decision::{DecisionModel, QuestionKind};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -17,7 +17,8 @@ fn main() -> Result<()> {
     let tolerance: f64 = args.get(4).map_or(Ok(MAX_PROBABILITY_DIFF), |t| t.parse())?;
     let body = Json::parse(&std::fs::read_to_string(&args[2])?)?;
     let reference = Json::parse(&std::fs::read_to_string(&args[3])?)?;
-    let gpu = ojas_metal::MetalGpu::new()?;
+    let metal = ojas_metal::MetalGpu::new()?;
+    let gpu = ojas_models::decision_backend::MetalDecision(&metal);
     let t_load = std::time::Instant::now();
     let model = DecisionModel::load(&gpu, &args[1])?;
     println!("  model      {}  (loaded in {:.2} s)", args[1], t_load.elapsed().as_secs_f64());

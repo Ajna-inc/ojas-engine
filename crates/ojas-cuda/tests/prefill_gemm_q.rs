@@ -1,6 +1,6 @@
 //! Quantised prefill GEMMs on CUDA — the `gemm_q` family, twins of Metal's `gemm_mm_q4`,
-//! `gemm_mm_q4l{,_mlx,_sk,_hb}`, `gemm_mm_q6k`, `gemm_mm_q8` (+ `splitk_accum`) — against a
-//! CPU f32 reference built from the repo's own quantisers / dequantisers.
+//! `gemm_mm_q4l{,_sk,_hb}`, `gemm_mm_q6k`, `gemm_mm_q8`, plus `gemm_mm_q8_0` and the split-K
+//! forms — against a CPU f32 reference built from the repo's own quantisers / dequantisers.
 //!
 //! GPU-only, so every test is `#[ignore]`:
 //!
@@ -16,7 +16,7 @@
 //!   its inverse, `(q - 8) · s`.
 //! * Q4L: synthetic Q4_K blocks (`ojas_formats::synth::blocks(12, ..)`), reference W =
 //!   `ojas_formats::gguf::dequant_to_f16(.., 12, ..)`; the kernel's inputs are those blocks
-//!   relaid by `relayout_q4k_q4l` (a CPU transcription of the Metal load-time kernel), so the
+//!   relaid by `quant::relayout_q4k_q4l` (a CPU transcription of the Metal load-time kernel), so the
 //!   kernel also carries the relayout's rounding of `d·sc` and `dmin·m` to f16.
 //! * Q6_K: `synth::blocks(14, ..)`, reference `dequant_to_f16(.., 14, ..)`.
 //! * Q8: `ojas_formats::quant::q8_rows_from_f16`, reference `q · scale`.
@@ -36,6 +36,7 @@ type Enc = <CudaGpu as Device>::Enc;
 fn gpu() -> CudaGpu {
     let mut g = CudaGpu::new(0).expect("these tests require a CUDA box: cargo test -- --ignored");
     g.ensure_family("gemm_q").expect("gemm_q family compiles");
+    g.ensure_family("gemm_f16").expect("gemm_f16 family compiles");
     g
 }
 
@@ -68,7 +69,7 @@ fn u16_bytes(v: &[u16]) -> Vec<u8> {
 // ---------------- weight formats ----------------
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Fmt { Q4, Q4l, Q6k, Q8 }
+enum Fmt { Q4, Q4l, Q6k, Q8, Q80, F16 }
 
 /// Device-side weights plus the f32 reference W[n, k] the CPU dequantiser produces.
 struct Weights {
@@ -93,39 +94,6 @@ fn dequant_q4_pair(nib: &[u8], scale: &[u16], n: usize, k: usize) -> Vec<f32> {
     out
 }
 
-/// CPU transcription of Metal's `relayout_q4k_q4l` (ojas-metal gemv.rs): Q4_K super-blocks
-/// -> Q4L nibbles (pairs sharing a byte) + per-32 f16 `qa = d·sc`, `qb = -dmin·m`.
-fn relayout_q4k_q4l(w: &[u8], k: usize, n: usize) -> (Vec<u8>, Vec<u16>, Vec<u16>) {
-    let (nblk, nsb) = (k / 32, k / 256);
-    let mut nib = vec![0u8; n * k / 2];
-    let mut qa = vec![0u16; n * nblk];
-    let mut qb = vec![0u16; n * nblk];
-    for r in 0..n {
-        for b in 0..nblk {
-            let (sb, j) = (b >> 3, b & 7);
-            let (g, hi) = (j >> 1, j & 1);
-            let blk = &w[(r * nsb + sb) * 144..][..144];
-            let d = f16::from_bits(u16::from_le_bytes([blk[0], blk[1]])).to_f32();
-            let dm = f16::from_bits(u16::from_le_bytes([blk[2], blk[3]])).to_f32();
-            let sc = &blk[4..16];
-            let (s_, m_) = if j < 4 {
-                ((sc[j] & 63) as u32, (sc[j + 4] & 63) as u32)
-            } else {
-                (((sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4)) as u32,
-                 ((sc[j + 4] >> 4) | ((sc[j] >> 6) << 4)) as u32)
-            };
-            qa[r * nblk + b] = f16::from_f32(d * s_ as f32).to_bits();
-            qb[r * nblk + b] = f16::from_f32(-dm * m_ as f32).to_bits();
-            let qq = &blk[16 + g * 32..][..32];
-            for i in 0..16 {
-                let pick = |v: u8| if hi == 1 { v >> 4 } else { v & 15 };
-                nib[r * (k / 2) + b * 16 + i] = pick(qq[2 * i]) | (pick(qq[2 * i + 1]) << 4);
-            }
-        }
-    }
-    (nib, qa, qb)
-}
-
 fn make_weights(g: &CudaGpu, fmt: Fmt, n: usize, k: usize, seed: u32) -> Weights {
     match fmt {
         Fmt::Q4 | Fmt::Q8 => {
@@ -147,7 +115,7 @@ fn make_weights(g: &CudaGpu, fmt: Fmt, n: usize, k: usize, seed: u32) -> Weights
         Fmt::Q4l => {
             let raw = synth::blocks(12, n * k / 256);
             let wref = f16_bytes_to_f32(&gguf::dequant_to_f16(&raw, 12, n * k));
-            let (nib, qa, qb) = relayout_q4k_q4l(&raw, k, n);
+            let (nib, qa, qb) = quant::relayout_q4k_q4l(&raw, k, n);
             Weights { bufs: vec![g.upload_bytes(&nib).unwrap(), g.upload_bytes(&u16_bytes(&qa)).unwrap(),
                                  g.upload_bytes(&u16_bytes(&qb)).unwrap()], wref }
         }
@@ -156,59 +124,70 @@ fn make_weights(g: &CudaGpu, fmt: Fmt, n: usize, k: usize, seed: u32) -> Weights
             let wref = f16_bytes_to_f32(&gguf::dequant_to_f16(&raw, 14, n * k));
             Weights { bufs: vec![g.upload_bytes(&raw).unwrap()], wref }
         }
+        Fmt::Q80 => {
+            let raw = synth::blocks(8, n * k / 32);
+            let wref = f16_bytes_to_f32(&gguf::dequant_to_f16(&raw, 8, n * k));
+            Weights { bufs: vec![g.upload_bytes(&raw).unwrap()], wref }
+        }
+        Fmt::F16 => {
+            let s = 1.7 / (k as f32).sqrt();
+            let w: Vec<f32> = tvec(n * k, seed).iter().map(|v| v * s).collect();
+            let wb = f16_bytes(&w);
+            Weights { bufs: vec![g.upload_bytes(&wb).unwrap()], wref: f16_bytes_to_f32(&wb) }
+        }
     }
 }
 
 // ---------------- kernels under test ----------------
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Kern { Q4, Q4l, Q4lMlx, Q4lSk, Q4lHb, Q6k, Q8 }
+enum Kern { Q4, Q4l, Q4lHb, Q6k, Q8, Q80, Q4lSk, Q80Sk, Q6kSk, F16Sk, Q4lH, Q80H, Q4lSkH, Q80SkH }
 
 impl Kern {
-    const ALL: [Kern; 7] = [Kern::Q4, Kern::Q4l, Kern::Q4lMlx, Kern::Q4lSk, Kern::Q4lHb, Kern::Q6k, Kern::Q8];
+    const ALL: [Kern; 14] = [Kern::Q4, Kern::Q4l, Kern::Q4lHb, Kern::Q6k, Kern::Q8, Kern::Q80,
+                             Kern::Q4lSk, Kern::Q80Sk, Kern::Q6kSk, Kern::F16Sk,
+                             Kern::Q4lH, Kern::Q80H, Kern::Q4lSkH, Kern::Q80SkH];
+    fn split_k(self) -> bool { matches!(self, Kern::Q4lSk | Kern::Q80Sk | Kern::Q6kSk | Kern::F16Sk | Kern::Q4lSkH | Kern::Q80SkH) }
+    fn x_half(self) -> bool { matches!(self, Kern::Q4lHb | Kern::Q4lSk | Kern::Q80Sk | Kern::Q6kSk | Kern::Q4lSkH | Kern::Q80SkH) }
     fn name(self) -> &'static str {
         match self {
-            Kern::Q4 => "gemm_mm_q4", Kern::Q4l => "gemm_mm_q4l", Kern::Q4lMlx => "gemm_mm_q4l_mlx",
-            Kern::Q4lSk => "gemm_mm_q4l_sk", Kern::Q4lHb => "gemm_mm_q4l_hb",
-            Kern::Q6k => "gemm_mm_q6k", Kern::Q8 => "gemm_mm_q8",
+            Kern::Q4 => "gemm_mm_q4", Kern::Q4l => "gemm_mm_q4l", Kern::Q4lHb => "gemm_mm_q4l_hb",
+            Kern::Q6k => "gemm_mm_q6k", Kern::Q8 => "gemm_mm_q8", Kern::Q80 => "gemm_mm_q8_0",
+            Kern::Q4lSk => "gemm_mm_q4l_sk", Kern::Q80Sk => "gemm_mm_q8_0_sk", Kern::Q6kSk => "gemm_mm_q6k_sk",
+            Kern::F16Sk => "gemm_mm_f16_sk",
+            Kern::Q4lH => "gemm_mm_q4l_h", Kern::Q80H => "gemm_mm_q8_0_h",
+            Kern::Q4lSkH => "gemm_mm_q4l_sk_h", Kern::Q80SkH => "gemm_mm_q8_0_sk_h",
         }
     }
     fn fmt(self) -> Fmt {
         match self {
-            Kern::Q4 => Fmt::Q4, Kern::Q6k => Fmt::Q6k, Kern::Q8 => Fmt::Q8, _ => Fmt::Q4l,
+            Kern::Q4 => Fmt::Q4, Kern::Q6k | Kern::Q6kSk => Fmt::Q6k, Kern::Q8 => Fmt::Q8,
+            Kern::Q80 | Kern::Q80Sk | Kern::Q80H | Kern::Q80SkH => Fmt::Q80, Kern::F16Sk => Fmt::F16, _ => Fmt::Q4l,
         }
     }
 }
 
-/// Metal's partition count (dispatch.rs), on this kernel's 128x128 tile: enough z-slices to
+/// Metal's partition count (dispatch.rs), on this kernel's 64x128 tile: enough z-slices to
 /// reach ~2 waves of blocks, at most 8, each at least one 32-block.
 fn nsplit_for(m: usize, k: usize, n: usize) -> usize {
-    let tiles = m.div_ceil(128) * n.div_ceil(128);
+    let tiles = m.div_ceil(64) * n.div_ceil(128);
     let mut ns = (56 / tiles.max(1)).clamp(1, 8);
     while ns > 1 && k / ns < 32 { ns -= 1; }
     ns
 }
 
-/// Launch `kern`: y (+)= x · Wᵀ. `part` is the split-K scratch (nsplit · M · N floats).
+/// Launch `kern`: y (+)= x · Wᵀ (the split-K forms add into y, zeroed first unless `accum`).
 #[allow(clippy::too_many_arguments)]
-fn launch(g: &CudaGpu, enc: &Enc, kern: Kern, x: &Buf, w: &Weights, y: &Buf, part: Option<&Buf>,
-          m: usize, k: usize, n: usize, accum: bool, nsplit: usize) {
-    let bm = if kern == Kern::Q4lMlx { 64 } else { 128 };
-    let grid = [n.div_ceil(128) as u32, m.div_ceil(bm) as u32, 1];
-    let mut bufs: Vec<(&Buf, u64)> = vec![(x, 0), (&w.bufs[0], 0)];
+fn launch(g: &CudaGpu, enc: &Enc, kern: Kern, x: &Buf, w: &Weights, y: &Buf, m: usize, k: usize, n: usize,
+          accum: bool, nsplit: usize) {
+    let grid = [n.div_ceil(128) as u32, m.div_ceil(64) as u32, 1];
+    let mut bufs: Vec<(&Buf, u64)> = vec![(x, 0), (&w.bufs[0], 0), (y, 0)];
+    bufs.extend(w.bufs[1..].iter().map(|b| (b, 0)));
     let (k, n, m, ac) = (k as u32, n as u32, m as u32, accum as u32);
-    if kern == Kern::Q4lSk {
-        let part = part.expect("split-K scratch");
-        bufs.push((part, 0));
-        bufs.extend(w.bufs[1..].iter().map(|b| (b, 0)));
-        g.dispatch(enc, kern.name(), &bufs, &[k, n, 0, m, nsplit as u32],
-                   [grid[0], grid[1], nsplit as u32], [256, 1, 1]).unwrap();
-        let total = m * n;
-        g.dispatch(enc, "splitk_accum", &[(part, 0), (y, 0)], &[total, nsplit as u32, ac],
-                   [total.div_ceil(256), 1, 1], [256, 1, 1]).unwrap();
+    if kern.split_k() {
+        if !accum { g.zero_bytes(y, 0, (m * n) as usize * 4).unwrap(); }
+        g.dispatch(enc, kern.name(), &bufs, &[k, n, m, nsplit as u32], [grid[0], grid[1], nsplit as u32], [256, 1, 1]).unwrap();
     } else {
-        bufs.push((y, 0));
-        bufs.extend(w.bufs[1..].iter().map(|b| (b, 0)));
         g.dispatch(enc, kern.name(), &bufs, &[k, n, ac, m], grid, [256, 1, 1]).unwrap();
     }
 }
@@ -330,11 +309,10 @@ fn run_case(g: &CudaGpu, kern: Kern, w: &Weights, m: usize, k: usize, n: usize, 
     const SENT: f32 = 12345.5;
     let mut yinit = y0.clone();
     yinit.extend(std::iter::repeat(SENT).take(n));
-    let xd = if kern == Kern::Q4lHb { g.upload_f16(&x) } else { g.upload(&x) };
+    let xd = if kern.x_half() { g.upload_f16(&x) } else { g.upload(&x) };
     let yd = g.upload(&yinit);
-    let part = (kern == Kern::Q4lSk).then(|| g.alloc(nsplit * m * n));
     let enc = g.begin();
-    launch(g, &enc, kern, &xd, w, &yd, part.as_ref(), m, k, n, accum, nsplit);
+    launch(g, &enc, kern, &xd, w, &yd, m, k, n, accum, nsplit);
     g.submit(enc).unwrap();
     let mut got = vec![0f32; m * n + n];
     g.read(&yd, &mut got);
@@ -343,7 +321,7 @@ fn run_case(g: &CudaGpu, kern: Kern, w: &Weights, m: usize, k: usize, n: usize, 
     let e32 = errs(got, &want);
     let e16 = errs(got, &want16);
     let (secs, med) = if timed {
-        time(g, 20, |g, enc| launch(g, enc, kern, &xd, w, &yd, part.as_ref(), m, k, n, false, nsplit))
+        time(g, 20, |g, enc| launch(g, enc, kern, &xd, w, &yd, m, k, n, false, nsplit))
     } else {
         (0.0, 0.0)
     };
@@ -353,7 +331,7 @@ fn run_case(g: &CudaGpu, kern: Kern, w: &Weights, m: usize, k: usize, n: usize, 
     } else {
         String::new()
     };
-    let sk = if kern == Kern::Q4lSk { format!(" z={nsplit}") } else { String::new() };
+    let sk = if kern.split_k() { format!(" z={nsplit}") } else { String::new() };
     println!("  {:16} M={m:5} K={k:5} N={n:5}{}{sk:4}  f32 max {:.2e} rms {:.2e} | x16 max {:.2e} rms {:.2e}{ts}",
              kern.name(), if accum { " +acc" } else { "     " }, e32.0, e32.1, e16.0, e16.1);
     let (bmax, brms) = bound_x16(kern.fmt());
@@ -392,7 +370,7 @@ fn sweep(kern: Kern) {
                            (300, 3584, 1024, true)] {
         let w = make_weights(&g, kern.fmt(), n, k, (k + n) as u32);
         note(&run_case(&g, kern, &w, m, k, n, acc, nsplit_for(m, k, n), false));
-        if kern == Kern::Q4lSk {
+        if kern.split_k() {
             // an odd partition count whose last slice takes a remainder
             note(&run_case(&g, kern, &w, m, k, n, acc, 3, false));
         }
@@ -411,14 +389,6 @@ fn gemm_mm_q4l() { sweep(Kern::Q4l) }
 
 #[test]
 #[ignore = "requires NVIDIA GPU"]
-fn gemm_mm_q4l_mlx() { sweep(Kern::Q4lMlx) }
-
-#[test]
-#[ignore = "requires NVIDIA GPU"]
-fn gemm_mm_q4l_sk() { sweep(Kern::Q4lSk) }
-
-#[test]
-#[ignore = "requires NVIDIA GPU"]
 fn gemm_mm_q4l_hb() { sweep(Kern::Q4lHb) }
 
 #[test]
@@ -429,11 +399,73 @@ fn gemm_mm_q6k() { sweep(Kern::Q6k) }
 #[ignore = "requires NVIDIA GPU"]
 fn gemm_mm_q8() { sweep(Kern::Q8) }
 
+#[test]
+#[ignore = "requires NVIDIA GPU"]
+fn gemm_mm_q8_0() { sweep(Kern::Q80) }
+
+#[test]
+#[ignore = "requires NVIDIA GPU"]
+fn gemm_mm_q4l_sk() { sweep(Kern::Q4lSk) }
+
+#[test]
+#[ignore = "requires NVIDIA GPU"]
+fn gemm_mm_q8_0_sk() { sweep(Kern::Q80Sk) }
+
+#[test]
+#[ignore = "requires NVIDIA GPU"]
+fn gemm_mm_q6k_sk() { sweep(Kern::Q6kSk) }
+
+#[test]
+#[ignore = "requires NVIDIA GPU"]
+fn gemm_mm_f16_sk() { sweep(Kern::F16Sk) }
+
+#[test]
+#[ignore = "requires NVIDIA GPU"]
+fn gemm_mm_h() { for k in [Kern::Q4lH, Kern::Q80H, Kern::Q4lSkH, Kern::Q80SkH] { sweep(k) } }
+
 /// Fails if an entry of the `gemm_q` family has no test above.
 #[test]
 fn every_gemm_q_entry_is_tested() {
-    let tested: Vec<&str> = Kern::ALL.iter().map(|k| k.name()).chain(["splitk_accum"]).collect();
+    let tested: Vec<&str> = Kern::ALL.iter().map(|k| k.name()).collect();
     for name in ojas_cuda::kernels::gemm_q::NAMES {
         assert!(tested.contains(name), "{name} has no test here");
+    }
+}
+
+/// The Q4_K / Q8_0 projections of Kev-4B at the chunk sizes a decision request prefills,
+/// timed with the runner's rule (split-K up to 128 rows, the plain tile above): milliseconds,
+/// the weight read against the card's bandwidth, and the arithmetic rate.
+#[test]
+#[ignore = "GPU"]
+fn kev_shapes() {
+    let g = gpu();
+    // (name, K, N, fmt): gate|up, down, the SSM in-projection, ssm_out / attn_output
+    let shapes = [("ffn gate|up", 2560, 18432, Fmt::Q4l), ("ffn down", 9216, 2560, Fmt::Q4l),
+                  ("ssm in", 2560, 12352, Fmt::Q80), ("ssm out", 4096, 2560, Fmt::Q80)];
+    let bits = |f: Fmt| match f { Fmt::Q4l => 4.5, Fmt::Q80 => 8.5, _ => 16.0 };
+    for k in [Kern::Q4lSkH, Kern::Q80SkH, Kern::Q4lH, Kern::Q80H] {
+        println!("  {:<18} {} blocks per SM", k.name(), g.blocks_per_sm(k.name(), 256).unwrap());
+    }
+    for (name, k, n, fmt) in shapes {
+        let w = make_weights(&g, fmt, n, k, 7);
+        for m in [16usize, 32, 64, 96, 128, 192, 256] {
+            let kerns = match (fmt, m <= 128) {
+                (Fmt::Q4l, true) => [Kern::Q4lSk, Kern::Q4lSkH], (Fmt::Q4l, false) => [Kern::Q4l, Kern::Q4lH],
+                (_, true) => [Kern::Q80Sk, Kern::Q80SkH], (_, false) => [Kern::Q80, Kern::Q80H],
+            };
+            let tiles = m.div_ceil(64) * n.div_ceil(128);
+            let mut ns = if m <= 128 { (224usize).div_ceil(tiles.max(1)).clamp(1, 8) } else { 1 };
+            while ns > 1 && k / ns < 32 { ns -= 1; }
+            let x = tvec(m * k, 3);
+            let mut line = format!("  {name:<12} K={k:5} N={n:5} M={m:3} z={ns}:");
+            for kern in kerns {
+                let xd = if kern.x_half() { g.upload_f16(&x) } else { g.upload(&x) };
+                let yd = g.alloc(m * n);
+                let (secs, _) = time(&g, 20, |g, enc| launch(g, enc, kern, &xd, &w, &yd, m, k, n, false, ns));
+                line += &format!("  {:<18} {:.3} ms {:>5.0} GB/s {:>5.1} TFLOP/s", kern.name(), secs * 1e3,
+                                 (n * k) as f64 * bits(fmt) / 8.0 / secs / 1e9, 2.0 * (m * n * k) as f64 / secs / 1e12);
+            }
+            println!("{line}");
+        }
     }
 }

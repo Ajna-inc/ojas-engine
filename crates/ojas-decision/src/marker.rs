@@ -12,16 +12,15 @@
 //! each option to at most 48 tokens after its marker, then all of them evenly when
 //! they leave the question fewer than 16 tokens, and the question to what remains.
 //! Every question of a request is one sequence, and all of them run in one GPU pass
-//! ([`DecoderGpu::marker_head_forward`]); the host applies the scorer's last
+//! ([`MarkerBackend::marker_head_forward`]); the host applies the scorer's last
 //! projection (`cls.output`).
 
 use super::json::Json;
 use super::template::{OptionView, PromptInput, Template};
 use super::{invalid, read_f32, Question, Request, Scored};
-use crate::decoder::DecoderGpu;
+use crate::backend::{DecisionGpu, MarkerBackend};
 use anyhow::{ensure, Context, Result};
 use ojas_formats::gguf::Gguf;
-use ojas_metal::MetalGpu;
 use ojas_tokenize::Bpe;
 
 /// Most tokens of an option's text.
@@ -36,8 +35,8 @@ const PASS_TOKENS: usize = 4096;
 /// Token sequences, one per question, and each one's option marker positions.
 type Sequences = (Vec<Vec<u32>>, Vec<Vec<usize>>);
 
-pub(super) struct MarkerHead<'a> {
-    dec: DecoderGpu<'a>,
+pub(super) struct MarkerHead<M> {
+    dec: M,
     tok: Bpe,
     template: Template,
     marker: u32,
@@ -50,8 +49,8 @@ pub(super) struct MarkerHead<'a> {
     out_b: f32,
 }
 
-impl<'a> MarkerHead<'a> {
-    pub(super) fn load(gpu: &'a MetalGpu, g: &mut Gguf, template: Template, prefix: &str) -> Result<Self> {
+impl<M: MarkerBackend> MarkerHead<M> {
+    pub(super) fn load<'a, G: DecisionGpu<Marker<'a> = M> + 'a>(gpu: &'a G, g: &mut Gguf, template: Template, prefix: &str) -> Result<Self> {
         let id = |k: &str| g.meta_u32(&format!("tokenizer.ggml.{k}")).with_context(|| format!("no tokenizer.ggml.{k}"));
         let (marker, sep) = (id("mask_token_id")?, id("seperator_token_id")?);
         let max_head_tokens = g.meta_u32(&format!("{prefix}max_head_tokens")).unwrap_or(0) as usize;
@@ -62,18 +61,10 @@ impl<'a> MarkerHead<'a> {
         let out_w = read_f32(g, "cls.output.weight")?;
         let out_b = read_f32(g, "cls.output.bias")?;
 
-        // The encoder keeps no KV cache, so the decoder context is minimal. Weights are
-        // held in f16: every token goes through batched GEMMs, which the file's
-        // quantized blocks would serve one row at a time, and requantizing them per row
-        // moves the probabilities further from the file's own numbers.
-        // An encoder takes no projector or draft head; files beside it belong to
-        // other models.
-        g.sidecars = false;
-        let dec = DecoderGpu::load(gpu, g, 64, 0, None, None)?;
-        ensure!(dec.has_marker_head(), "the encoder loaded without its decision head");
-        let d = dec.text_encoder_width().context("not a text encoder")?;
+        let dec = gpu.load_marker(g)?;
+        let d = dec.width();
         ensure!(out_w.len() == d && out_b.len() == 1, "cls.output must project {d} values to one score");
-        let max_positions = dec.text_encoder_max_positions().unwrap_or(usize::MAX);
+        let max_positions = dec.max_positions();
         Ok(MarkerHead { dec, tok, template, marker, sep, marker_text, max_head_tokens, max_positions, out_w, out_b: out_b[0] })
     }
 

@@ -29,59 +29,109 @@ extern "C" __global__ void conv1d_decode(float* qkv, float* cstate, const float*
     qkv[c] = acc / (1.0f + expf(-acc));   // SILU
 }
 
-// Gated-DeltaNet recurrence: one warp per state column, the 128 column values in
-// registers (4/lane). q/k L2-norm fused in; 1/sqrt(S) folds into q's normalizer.
-// Token-serial (the recurrence is sequential). q/k/v are slices of the conv
+// Gated-DeltaNet recurrence: one warp per four consecutive state columns, the 4 x 128
+// column values in registers (16/lane). q/k L2-norm fused in; 1/sqrt(S) folds into q's
+// normalizer. Token-serial (the recurrence is sequential), so a step is a latency chain:
+// the next token's q/k/v/gate/beta are loaded while this token is computed, and the four
+// columns' reductions are independent and overlap. Four columns a warp puts a 32-head
+// model's 256 blocks on the card at once (one wave, no tail). q/k/v are slices of the conv
 // output row [conv_ch]; gate/beta rows [H_v]; out rows [H_v*S]. Assumes S==128.
-// grid = (S/4, H_v); block = 128 threads (4 warps).
+// Several sequences at once: segment z of `segs` ([base, base+rows, slot, r0] u32 each)
+// takes rows r0.. of the chunk and slot `slot` of the state (`slot_floats` apart).
+// grid = (S/16, H_v, segments); block = 128 threads (4 warps).
 extern "C" __global__ void deltanet_fused(float* state, const float* qkv,
                                           const float* gate, const float* beta,
-                                          float* out, int S, int H_k, int H_v,
-                                          int conv_ch, int M, float eps) {
+                                          float* out, const unsigned* segs, int S, int H_k, int H_v,
+                                          int conv_ch, int slot_floats, float eps) {
+    const unsigned* seg = segs + 4 * blockIdx.z;
+    const int M = (int)(seg[1] - seg[0]), r0 = (int)seg[3];
+    state += (long)seg[2] * slot_floats;
+    qkv += (long)r0 * conv_ch;
+    gate += (long)r0 * H_v;
+    beta += (long)r0 * H_v;
+    out += (long)r0 * H_v * S;
     int h = blockIdx.y;
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int col = blockIdx.x * 4 + warp;
-    if (col >= S) return;
+    int col0 = (blockIdx.x * 4 + warp) * 4;
+    if (col0 >= S) return;
     int hk = h % H_k;
     float scale = rsqrtf((float)S);
-    float* sb = state + (long)(h * S + col) * S;
-    float ls[4];
+    float* sb = state + (long)(h * S + col0) * S;
+    float ls[4][4];
     #pragma unroll
-    for (int j = 0; j < 4; j++) ls[j] = sb[j * 32 + lane];   // coalesced state layout (matches deltanet_scan)
-    for (int t = 0; t < M; t++) {
+    for (int c = 0; c < 4; c++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) ls[c][j] = sb[c * S + j * 32 + lane];   // coalesced state layout
+    const float* vcol = qkv + 2 * H_k * S + h * S + col0;
+    auto fetch = [&](int t, float* qv, float* kv, float4* v4, float* g, float* b) {
         const float* row = qkv + (long)t * conv_ch;
-        float qv[4], kv[4], sq = 0.0f, s2 = 0.0f;
         #pragma unroll
         for (int j = 0; j < 4; j++) {
             int is = j * 32 + lane;
             qv[j] = row[hk * S + is];
             kv[j] = row[H_k * S + hk * S + is];
-            sq += qv[j] * qv[j]; s2 += kv[j] * kv[j];
         }
+        *v4 = *(const float4*)(vcol + (long)t * conv_ch);
+        *g = gate[t * H_v + h];
+        *b = beta[t * H_v + h];
+    };
+    float qv[4], kv[4], g, b;
+    float4 v4;
+    if (M > 0) fetch(0, qv, kv, &v4, &g, &b);
+    for (int t = 0; t < M; t++) {
+        float nq[4], nk[4], ng, nb;
+        float4 nv;
+        if (t + 1 < M) fetch(t + 1, nq, nk, &nv, &ng, &nb);
+        float sq = 0.0f, s2 = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) { sq += qv[j] * qv[j]; s2 += kv[j] * kv[j]; }
         sq = warp_all_sum(sq); s2 = warp_all_sum(s2);
         float qn = rsqrtf(sq + eps) * scale;
         float kn = rsqrtf(s2 + eps);
-        float g = expf(gate[t * H_v + h]), bet = beta[t * H_v + h];
-        float sk = 0.0f;
+        float gexp = expf(g);
+        float sk[4];
         #pragma unroll
-        for (int j = 0; j < 4; j++) { ls[j] *= g; sk += ls[j] * kv[j]; }
-        sk = warp_all_sum(sk) * kn;
-        float d = (row[2 * H_k * S + h * S + col] - sk) * bet;
-        float y = 0.0f;
+        for (int c = 0; c < 4; c++) {
+            sk[c] = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) { ls[c][j] *= gexp; sk[c] += ls[c][j] * kv[j]; }
+        }
         #pragma unroll
-        for (int j = 0; j < 4; j++) { ls[j] += kv[j] * kn * d; y += ls[j] * qv[j]; }
-        y = warp_all_sum(y) * qn;
-        if (lane == 0) out[(long)t * (H_v * S) + h * S + col] = y;
+        for (int c = 0; c < 4; c++) sk[c] = warp_all_sum(sk[c]) * kn;
+        const float vv[4] = {v4.x, v4.y, v4.z, v4.w};
+        float y[4];
+        #pragma unroll
+        for (int c = 0; c < 4; c++) {
+            float d = (vv[c] - sk[c]) * b;
+            y[c] = 0.0f;
+            #pragma unroll
+            for (int j = 0; j < 4; j++) { ls[c][j] += kv[j] * kn * d; y[c] += ls[c][j] * qv[j]; }
+        }
+        #pragma unroll
+        for (int c = 0; c < 4; c++) y[c] = warp_all_sum(y[c]) * qn;
+        if (lane == 0) *(float4*)(out + (long)t * (H_v * S) + h * S + col0) = make_float4(y[0], y[1], y[2], y[3]);
+        if (t + 1 < M) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) { qv[j] = nq[j]; kv[j] = nk[j]; }
+            v4 = nv; g = ng; b = nb;
+        }
     }
     #pragma unroll
-    for (int j = 0; j < 4; j++) sb[j * 32 + lane] = ls[j];
+    for (int c = 0; c < 4; c++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) sb[c * S + j * 32 + lane] = ls[c][j];
 }
 
-// Causal depthwise conv1d over M prompt tokens + SILU + rolling state update.
-// qkv[M*n_ch] token-major; cstate holds last K-1 inputs. One thread per channel,
-// sequential over tokens (mirrors conv1d_decode called M times).
+// Causal depthwise conv1d over a segment's prompt tokens + SILU + rolling state update.
+// qkv[*, n_ch] token-major; cstate holds the last K-1 inputs per slot (`slot_floats`
+// apart). One thread per channel, sequential over tokens (mirrors conv1d_decode called M
+// times); segment y of `segs` ([base, base+rows, slot, r0]) as in deltanet_fused.
 extern "C" __global__ void conv1d_prefill(float* qkv, float* cstate, const float* cw,
-    int n_ch, int K, int M) {
+    const unsigned* segs, int n_ch, int K, int slot_floats) {
+    const unsigned* seg = segs + 4 * blockIdx.y;
+    const int M = (int)(seg[1] - seg[0]);
+    qkv += (long)seg[3] * n_ch;
+    cstate += (long)seg[2] * slot_floats;
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= n_ch) return;
     float ring[8];

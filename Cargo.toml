@@ -10,6 +10,7 @@ members = [
     "crates/ojas-train",
     "crates/ojas-swarm",
     "crates/ojas-models",
+    "crates/ojas-decision",
     "crates/ojas-cpu",
     "crates/ojas-tokenize",
     "crates/ojas-infer",

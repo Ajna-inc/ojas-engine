@@ -1,4 +1,4 @@
-//! `ojas decide`: typed decisions with a decision model (Metal).
+//! `ojas decide`: typed decisions with a decision model, on Metal or CUDA.
 //!
 //! ```text
 //! ojas decide model.gguf --state '{"subject": "...", "body": "..."}' \
@@ -19,11 +19,65 @@
 //! order-preserving JSON reader, since a choice question's option order is part of
 //! the model's input.
 
+// Without a GPU backend in the build every entry point refuses before loading, and the
+// code past the refusal is never reached.
+#![cfg_attr(not(any(target_os = "macos", feature = "cuda")), allow(dead_code, unused_variables, unreachable_code))]
+
+use crate::backend::Device;
 use crate::flags::RunOpts;
 use crate::serve::{send, send_err, send_json, serve_http_batches};
 use anyhow::{Context, Result};
-use ojas_models::decision::json::Json;
-use ojas_models::decision::{Decision, DecisionModel, Image, InvalidRequest, QuestionKind, Request, Unsupported};
+use ojas_decision::json::Json;
+use ojas_decision::{Decision, DecisionGpu, DecisionModel, Image, InvalidRequest, QuestionKind, Request, Unsupported};
+
+/// The GPU backends a decision model can run on in this build.
+#[derive(Clone, Copy, Debug)]
+enum Backend {
+    #[cfg(target_os = "macos")]
+    Metal,
+    #[cfg(feature = "cuda")]
+    Cuda,
+}
+
+/// The backend `--device` asks for: Metal on macOS, CUDA when built with the `cuda`
+/// feature; `auto` prefers Metal, then CUDA. There is no CPU decision path.
+fn pick(device: Device) -> Result<Backend> {
+    let want = match device {
+        Device::Auto => "auto",
+        Device::Metal => "metal",
+        Device::Cpu => anyhow::bail!("decision models run on a GPU (Metal or CUDA), not on the CPU"),
+        Device::Cuda => "cuda",
+    };
+    #[cfg(target_os = "macos")]
+    if matches!(want, "auto" | "metal") { return Ok(Backend::Metal); }
+    #[cfg(feature = "cuda")]
+    if matches!(want, "auto" | "cuda") { return Ok(Backend::Cuda); }
+    anyhow::bail!("decision models need a Metal GPU or a build with --features cuda (asked for --device {want})")
+}
+
+/// Load the decision model at `$path` on the backend `$device` names and run `$body`
+/// with it. A macro rather than a function: the model's type carries the backend, and
+/// each backend is its own arm so the others need not be compiled in.
+macro_rules! with_decision_model {
+    ($path:expr, $device:expr, |$model:ident| $body:expr) => {{
+        let path: &str = $path;
+        match pick($device)? {
+            #[cfg(target_os = "macos")]
+            Backend::Metal => {
+                let gpu = ojas_metal::MetalGpu::new().context("opening the Metal GPU")?;
+                let backend = ojas_models::decision_backend::MetalDecision(&gpu);
+                let $model = DecisionModel::load(&backend, path)?;
+                $body
+            }
+            #[cfg(feature = "cuda")]
+            Backend::Cuda => {
+                let gpu = ojas_cuda::CudaDecision::new(0).context("opening the CUDA device")?;
+                let $model = DecisionModel::load(&gpu, path)?;
+                $body
+            }
+        }
+    }};
+}
 
 fn read(inline: &Option<String>, file: &Option<String>, what: &str) -> Result<String> {
     if let Some(f) = file {
@@ -49,7 +103,7 @@ fn parse_state(text: &str) -> Json {
 }
 
 /// A request from the state text, the questions text and image files.
-fn request(model: &DecisionModel, state: &str, questions: &str, images: &[String]) -> Result<Request> {
+fn request<G: DecisionGpu>(model: &DecisionModel<G>, state: &str, questions: &str, images: &[String]) -> Result<Request> {
     let questions = Json::parse(questions).context("--questions is not valid JSON")?;
     let body = Json::Object(vec![("state".into(), parse_state(state)), ("questions".into(), questions)]);
     let mut req = model.request(&body)?;
@@ -88,7 +142,7 @@ fn truncate(s: &str, n: usize) -> String {
 /// The answers to a file of request bodies, one JSON object per line: each line's
 /// response (or `{"error": ...}`) on its own output line, in order. Requests are
 /// answered `MAX_BATCH` at a time, as `serve` answers requests that arrive together.
-fn decide_file(model: &DecisionModel, path: &str) -> Result<()> {
+fn decide_file<G: DecisionGpu>(model: &DecisionModel<G>, path: &str) -> Result<()> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading requests file {path}"))?;
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let t = std::time::Instant::now();
@@ -115,30 +169,28 @@ fn decide_file(model: &DecisionModel, path: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn decide(model: &str, opts: &RunOpts) -> Result<()> {
-    if let Some(path) = &opts.requests_file {
-        let gpu = ojas_metal::MetalGpu::new().context("`decide` needs a Metal GPU")?;
-        return decide_file(&DecisionModel::load(&gpu, model)?, path);
+pub fn decide(path: &str, opts: &RunOpts) -> Result<()> {
+    if let Some(requests) = &opts.requests_file {
+        return with_decision_model!(path, opts.device, |model| decide_file(&model, requests));
     }
     let state = read(&opts.state, &opts.state_file, "state")?;
     let questions = read(&opts.questions, &opts.questions_file, "questions")?;
-    let gpu = ojas_metal::MetalGpu::new().context("`decide` needs a Metal GPU")?;
-    let model = DecisionModel::load(&gpu, model)?;
-    let req = request(&model, &state, &questions, &opts.images)?;
-
-    let t = std::time::Instant::now();
-    let decision = model.decide(&req)?;
-    let wall_ms = t.elapsed().as_secs_f64() * 1e3;
-    if opts.json {
-        println!("{}", decision.to_json(model.name()).to_python(false));
-    } else {
-        print_table(&decision, wall_ms);
-    }
-    Ok(())
+    with_decision_model!(path, opts.device, |model| {
+        let req = request(&model, &state, &questions, &opts.images)?;
+        let t = std::time::Instant::now();
+        let decision = model.decide(&req)?;
+        let wall_ms = t.elapsed().as_secs_f64() * 1e3;
+        if opts.json {
+            println!("{}", decision.to_json(model.name()).to_python(false));
+        } else {
+            print_table(&decision, wall_ms);
+        }
+        Ok(())
+    })
 }
 
 /// Whether `path` is a decision model, read from the header alone.
-pub fn is_decision_model(path: &str) -> bool { ojas_models::decision::decision_type(path).is_some() }
+pub fn is_decision_model(path: &str) -> bool { ojas_decision::decision_type(path).is_some() }
 
 /// An error reply: the status and the message.
 type Refusal = (&'static str, String);
@@ -151,7 +203,7 @@ fn refusal(e: anyhow::Error) -> Refusal {
 }
 
 /// A request body, parsed for `model`.
-fn parse_body(model: &DecisionModel, body: &[u8]) -> Result<Request, Refusal> {
+fn parse_body<G: DecisionGpu>(model: &DecisionModel<G>, body: &[u8]) -> Result<Request, Refusal> {
     let body = std::str::from_utf8(body).ok().and_then(|text| Json::parse(text).ok())
         .ok_or(("400 Bad Request", "the request body is not valid JSON".to_string()))?;
     model.request(&body).map_err(refusal)
@@ -209,24 +261,26 @@ impl Metrics {
 /// answered wait, and are then answered together: an encoder model runs all of
 /// their questions in shared GPU passes.
 pub fn serve(path: &str, opts: &RunOpts) -> Result<()> {
-    let gpu = ojas_metal::MetalGpu::new().context("serving a decision model needs a Metal GPU")?;
     let t = std::time::Instant::now();
-    let model = DecisionModel::load(&gpu, path)?;
+    with_decision_model!(path, opts.device, |model| serve_model(&model, opts, t.elapsed().as_secs_f64()))
+}
+
+fn serve_model<G: DecisionGpu>(model: &DecisionModel<G>, opts: &RunOpts, load_s: f64) -> Result<()> {
     let addr = format!("{}:{}", opts.host, opts.port);
     let listener = std::net::TcpListener::bind(&addr).with_context(|| format!("binding {addr}"))?;
-    eprintln!("  {} | decision model | metal | loaded in {:.1}s", model.name(), t.elapsed().as_secs_f64());
+    eprintln!("  {} | decision model | {} | loaded in {load_s:.1}s", model.name(), G::NAME);
     eprintln!("  listening on http://{addr}  (up to {MAX_BATCH} requests answered together)");
     eprintln!("  POST /v1/systemone  GET /health  GET /v1/models  GET /props  GET /metrics");
     let props = serde_json::json!({
         "model": model.name(), "decision_type": model.kind(), "max_options": model.max_options(),
-        "images": model.takes_images(), "max_images": ojas_models::decision::MAX_IMAGES, "max_batch": MAX_BATCH,
+        "images": model.takes_images(), "max_images": ojas_decision::MAX_IMAGES, "max_batch": MAX_BATCH,
     });
     let mut metrics = Metrics::default();
     serve_http_batches(&listener, MAX_BATCH, |batch| {
         let mut pending: Vec<(std::net::TcpStream, Request)> = Vec::new();
         for (mut stream, req, route) in batch {
             match (req.method.as_str(), route.as_str()) {
-                ("POST", "/v1/systemone" | "/v1/decide" | "/decide") => match parse_body(&model, &req.body) {
+                ("POST", "/v1/systemone" | "/v1/decide" | "/decide") => match parse_body(model, &req.body) {
                     Ok(r) => pending.push((stream, r)),
                     Err(refused) => {
                         metrics.errors += 1;
@@ -263,13 +317,15 @@ pub fn serve(path: &str, opts: &RunOpts) -> Result<()> {
 /// and the questions each default to `decision::BENCH_REQUEST`'s when their flags
 /// are absent.
 pub fn bench(path: &str, opts: &RunOpts) -> Result<()> {
-    let builtin = Json::parse(ojas_models::decision::BENCH_REQUEST).context("the built-in bench request")?;
+    let builtin = Json::parse(ojas_decision::BENCH_REQUEST).context("the built-in bench request")?;
     let field = |k: &str| builtin.get(k).map(|v| v.to_python(false)).unwrap_or_default();
     let state = read_or(&opts.state, &opts.state_file, "state", &field("state"))?;
     let questions = read_or(&opts.questions, &opts.questions_file, "questions", &field("questions"))?;
-    let gpu = ojas_metal::MetalGpu::new().context("`bench` on a decision model needs a Metal GPU")?;
-    let model = DecisionModel::load(&gpu, path)?;
-    let req = request(&model, &state, &questions, &opts.images)?;
+    with_decision_model!(path, opts.device, |model| bench_model(&model, opts, &state, &questions))
+}
+
+fn bench_model<G: DecisionGpu>(model: &DecisionModel<G>, opts: &RunOpts, state: &str, questions: &str) -> Result<()> {
+    let req = request(model, state, questions, &opts.images)?;
     eprintln!("  warmup...");
     for _ in 0..3 { model.decide(&req)?; }
     let (mut wall, mut dev, mut tokens) = (Vec::new(), Vec::new(), 0usize);
@@ -284,9 +340,9 @@ pub fn bench(path: &str, opts: &RunOpts) -> Result<()> {
     }
     let stats = |mut v: Vec<f64>| { v.sort_by(f64::total_cmp); (v[v.len() / 2], v[0]) };
     let ((w50, wmin), (g50, gmin)) = (stats(wall), stats(dev));
-    println!("\n{} | metal | {} questions, {tokens} tokens | {} reps\n  wall median {w50:.2} ms  best {wmin:.2} ms  \
+    println!("\n{} | {} | {} questions, {tokens} tokens | {} reps\n  wall median {w50:.2} ms  best {wmin:.2} ms  \
               ({:.1} decisions/s)\n  gpu  median {g50:.2} ms  best {gmin:.2} ms",
-        model.name(), req.questions.len(), opts.reps.max(1), 1e3 / w50);
+        model.name(), G::NAME, req.questions.len(), opts.reps.max(1), 1e3 / w50);
     Ok(())
 }
 

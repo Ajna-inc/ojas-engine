@@ -8,8 +8,8 @@
 //!   score is the scaled dot product of the last token's query with its marker's
 //!   key.
 //!
-//! Both read the final hidden states ([`DecoderGpu::prefill_hidden`]), so only the
-//! label rows of the output projection are ever multiplied, on the host.
+//! Both read the final hidden states ([`CausalBackend::prefill_hidden_slots`]), so
+//! only the label rows of the output projection are ever multiplied, on the host.
 //!
 //! A question may be asked in more than one option order ([`Causal::variants`]),
 //! each its own prompt. The prefix every prompt of a request shares, the state as a
@@ -26,11 +26,10 @@ use super::json::Json;
 use super::media::Image;
 use super::template::{OptionView, PromptInput, Template};
 use super::{invalid, read_f32, Question, QuestionKind, Scored};
-use crate::decoder::{DecoderGpu, PromptRows, SlotPrefill, MAX_SLOTS, PRECISION_AUTO};
+use crate::backend::{CausalBackend, CausalLoad, DecisionGpu, PromptRows, SlotPrefill, MAX_SLOTS};
 use anyhow::{bail, ensure, Context, Result};
 use ojas_cpu::VitPreproc;
 use ojas_formats::gguf::{Gguf, Meta};
-use ojas_metal::MetalGpu;
 use ojas_tokenize::Bpe;
 
 /// How options are labelled in the prompt.
@@ -174,8 +173,8 @@ const MAX_PROMPT_TOKENS: usize = 8192;
 /// Most options when the readout has no label set to bound them.
 const MAX_POINTER_OPTIONS: usize = 255;
 
-pub(super) struct CausalHead<'a> {
-    dec: DecoderGpu<'a>,
+pub(super) struct CausalHead<C> {
+    dec: C,
     tok: Bpe,
     template: Template,
     spec: Causal,
@@ -186,20 +185,19 @@ pub(super) struct CausalHead<'a> {
     pointer: Option<Pointer>,
     vision: Option<Vision>,
     max_seq: usize,
-    /// The prefix the last request shared, still in the cache: its ids and the
-    /// recurrent state after it. Its KV rows stay valid, since a request writes only
-    /// the rows after the prefix it continues from.
+    /// The prefix the last request shared, still in the cache: its ids; the recurrent
+    /// state after it is the backend's saved state. Its KV rows stay valid, since a
+    /// request writes only the rows after the prefix it continues from.
     held: std::cell::RefCell<Option<HeldPrefix>>,
 }
 
 /// A prompt prefix left in the cache by an earlier request.
 struct HeldPrefix {
     ids: Vec<u32>,
-    state: Vec<u8>,
 }
 
-impl<'a> CausalHead<'a> {
-    pub(super) fn load(gpu: &'a MetalGpu, g: &mut Gguf, template: Template, spec: Causal) -> Result<Self> {
+impl<C: CausalBackend> CausalHead<C> {
+    pub(super) fn load<'a, G: DecisionGpu<Causal<'a> = C> + 'a>(gpu: &'a G, g: &mut Gguf, template: Template, spec: Causal) -> Result<Self> {
         let tok = Bpe::from_gguf(g);
         let single = |text: &str| -> Option<u32> {
             match tok.encode(text).as_slice() { [one] => Some(*one as u32), _ => None }
@@ -238,15 +236,15 @@ impl<'a> CausalHead<'a> {
         let label_rows = g.read_rows(head, &labels.iter().map(|&t| t as usize).collect::<Vec<_>>())?;
 
         let max_seq = g.meta_u32(&format!("{}.context_length", g.arch())).map_or(MAX_PROMPT_TOKENS, |c| (c as usize).min(MAX_PROMPT_TOKENS));
-        // A projector beside the file is loaded only for a model that takes images.
-        g.sidecars = spec.images;
         // One slot per prompt run at once: a request's prompts continue their shared
         // prefix a slot each, and one-prompt requests share passes a slot each. The
-        // host's `parallel` sets the count; unset, every slot the arena allows.
-        let mut cfg = ojas_core::config::EngineConfig::current();
-        cfg.parallel = Some(cfg.parallel.unwrap_or(MAX_SLOTS));
-        let dec = DecoderGpu::load_with(gpu, g, max_seq, PRECISION_AUTO, None, None, cfg)?;
-        ensure!(dec.is_recurrent(), "decision readouts of a causal model need a recurrent model");
+        // host's `parallel` (else `OJAS_SLOTS`) sets the count; unset, every slot the
+        // backend allows. A projector beside the file is loaded only for a model that
+        // takes images.
+        let slots = ojas_core::config::EngineConfig::current().parallel
+            .or_else(|| std::env::var("OJAS_SLOTS").ok()?.parse().ok()).unwrap_or(MAX_SLOTS).max(1);
+        let dec = gpu.load_causal(g, CausalLoad { max_seq, slots, images: spec.images })?;
+        ensure!(dec.slots() >= 1, "a causal decision model needs at least one sequence slot");
         let vision = match dec.vision_patch_merge() {
             Some((patch, merge)) if spec.images => {
                 let floats = |k: &str| match g.meta.get(k) {
@@ -289,7 +287,7 @@ impl<'a> CausalHead<'a> {
             let (w, h, planar) = v.preproc.preprocess(&img.rgb, img.width, img.height)?;
             let (columns, grid_rows) = self.dec.vision_grid(w, h).context("the model has no vision tower")?;
             let rows = self.dec.encode_image(&planar, w, h)?;
-            ensure!(rows.len() == columns * grid_rows * self.dec.d, "the vision tower returned {} values for a {columns}x{grid_rows} grid", rows.len());
+            ensure!(rows.len() == columns * grid_rows * self.dec.width(), "the vision tower returned {} values for a {columns}x{grid_rows} grid", rows.len());
             ensure!(rows.iter().all(|v| v.is_finite()), "the vision tower produced non-finite values");
             Ok(EncodedImage { rows, columns, grid_rows })
         }).collect()
@@ -357,12 +355,12 @@ impl<'a> CausalHead<'a> {
     /// The prefix every prompt shares, up to the first row any prompt reads, is
     /// evaluated once, in slot 0. The prompts then continue from it a slot each,
     /// as many at a time as there are slots, in shared passes: slot 0 restores the
-    /// prefix's recurrent state, and every other slot starts from a copy of the
-    /// prefix's state and KV rows. The prefix is held for the next request, which
-    /// continues from it when its own prompts begin with it; slot 0's prefix rows stay
-    /// in place, since a prompt writes only the rows after them. A prompt holding an
-    /// image is never continued from: its image rows carry the same placeholder id
-    /// whatever the image.
+    /// prefix's recurrent state (the backend's saved state), and every other slot
+    /// starts from a copy of the prefix's state and KV rows. The prefix is held for
+    /// the next request, which continues from it when its own prompts begin with it;
+    /// slot 0's prefix rows stay in place, since a prompt writes only the rows after
+    /// them. A prompt holding an image is never continued from: its image rows carry
+    /// the same placeholder id whatever the image.
     fn read(&self, prompts: &[Prompt], images: &[EncodedImage]) -> (Vec<Vec<f32>>, usize) {
         let first_read = prompts.iter().map(|p| p.reads[0]).min().unwrap_or(0);
         let shared = prompts[1..].iter().map(|p| ojas_tokenize::shared_prefix(&prompts[0].ids, &p.ids))
@@ -374,7 +372,7 @@ impl<'a> CausalHead<'a> {
         let mut held = self.held.borrow_mut();
         let resumed = match held.take() {
             Some(h) if reusable && h.ids.len() <= shared && prompts[0].ids.starts_with(&h.ids) => {
-                self.dec.set_state_bytes(&h.state);
+                self.dec.restore_state();
                 h.ids.len()
             }
             _ => {
@@ -385,18 +383,19 @@ impl<'a> CausalHead<'a> {
         if shared > resumed {
             let runs = embedded(&prompts[0]);
             let rows = PromptRows { ids: &prompts[0].ids, embedded: &runs, positions: prompts[0].positions.as_deref() };
-            self.dec.prefill_hidden(&rows, resumed..shared, &[]);
+            self.dec.prefill_hidden_slots(&[SlotPrefill { prompt: &rows, span: resumed..shared, slot: 0, read: &[] }]);
         }
-        let snapshot = self.dec.state_bytes();
+        self.dec.save_state();
         if reusable && shared > 0 {
-            *held = Some(HeldPrefix { ids: prompts[0].ids[..shared].to_vec(), state: snapshot.clone() });
+            *held = Some(HeldPrefix { ids: prompts[0].ids[..shared].to_vec() });
         }
         let reused = resumed + shared * (prompts.len() - 1);
         // The prompts continue from the prefix a slot each, as many at once as there
-        // are slots: slot 0 holds the prefix, and every other slot starts from a copy.
+        // are slots: slot 0 holds the prefix (the first group finds it there), and
+        // every other slot starts from a copy.
         let mut hidden: Vec<Vec<Vec<f32>>> = Vec::with_capacity(prompts.len());
-        for group in prompts.chunks(self.dec.slots()) {
-            self.dec.set_state_bytes(&snapshot);
+        for (gi, group) in prompts.chunks(self.dec.slots()).enumerate() {
+            if gi > 0 { self.dec.restore_state(); }
             for slot in 1..group.len() { self.dec.copy_slot_prefix(0, slot, shared); }
             let runs: Vec<Vec<(usize, &[f32])>> = group.iter().map(embedded).collect();
             let rows: Vec<PromptRows> = group.iter().zip(&runs)

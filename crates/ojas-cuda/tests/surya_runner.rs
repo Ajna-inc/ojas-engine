@@ -248,11 +248,13 @@ fn ssm_kernels_match_oracle() {
             let ob = up(&g, &vec![0f32; m * DINNER]);
             let nab = (m * HV) as u32;
             g.dispatch(&enc, "ssm_ab", &[(&alb, 0), (&beb, 0), (&dtb, 0), (&ab, 0)], &[nab, HV as u32], [blocks(m * HV, 256), 1, 1], [256, 1, 1]).unwrap();
-            g.dispatch(&enc, "conv1d_prefill", &[(&qb, 0), (&conv_fused, 0), (&cwb, 0)], &[CONV_CH as u32, KTAPS as u32, m as u32],
+            // one segment: rows 0..m of slot 0
+            let seg = g.upload_bytes(&[0u32, m as u32, 0, 0].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+            g.dispatch(&enc, "conv1d_prefill", &[(&qb, 0), (&conv_fused, 0), (&cwb, 0), (&seg, 0)], &[CONV_CH as u32, KTAPS as u32, 0],
                        [blocks(CONV_CH, 128), 1, 1], [128, 1, 1]).unwrap();
             if variant == "fused" {
-                g.dispatch(&enc, "deltanet_fused", &[(&st_fused, 0), (&qb, 0), (&alb, 0), (&beb, 0), (&ob, 0)],
-                           &[S as u32, HK as u32, HV as u32, CONV_CH as u32, m as u32, EPS.to_bits()], [(S / 4) as u32, HV as u32, 1], [128, 1, 1]).unwrap();
+                g.dispatch(&enc, "deltanet_fused", &[(&st_fused, 0), (&qb, 0), (&alb, 0), (&beb, 0), (&ob, 0), (&seg, 0)],
+                           &[S as u32, HK as u32, HV as u32, CONV_CH as u32, 0, EPS.to_bits()], [(S / 16) as u32, HV as u32, 1], [128, 1, 1]).unwrap();
             } else {
                 let qk = up(&g, &vec![0f32; m * HK]);
                 let warps = m * HK;

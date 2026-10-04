@@ -350,7 +350,6 @@ fn stop_ids(bpe: &Bpe, info: &ModelInfo) -> (Option<u32>, Option<u32>) {
 }
 
 pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
-    #[cfg(target_os = "macos")]
     if crate::decide::is_decision_model(model) {
         return crate::decide::serve(model, opts);
     }

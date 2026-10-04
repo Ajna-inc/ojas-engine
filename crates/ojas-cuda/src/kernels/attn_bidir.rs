@@ -24,6 +24,13 @@
 //! grid = [mtok*n_head, 1, 1], block = [256, 1, 1]. Every query streams the head's whole K and
 //! V, ~824 GB per layer at 16k patches: the oracle and the fallback, not the production path.
 //!
+//! `attention_m_mma_span_{64,128}` — the same kernel over packed sequences with per-row key
+//! spans (the text encoder): a `tiles` entry per block names its query rows and the key range
+//! covering them, and every score is masked to its row's span, which is how sequence bounds
+//! and a sliding window both clip inside a tile. [`mma_span_tiles`] builds the tiles. Q goes
+//! in as an f16 pair (value and rounding residual, two MMAs), since the encoder's
+//! probabilities move by 1e-2 with Q rounded to f16 alone.
+//!
 //! `attention_m_mma_bidir_{64,128}` — FlashAttention-2 on `mma.sync.m16n8k16` (f16 in, f32
 //! accumulate). Each warp owns 16 query rows; Q (f32, rounded to f16 on load as Metal's
 //! staged-Q tile does) lives in registers as A fragments, S = QKᵀ and O stay in registers,
@@ -100,9 +107,16 @@ __device__ __forceinline__ void bidir_cp16(unsigned dst, const void* src, bool v
 }
 
 // HD: head dim (compile-time). BKV: keys per K/V tile. NW: warps per block (16 rows each).
-template <int HD, int BKV, int NW>
+// SPAN: packed sequences with per-row key spans (attention_m_mma_span_<hd>): the block takes
+// its query tile from `tiles` (q0, nq, klo, khi), walks keys [klo, khi) and masks every score
+// to its row's own [span[row].x, span[row].y).
+// QX2: Q enters as an f16 pair (hi + lo, the residual of the rounding) and S = Q K^T is two
+// MMAs per k-chunk, so the scores carry Q to f32 precision at the cost of the QK^T half of
+// the MMA work; the text encoder's probabilities need it (Julia-1 moves 1e-2 without).
+template <int HD, int BKV, int NW, bool SPAN, bool QX2>
 __device__ __forceinline__ void mma_bidir_core(const float* __restrict__ q,
     const __half* __restrict__ kc, const __half* __restrict__ vc, float* __restrict__ out,
+    const uint4* __restrict__ tiles, const uint2* __restrict__ span,
     unsigned kvdim, unsigned total, unsigned group, float scale, unsigned n_head,
     unsigned mtok) {
     constexpr int ST = HD + 8;            // padded smem row stride (halves): 16 B aligned,
@@ -119,8 +133,17 @@ __device__ __forceinline__ void mma_bidir_core(const float* __restrict__ q,
     const int g = lane >> 2, c = lane & 3;          // mma fragment row group / column pair
     const unsigned head = blockIdx.y, kvh = head / group;
     const unsigned R = n_head * HD;
-    const unsigned qrow0 = blockIdx.x * (NW * 16) + warp * 16;
+    unsigned q0 = blockIdx.x * (NW * 16), nq = mtok, klo = 0u, khi = total;
+    if (SPAN) { uint4 td = tiles[blockIdx.x]; q0 = td.x; nq = td.y; klo = td.z; khi = td.w; }
+    const unsigned qend = SPAN ? q0 + nq : mtok;          // rows at or past it are padding
+    const unsigned qrow0 = q0 + warp * 16;
     const float sl2 = scale * 1.4426950408889634f;  // softmax in the exp2 domain
+    // this lane's two rows' key spans (padding rows take the tile's last row's)
+    uint2 sp0 = make_uint2(0u, total), sp1 = make_uint2(0u, total);
+    if (SPAN) {
+        sp0 = span[min(qrow0 + g, qend - 1u)];
+        sp1 = span[min(qrow0 + g + 8, qend - 1u)];
+    }
 
     const __half* kbase = kc + kvh * HD;
     const __half* vbase = vc + kvh * HD;
@@ -129,7 +152,7 @@ __device__ __forceinline__ void mma_bidir_core(const float* __restrict__ q,
         for (int i = tid; i < CH; i += NT) {
             int r = i / (HD / 8), cc = (i % (HD / 8)) * 8;
             unsigned t = t0 + r;
-            bool ok = t < total;
+            bool ok = t < khi;
             unsigned long long off = (unsigned long long)(ok ? t : 0u) * kvdim + cc;
             bidir_cp16((unsigned)__cvta_generic_to_shared(&sK[buf][r * ST + cc]), kbase + off, ok);
             bidir_cp16((unsigned)__cvta_generic_to_shared(&sV[buf][r * ST + cc]), vbase + off, ok);
@@ -137,26 +160,35 @@ __device__ __forceinline__ void mma_bidir_core(const float* __restrict__ q,
         asm volatile("cp.async.commit_group;\n" ::);
     };
 
-    const unsigned ntile = (total + BKV - 1) / BKV;
-    load_tile(0, 0u);
+    const unsigned ntile = (khi - klo + BKV - 1) / BKV;
+    load_tile(0, klo);
 
-    // Q -> f16 A fragments, straight from global (rows past mtok are zero).
+    // Q -> f16 A fragments, straight from global (rows past mtok are zero); with QX2 also
+    // the f16 residual of that rounding.
     unsigned qa[KC][4];
+    unsigned ql[QX2 ? KC : 1][4];
     {
         const unsigned r0 = qrow0 + g, r1 = qrow0 + g + 8;
-        const float* q0 = q + (unsigned long long)r0 * R + head * HD;
-        const float* q1 = q + (unsigned long long)r1 * R + head * HD;
+        const float* qp0 = q + (unsigned long long)r0 * R + head * HD;
+        const float* qp1 = q + (unsigned long long)r1 * R + head * HD;
         #pragma unroll
         for (int kk = 0; kk < KC; kk++) {
             int col = kk * 16 + c * 2;
-            float2 x00 = r0 < mtok ? *reinterpret_cast<const float2*>(q0 + col) : make_float2(0.f, 0.f);
-            float2 x10 = r1 < mtok ? *reinterpret_cast<const float2*>(q1 + col) : make_float2(0.f, 0.f);
-            float2 x01 = r0 < mtok ? *reinterpret_cast<const float2*>(q0 + col + 8) : make_float2(0.f, 0.f);
-            float2 x11 = r1 < mtok ? *reinterpret_cast<const float2*>(q1 + col + 8) : make_float2(0.f, 0.f);
+            float2 x00 = r0 < qend ? *reinterpret_cast<const float2*>(qp0 + col) : make_float2(0.f, 0.f);
+            float2 x10 = r1 < qend ? *reinterpret_cast<const float2*>(qp1 + col) : make_float2(0.f, 0.f);
+            float2 x01 = r0 < qend ? *reinterpret_cast<const float2*>(qp0 + col + 8) : make_float2(0.f, 0.f);
+            float2 x11 = r1 < qend ? *reinterpret_cast<const float2*>(qp1 + col + 8) : make_float2(0.f, 0.f);
             qa[kk][0] = bidir_pack_h2(x00.x, x00.y);
             qa[kk][1] = bidir_pack_h2(x10.x, x10.y);
             qa[kk][2] = bidir_pack_h2(x01.x, x01.y);
             qa[kk][3] = bidir_pack_h2(x11.x, x11.y);
+            if (QX2) {
+                auto lo = [](float v) { return v - __half2float(__float2half_rn(v)); };
+                ql[kk][0] = bidir_pack_h2(lo(x00.x), lo(x00.y));
+                ql[kk][1] = bidir_pack_h2(lo(x10.x), lo(x10.y));
+                ql[kk][2] = bidir_pack_h2(lo(x01.x), lo(x01.y));
+                ql[kk][3] = bidir_pack_h2(lo(x11.x), lo(x11.y));
+            }
         }
     }
 
@@ -169,7 +201,7 @@ __device__ __forceinline__ void mma_bidir_core(const float* __restrict__ q,
     for (unsigned j = 0; j < ntile; j++) {
         const int buf = j & 1;
         if (j + 1 < ntile) {
-            load_tile(buf ^ 1, (j + 1) * BKV);
+            load_tile(buf ^ 1, klo + (j + 1) * BKV);
             asm volatile("cp.async.wait_group 1;\n" ::);
         } else {
             asm volatile("cp.async.wait_group 0;\n" ::);
@@ -199,19 +231,32 @@ __device__ __forceinline__ void mma_bidir_core(const float* __restrict__ q,
                 asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                     : "+f"(s[n + 1][0]), "+f"(s[n + 1][1]), "+f"(s[n + 1][2]), "+f"(s[n + 1][3])
                     : "r"(qa[kk][0]), "r"(qa[kk][1]), "r"(qa[kk][2]), "r"(qa[kk][3]), "r"(b2), "r"(b3));
+                if (QX2) {
+                    const int kq = QX2 ? kk : 0;
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(s[n][0]), "+f"(s[n][1]), "+f"(s[n][2]), "+f"(s[n][3])
+                        : "r"(ql[kq][0]), "r"(ql[kq][1]), "r"(ql[kq][2]), "r"(ql[kq][3]), "r"(b0), "r"(b1));
+                    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                        : "+f"(s[n + 1][0]), "+f"(s[n + 1][1]), "+f"(s[n + 1][2]), "+f"(s[n + 1][3])
+                        : "r"(ql[kq][0]), "r"(ql[kq][1]), "r"(ql[kq][2]), "r"(ql[kq][3]), "r"(b2), "r"(b3));
+                }
             }
         }
 
-        // online softmax (exp2 domain). Only the last tile can hold keys >= total.
-        const unsigned t0 = j * BKV;
-        const bool tail = t0 + BKV > total;
+        // online softmax (exp2 domain). Only the last tile can hold keys >= khi; with
+        // spans every key is also held to its row's range.
+        const unsigned t0 = klo + j * BKV;
+        const bool tail = t0 + BKV > khi;
         float mx0 = -1e30f, mx1 = -1e30f;
         #pragma unroll
         for (int n = 0; n < NS; n++) {
             #pragma unroll
             for (int e = 0; e < 4; e++) {
                 float v = s[n][e] * sl2;
-                if (tail && t0 + n * 8 + c * 2 + (e & 1) >= total) v = -__int_as_float(0x7f800000);
+                const unsigned t = t0 + n * 8 + c * 2 + (e & 1);
+                bool masked = tail && t >= khi;
+                if (SPAN) { const uint2 sp = (e < 2) ? sp0 : sp1; masked |= (t < sp.x) | (t >= sp.y); }
+                if (masked) v = -__int_as_float(0x7f800000);
                 s[n][e] = v;
             }
             mx0 = fmaxf(mx0, fmaxf(s[n][0], s[n][1]));
@@ -276,8 +321,8 @@ __device__ __forceinline__ void mma_bidir_core(const float* __restrict__ q,
     float* o1 = out + (unsigned long long)r1 * R + head * HD + c * 2;
     #pragma unroll
     for (int n = 0; n < NO; n++) {
-        if (r0 < mtok) *reinterpret_cast<float2*>(o0 + n * 8) = make_float2(o[n][0] * i0, o[n][1] * i0);
-        if (r1 < mtok) *reinterpret_cast<float2*>(o1 + n * 8) = make_float2(o[n][2] * i1, o[n][3] * i1);
+        if (r0 < qend) *reinterpret_cast<float2*>(o0 + n * 8) = make_float2(o[n][0] * i0, o[n][1] * i0);
+        if (r1 < qend) *reinterpret_cast<float2*>(o1 + n * 8) = make_float2(o[n][2] * i1, o[n][3] * i1);
     }
 }
 
@@ -286,7 +331,19 @@ extern "C" __global__ void __launch_bounds__(128) attention_m_mma_bidir_64(const
     const __half* kc, const __half* vc, float* out, unsigned hd, unsigned kvdim,
     unsigned total, unsigned group, float scale, unsigned n_head, unsigned mtok) {
     (void)hd;
-    mma_bidir_core<64, 64, 4>(q, kc, vc, out, kvdim, total, group, scale, n_head, mtok);
+    mma_bidir_core<64, 64, 4, false, false>(q, kc, vc, out, nullptr, nullptr, kvdim, total, group, scale, n_head, mtok);
+}
+
+// Packed sequences with per-row key spans, hd 64: one block per `tiles` entry (q0, nq,
+// klo, khi) and head; grid [n_tiles, n_head]. `span` is (lo, hi) per query row. K and V
+// must hold finite values 64 rows past the last token (the tail of a tile is loaded in
+// whole 8-row chunks and masked). Metal: attention_m_mma_span_<hd>.
+extern "C" __global__ void __launch_bounds__(128) attention_m_mma_span_64(const float* q,
+    const __half* kc, const __half* vc, float* out, const uint4* tiles, const uint2* span,
+    unsigned hd, unsigned kvdim, unsigned total, unsigned group, float scale, unsigned n_head,
+    unsigned mtok) {
+    (void)hd;
+    mma_bidir_core<64, 64, 4, true, true>(q, kc, vc, out, tiles, span, kvdim, total, group, scale, n_head, mtok);
 }
 
 // hd 128: 32-key tiles, 4 warps (64 query rows / block), 34.8 KB static shared.
@@ -294,7 +351,15 @@ extern "C" __global__ void __launch_bounds__(128) attention_m_mma_bidir_128(cons
     const __half* kc, const __half* vc, float* out, unsigned hd, unsigned kvdim,
     unsigned total, unsigned group, float scale, unsigned n_head, unsigned mtok) {
     (void)hd;
-    mma_bidir_core<128, 32, 4>(q, kc, vc, out, kvdim, total, group, scale, n_head, mtok);
+    mma_bidir_core<128, 32, 4, false, false>(q, kc, vc, out, nullptr, nullptr, kvdim, total, group, scale, n_head, mtok);
+}
+
+extern "C" __global__ void __launch_bounds__(128) attention_m_mma_span_128(const float* q,
+    const __half* kc, const __half* vc, float* out, const uint4* tiles, const uint2* span,
+    unsigned hd, unsigned kvdim, unsigned total, unsigned group, float scale, unsigned n_head,
+    unsigned mtok) {
+    (void)hd;
+    mma_bidir_core<128, 32, 4, true, true>(q, kc, vc, out, tiles, span, kvdim, total, group, scale, n_head, mtok);
 }
 "#;
 
@@ -303,7 +368,29 @@ pub const NAMES: &[&str] = &[
     "attention_m_bidir",
     "attention_m_mma_bidir_64",
     "attention_m_mma_bidir_128",
+    "attention_m_mma_span_64",
+    "attention_m_mma_span_128",
 ];
+
+/// Query rows per tile of `attention_m_mma_span_<hd>` (one block).
+pub const MMA_SPAN_BQ: usize = 64;
+
+/// The `(q0, nq, klo, khi)` tiles of `attention_m_mma_span_<hd>` over packed sequences of
+/// the given lengths, whose rows have the key spans `span` (`(lo, hi)` per row, as the
+/// kernel reads them): one tile per [`MMA_SPAN_BQ`] rows of each sequence, its key range
+/// the union of its rows' spans.
+pub fn mma_span_tiles(lens: &[usize], span: &[u32]) -> Vec<u32> {
+    let mut t = Vec::new();
+    let mut start = 0usize;
+    for &len in lens {
+        for q0 in (start..start + len).step_by(MMA_SPAN_BQ) {
+            let nq = MMA_SPAN_BQ.min(start + len - q0);
+            t.extend_from_slice(&[q0 as u32, nq as u32, span[2 * q0], span[2 * (q0 + nq - 1) + 1]]);
+        }
+        start += len;
+    }
+    t
+}
 
 /// Head dims with an `attention_m_mma_bidir_<hd>` entry (Metal: `ATTN_BIDIR_HD`).
 pub const MMA_BIDIR_HD: &[u32] = &[64, 128];
