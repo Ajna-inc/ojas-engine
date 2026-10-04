@@ -31,7 +31,10 @@ fn metal() -> Option<Metal> {
 
 /// Run `f` on both backends with the same inputs (all differentiable); return
 /// (cpu, metal) x (loss, grads).
-fn both<F>(inputs: &[(Vec<f32>, Vec<usize>)], f: F) -> Option<((f32, Vec<Vec<f32>>), (f32, Vec<Vec<f32>>))>
+/// A loss and the gradient of every input, from one backend.
+type LossGrads = (f32, Vec<Vec<f32>>);
+
+fn both<F>(inputs: &[(Vec<f32>, Vec<usize>)], f: F) -> Option<(LossGrads, LossGrads)>
 where
     F: Fn(&mut dyn TapeOps, &[Var]) -> Var,
 {
@@ -154,6 +157,32 @@ fn gemm_every_layout() {
 }
 
 #[test]
+fn gemm_primitive_every_variant() {
+    // The `gemm` primitive itself over what the tape never asks for (ta with tb, alpha and
+    // beta, element offsets) and the shapes that pick the device's other paths: rows that
+    // are 16-byte aligned or not, and few output tiles over a long K (split K).
+    use ojas_learn::backend::Gemm;
+    fn on<B: Backend>(be: &B, a: &[f32], b: &[f32], c: &[f32], g: &Gemm) -> Vec<f32> {
+        let (a, b, c) = (be.upload(a), be.upload(b), be.upload(c));
+        be.gemm(&a, &b, &c, g);
+        be.download(&c)
+    }
+    let Some(gpu) = metal() else { return };
+    let shapes = [(44, 96, 1024, 1), (13, 70, 300, 1), (64, 64, 64, 1), (130, 90, 70, 3), (8, 12, 2000, 2)];
+    for (m, n, k, batch) in shapes {
+        for (ta, tb) in [(false, false), (false, true), (true, false), (true, true)] {
+            for (alpha, beta, off) in [(1.0, 0.0, 0), (0.5, 1.0, 0), (2.0, -0.5, 3)] {
+                let g = Gemm { batch, sa: m * k, sb: k * n, sc: m * n, alpha, beta, oa: off, ob: 2 * off, oc: off, ..Gemm::plain(m, n, k, ta, tb) };
+                let (a, b, c) = (vals(off + batch * m * k, 30), vals(2 * off + batch * k * n, 31), vals(off + batch * m * n, 32));
+                let (want, got) = (on(&Cpu, &a, &b, &c, &g), on(&gpu, &a, &b, &c, &g));
+                let worst = want.iter().zip(&got).map(|(x, y)| (x - y).abs() / x.abs().max(1.0)).fold(0.0f32, f32::max);
+                assert!(worst < 1e-4, "gemm {m}x{n}x{k} b{batch} ta {ta} tb {tb} alpha {alpha} beta {beta} off {off}: worst rel {worst:.2e}");
+            }
+        }
+    }
+}
+
+#[test]
 fn softmax_layernorm_wide_rows() {
     let Some((c, g)) = both(&[(vals(5 * 700, 11), vec![5, 700])], |t, v| {
         let y = t.softmax(v[0]);
@@ -177,6 +206,13 @@ fn data_movement() {
         t.weighted_sum(y)
     }) else { return };
     close("permute/slice/concat", &c, &g, 1e-5);
+    // attention's head split: the innermost axis stays contiguous, so whole float4 runs move
+    let Some((c, g)) = both(&[(vals(6 * 4 * 24, 17), vec![6, 4, 24])], |t, v| {
+        let h = t.slice(v[0], 1, 1, 3);
+        let y = t.permute(h, &[1, 0, 2]);
+        t.weighted_sum(y)
+    }) else { return };
+    close("head split", &c, &g, 1e-5);
 }
 
 fn weighted_sum<B: Backend>(t: &mut Tape<'_, B>, y: Var) -> Var {

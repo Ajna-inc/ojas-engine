@@ -1,5 +1,6 @@
 //! ojas-formats — backend-free model IO: GGUF, safetensors, quantization, IQ codebooks.
 pub mod gguf;
+pub mod gguf_write;
 pub mod safetensors;
 pub mod mxfp4;
 pub mod quant;

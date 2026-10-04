@@ -15,10 +15,10 @@
 //! block = threads per threadgroup — CUDA's blockIdx/blockDim, not a global
 //! thread id, so every kernel keeps CUDA's blockIdx-style indexing exactly.
 //!
-//! GEMM is the CPU-parity naive tile only, with no simdgroup_matrix tensor-core path,
-//! mirroring the CUDA side's history: kernels first (`f498470`/`fa648fd`), tensor cores
-//! as a separate pass (`937063d`). `reduce_to` is one general kernel with no row-split
-//! fast path, favouring simplicity over CUDA's two-kernel split.
+//! `learn_gemm` here is the portable scalar tile. The simdgroup-matrix GEMM lives in its own
+//! family, [`MMA_BODY`] (`cnn_train_mma`), since only Apple family 7+ GPUs can compile it.
+//! `reduce_to` has CUDA's row-split fast path for reductions over leading axes, with the
+//! general kernel for everything else.
 
 pub const BODY: &str = r#"
 #include <metal_stdlib>
@@ -104,7 +104,8 @@ kernel void learn_axpby(device const float* x [[buffer(0)]], device float* y [[b
                          constant float& a [[buffer(3)]], constant float& b [[buffer(4)]],
                          uint3 gid [[threadgroup_position_in_grid]], uint3 tid [[thread_position_in_threadgroup]], uint3 bs [[threads_per_threadgroup]]) {
     uint i = gid.x * bs.x + tid.x;
-    if (i < n) y[i] = a * x[i] + b * y[i];
+    // `b == 0` never reads `y`: the output may be fresh memory holding non-finite bits.
+    if (i < n) y[i] = b == 0.0f ? a * x[i] : a * x[i] + b * y[i];
 }
 
 kernel void learn_unary(device const float* x [[buffer(0)]], device float* y [[buffer(1)]], constant uint& n [[buffer(2)]], constant uint& op [[buffer(3)]],
@@ -188,6 +189,32 @@ kernel void learn_reduce_to(device const float* t [[buffer(0)]], device float* g
     learn_store(g, o, acc, accum);
 }
 
+// Fast paths of learn_reduce_to when the reduced axes all precede the kept ones, t
+// viewed as [R, C]: partial[s][c] = Sum over rows [s*chunk, (s+1)*chunk).
+// grid [ceil(C/256), splits], block 256.
+kernel void learn_reduce_rows_partial(device const float* t [[buffer(0)]], device float* part [[buffer(1)]],
+                                        constant uint& R [[buffer(2)]], constant uint& C [[buffer(3)]], constant uint& chunk [[buffer(4)]],
+                                        uint3 gid [[threadgroup_position_in_grid]], uint3 tid [[thread_position_in_threadgroup]], uint3 bs [[threads_per_threadgroup]]) {
+    uint c = gid.x * bs.x + tid.x;
+    if (c >= C) return;
+    uint r0 = gid.y * chunk, r1 = min(R, r0 + chunk);
+    float acc = 0.0f;
+    for (uint r = r0; r < r1; r++) acc += t[(long)r * C + c];
+    part[(long)gid.y * C + c] = acc;
+}
+
+// g[c] (+)= Sum_s part[s][c], splits in order (deterministic). Also the whole
+// reduction when R is short (part = t, splits = R) and a plain accumulate (splits = 1).
+kernel void learn_reduce_rows_final(device const float* part [[buffer(0)]], device float* g [[buffer(1)]],
+                                      constant uint& C [[buffer(2)]], constant uint& splits [[buffer(3)]], constant uint& accum [[buffer(4)]],
+                                      uint3 gid [[threadgroup_position_in_grid]], uint3 tid [[thread_position_in_threadgroup]], uint3 bs [[threads_per_threadgroup]]) {
+    uint c = gid.x * bs.x + tid.x;
+    if (c >= C) return;
+    float acc = 0.0f;
+    for (uint s = 0; s < splits; s++) acc += part[(long)s * C + c];
+    learn_store(g, c, acc, accum);
+}
+
 // y[yoff + Sum c*ys] (+)= x[xoff + Sum c*xs] over the index space `dims`
 // (rank <= 6, right-aligned). Permute, slice, concat and their backwards.
 kernel void learn_copy_strided(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
@@ -206,14 +233,47 @@ kernel void learn_copy_strided(device const float* x [[buffer(0)]], device float
     uint xs[6] = {xs0, xs1, xs2, xs3, xs4, xs5};
     uint ys[6] = {ys0, ys1, ys2, ys3, ys4, ys5};
     long ox = xoff, oy = yoff; uint rem = i;
-    for (int d = 5; d >= 0; d--) { uint c = rem % dims[d]; rem /= dims[d]; ox += (long)c * xs[d]; oy += (long)c * ys[d]; }
+    // the host folds unit and mergeable axes away; skipping them saves a division each
+    for (int d = 5; d >= 0; d--) {
+        if (dims[d] == 1) continue;
+        uint c = rem % dims[d]; rem /= dims[d]; ox += (long)c * xs[d]; oy += (long)c * ys[d];
+    }
     learn_store(y, oy, x[ox], accum);
+}
+
+// learn_copy_strided four elements at a time: the innermost axis has unit stride on both
+// sides and is counted in float4s (its stride given as 4), and every offset and stride is
+// a multiple of 4, so each float4 is 16-byte aligned.
+kernel void learn_copy_strided4(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
+                                 constant uint& n [[buffer(2)]], constant uint& accum [[buffer(3)]],
+                                 constant uint& d0 [[buffer(4)]], constant uint& d1 [[buffer(5)]], constant uint& d2 [[buffer(6)]],
+                                 constant uint& d3 [[buffer(7)]], constant uint& d4 [[buffer(8)]], constant uint& d5 [[buffer(9)]],
+                                 constant uint& xs0 [[buffer(10)]], constant uint& xs1 [[buffer(11)]], constant uint& xs2 [[buffer(12)]],
+                                 constant uint& xs3 [[buffer(13)]], constant uint& xs4 [[buffer(14)]], constant uint& xs5 [[buffer(15)]],
+                                 constant uint& ys0 [[buffer(16)]], constant uint& ys1 [[buffer(17)]], constant uint& ys2 [[buffer(18)]],
+                                 constant uint& ys3 [[buffer(19)]], constant uint& ys4 [[buffer(20)]], constant uint& ys5 [[buffer(21)]],
+                                 constant uint& xoff [[buffer(22)]], constant uint& yoff [[buffer(23)]],
+                                 uint3 gid [[threadgroup_position_in_grid]], uint3 tid [[thread_position_in_threadgroup]], uint3 bs [[threads_per_threadgroup]]) {
+    uint i = gid.x * bs.x + tid.x;
+    if (i >= n) return;
+    uint dims[6] = {d0, d1, d2, d3, d4, d5};
+    uint xs[6] = {xs0, xs1, xs2, xs3, xs4, xs5};
+    uint ys[6] = {ys0, ys1, ys2, ys3, ys4, ys5};
+    long ox = xoff, oy = yoff; uint rem = i;
+    // the host folds unit and mergeable axes away; skipping them saves a division each
+    for (int d = 5; d >= 0; d--) {
+        if (dims[d] == 1) continue;
+        uint c = rem % dims[d]; rem /= dims[d]; ox += (long)c * xs[d]; oy += (long)c * ys[d];
+    }
+    float4 v = *(device const float4*)(x + ox);
+    device float4* o = (device float4*)(y + oy);
+    if (accum) *o += v; else *o = v;
 }
 
 // Batched row-major GEMM: C = alpha*op(A)*op(B) + beta*C, op(A) MxK, op(B) KxN.
 // ta: A stored KxM; tb: B stored NxK. Batch z: A += z*sa, B += z*sb, C += z*sc.
-// 64x64 tile, k step 16, 256 threads x 4x4 outputs -- the CPU-parity oracle,
-// not the fast path; simdgroup_matrix tensor cores are a follow-up.
+// 64x64 tile, k step 16, 256 threads x 4x4 outputs: the path for GPUs without
+// simdgroup matrices (`learn_gemm_mma_*` in MMA_BODY is the fast one).
 kernel void learn_gemm(device const float* A [[buffer(0)]], device const float* B [[buffer(1)]], device float* C [[buffer(2)]],
                         constant uint& M [[buffer(3)]], constant uint& N [[buffer(4)]], constant uint& K [[buffer(5)]],
                         constant uint& ta [[buffer(6)]], constant uint& tb [[buffer(7)]],
@@ -822,7 +882,8 @@ kernel void learn_gather_rows_bwd(device const float* dy [[buffer(0)]], device c
 
 pub const NAMES: &[&str] = &[
     "learn_fill", "learn_axpby", "learn_unary", "learn_unary_bwd",
-    "learn_binary", "learn_binary_grad", "learn_reduce_to", "learn_copy_strided",
+    "learn_binary", "learn_binary_grad", "learn_reduce_to", "learn_reduce_rows_partial", "learn_reduce_rows_final",
+    "learn_copy_strided", "learn_copy_strided4",
     "learn_gemm", "learn_softmax", "learn_softmax_bwd",
     "learn_layernorm", "learn_layernorm_bwd", "learn_layernorm_wgrad",
     "learn_sum", "learn_sumsq", "learn_scale", "learn_bcast_scalar", "learn_adamw",
@@ -833,3 +894,225 @@ pub const NAMES: &[&str] = &[
     "learn_grid_sample", "learn_grid_sample_bwd",
     "learn_gather_rows", "learn_gather_rows_bwd",
 ];
+
+/// The fast GEMM path (`cnn_train_mma` family): `learn_gemm`'s contract on the simdgroup matrix
+/// units. A family of its own because only Apple family 7+ GPUs have those units, and a device
+/// without them must still compile `cnn_train`; `ojas-learn` registers and compiles this one only
+/// where it can run, falling back to `learn_gemm` elsewhere.
+pub const MMA_BODY: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+// f32 in, f32 accumulate, so results stay within rounding of the reference. A 64x64
+// output tile per threadgroup of 4 simdgroups, each owning a 32x32 quarter as 4x4 8x8
+// accumulators; K advances 16 at a time through threadgroup memory (a short slab wastes
+// less on the K of a few dozen tokens that weight gradients reduce over).
+//
+// Each operand is staged in its stored orientation so global reads stay contiguous, and
+// a transposed operand is read back transposed by `simdgroup_load`. Loads and stores are
+// float4 where the host says the rows and base are 16-byte aligned (`vec` bit 0 for A,
+// 1 for B, 2 for C). The next K slab is loaded into registers while the current one is
+// multiplied.
+//
+// Split-K: with `splits` > 1 the grid's z axis is batch x splits, each threadgroup sums
+// one K range and stores its raw partial tile to `P` ([batch][splits][M][N]), and
+// `learn_gemm_mma_reduce` applies alpha and beta. This keeps the GPU full when M and N
+// are small but K is long (a weight-streaming product over a few dozen tokens).
+//
+// Every loop below must be unrolled: an array of simdgroup matrices indexed by a loop
+// variable that is not unrolled is spilled to memory, at several times the cost.
+constant uint LG_BM = 64, LG_BN = 64, LG_BK = 16, LG_PAD = 4;
+// the output tile, which reuses the two staged operands' space once the K loop is done
+constant uint LG_SH = LG_BM * LG_BN;
+
+// One stored tile of `rows` x `cols` (cols a multiple of 4) at (r0, c0) of a row-major
+// matrix with `ld` columns and `nr` x `nc` valid extent, as float4 quads spread over the
+// 128 threads; zero outside.
+template <uint rows, uint cols>
+static inline void lg_fetch(device const float* X, uint ld, uint nr, uint nc, uint r0, uint c0, bool vec,
+                            ushort tidx, thread float4* q) {
+    static_assert(rows * cols % 512 == 0, "whole quads per thread");
+    _Pragma("clang loop unroll(full)")
+    for (uint i = 0; i < rows * cols / 512; i++) {
+        uint e = tidx + i * 128;
+        uint r = r0 + e / (cols / 4), c = c0 + (e % (cols / 4)) * 4;
+        device const float* src = X + (long)r * ld + c;
+        if (vec && r < nr && c + 3 < nc) {
+            q[i] = *(device const float4*)src;
+        } else {
+            float4 v = 0.0f;
+            if (r < nr) {
+                if (c < nc) v.x = src[0];
+                if (c + 1 < nc) v.y = src[1];
+                if (c + 2 < nc) v.z = src[2];
+                if (c + 3 < nc) v.w = src[3];
+            }
+            q[i] = v;
+        }
+    }
+}
+
+template <uint rows, uint cols, uint ld>
+static inline void lg_stage(threadgroup float* S, ushort tidx, thread const float4* q) {
+    _Pragma("clang loop unroll(full)")
+    for (uint i = 0; i < rows * cols / 512; i++) {
+        uint e = tidx + i * 128;
+        uint r = e / (cols / 4), c = (e % (cols / 4)) * 4;
+        *(threadgroup float4*)(S + r * ld + c) = q[i];
+    }
+}
+
+template <bool TA, bool TB>
+static inline void learn_gemm_mma(device const float* A, device const float* B, device float* C, device float* P,
+                                  uint M, uint N, uint K, uint sa, uint sb, uint sc, float alpha, float beta,
+                                  uint splits, uint kchunk, uint vec,
+                                  uint3 gridp, ushort tidx, ushort sg, threadgroup float* sh) {
+    // stored tile shapes: A is BMxBK (row-major) or BKxBM (TA); B is BKxBN or BNxBK (TB)
+    constexpr uint a_rows = TA ? LG_BK : LG_BM, a_cols = TA ? LG_BM : LG_BK;
+    constexpr uint b_rows = TB ? LG_BN : LG_BK, b_cols = TB ? LG_BK : LG_BN;
+    constexpr uint lda = a_cols + LG_PAD, ldb = b_cols + LG_PAD;
+    threadgroup float* As = sh;
+    threadgroup float* Bs = sh + a_rows * lda;
+    uint z = gridp.z / splits, split = gridp.z % splits;
+    device const float* Az = A + (long)z * sa;
+    device const float* Bz = B + (long)z * sb;
+    uint row0 = gridp.y * LG_BM, col0 = gridp.x * LG_BN;
+    uint kbeg = split * kchunk, kend = min(K, kbeg + kchunk);
+    // stored extents and leading dimensions of A and B
+    uint a_ld = TA ? M : K, a_nr = TA ? kend : M, a_nc = TA ? M : kend;
+    uint b_ld = TB ? K : N, b_nr = TB ? N : kend, b_nc = TB ? kend : N;
+    bool va = vec & 1, vb = vec & 2;
+    uint sm = (sg >> 1) * 32, sn = (sg & 1) * 32;
+    simdgroup_float8x8 acc[16];
+    _Pragma("clang loop unroll(full)")
+    for (uint i = 0; i < 16; i++) acc[i] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    float4 qa[LG_BM * LG_BK / 512], qb[LG_BN * LG_BK / 512];
+    if (kbeg < kend) {
+        lg_fetch<a_rows, a_cols>(Az, a_ld, a_nr, a_nc, TA ? kbeg : row0, TA ? row0 : kbeg, va, tidx, qa);
+        lg_fetch<b_rows, b_cols>(Bz, b_ld, b_nr, b_nc, TB ? col0 : kbeg, TB ? kbeg : col0, vb, tidx, qb);
+    }
+    for (uint k0 = kbeg; k0 < kend; k0 += LG_BK) {
+        lg_stage<a_rows, a_cols, lda>(As, tidx, qa);
+        lg_stage<b_rows, b_cols, ldb>(Bs, tidx, qb);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint k1 = k0 + LG_BK;
+        if (k1 < kend) {
+            lg_fetch<a_rows, a_cols>(Az, a_ld, a_nr, a_nc, TA ? k1 : row0, TA ? row0 : k1, va, tidx, qa);
+            lg_fetch<b_rows, b_cols>(Bz, b_ld, b_nr, b_nc, TB ? col0 : k1, TB ? k1 : col0, vb, tidx, qb);
+        }
+        _Pragma("clang loop unroll(full)")
+        for (uint kk = 0; kk < LG_BK; kk += 8) {
+            simdgroup_float8x8 ma[4], mb[4];
+            _Pragma("clang loop unroll(full)")
+            for (uint i = 0; i < 4; i++) {
+                if (TA) simdgroup_load(ma[i], As + kk * lda + sm + i * 8, lda, ulong2(0, 0), true);
+                else    simdgroup_load(ma[i], As + (sm + i * 8) * lda + kk, lda, ulong2(0, 0), false);
+            }
+            _Pragma("clang loop unroll(full)")
+            for (uint j = 0; j < 4; j++) {
+                if (TB) simdgroup_load(mb[j], Bs + (sn + j * 8) * ldb + kk, ldb, ulong2(0, 0), true);
+                else    simdgroup_load(mb[j], Bs + kk * ldb + sn + j * 8, ldb, ulong2(0, 0), false);
+            }
+            _Pragma("clang loop unroll(full)")
+            for (uint i = 0; i < 4; i++) {
+                _Pragma("clang loop unroll(full)")
+                for (uint j = 0; j < 4; j++)
+                    simdgroup_multiply_accumulate(acc[i * 4 + j], ma[i], mb[j], acc[i * 4 + j]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // Stage the tile through threadgroup memory so edges, alpha and beta are handled
+    // per element with coalesced stores.
+    _Pragma("clang loop unroll(full)")
+    for (uint i = 0; i < 4; i++) {
+        _Pragma("clang loop unroll(full)")
+        for (uint j = 0; j < 4; j++)
+            simdgroup_store(acc[i * 4 + j], sh + (sm + i * 8) * LG_BN + sn + j * 8, LG_BN);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Four consecutive columns per thread; float4 when C's rows are 16-byte aligned (the
+    // split partials share C's row length, so then theirs are too).
+    bool vc = vec & 4;
+    device float* Cz = splits > 1 ? P + (long)gridp.z * M * N : C + (long)z * sc;
+    float al = splits > 1 ? 1.0f : alpha, be = splits > 1 ? 0.0f : beta;
+    for (uint e = tidx; e < LG_BM * LG_BN / 4; e += 128) {
+        uint lr = e / (LG_BN / 4), lc = (e % (LG_BN / 4)) * 4;
+        uint r = row0 + lr, c = col0 + lc;
+        if (r >= M) continue;
+        float4 v = al * *(threadgroup float4*)(sh + lr * LG_BN + lc);
+        device float* o = Cz + (long)r * N + c;
+        if (vc && c + 3 < N) {
+            if (be != 0.0f) v += be * *(device float4*)o;
+            *(device float4*)o = v;
+        } else {
+            for (uint j = 0; j < 4 && c + j < N; j++) o[j] = be == 0.0f ? v[j] : v[j] + be * o[j];
+        }
+    }
+}
+
+kernel void learn_gemm_mma_nn(device const float* A [[buffer(0)]], device const float* B [[buffer(1)]], device float* C [[buffer(2)]],
+                               device float* P [[buffer(3)]],
+                               constant uint& M [[buffer(4)]], constant uint& N [[buffer(5)]], constant uint& K [[buffer(6)]],
+                               constant uint& sa [[buffer(7)]], constant uint& sb [[buffer(8)]], constant uint& sc [[buffer(9)]],
+                               constant float& alpha [[buffer(10)]], constant float& beta [[buffer(11)]],
+                               constant uint& splits [[buffer(12)]], constant uint& kchunk [[buffer(13)]], constant uint& vec [[buffer(14)]],
+                               uint3 gridp [[threadgroup_position_in_grid]], ushort tidx [[thread_index_in_threadgroup]],
+                               ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sh[LG_SH];
+    learn_gemm_mma<false, false>(A, B, C, P, M, N, K, sa, sb, sc, alpha, beta, splits, kchunk, vec, gridp, tidx, sg, sh);
+}
+
+kernel void learn_gemm_mma_nt(device const float* A [[buffer(0)]], device const float* B [[buffer(1)]], device float* C [[buffer(2)]],
+                               device float* P [[buffer(3)]],
+                               constant uint& M [[buffer(4)]], constant uint& N [[buffer(5)]], constant uint& K [[buffer(6)]],
+                               constant uint& sa [[buffer(7)]], constant uint& sb [[buffer(8)]], constant uint& sc [[buffer(9)]],
+                               constant float& alpha [[buffer(10)]], constant float& beta [[buffer(11)]],
+                               constant uint& splits [[buffer(12)]], constant uint& kchunk [[buffer(13)]], constant uint& vec [[buffer(14)]],
+                               uint3 gridp [[threadgroup_position_in_grid]], ushort tidx [[thread_index_in_threadgroup]],
+                               ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sh[LG_SH];
+    learn_gemm_mma<false, true>(A, B, C, P, M, N, K, sa, sb, sc, alpha, beta, splits, kchunk, vec, gridp, tidx, sg, sh);
+}
+
+kernel void learn_gemm_mma_tn(device const float* A [[buffer(0)]], device const float* B [[buffer(1)]], device float* C [[buffer(2)]],
+                               device float* P [[buffer(3)]],
+                               constant uint& M [[buffer(4)]], constant uint& N [[buffer(5)]], constant uint& K [[buffer(6)]],
+                               constant uint& sa [[buffer(7)]], constant uint& sb [[buffer(8)]], constant uint& sc [[buffer(9)]],
+                               constant float& alpha [[buffer(10)]], constant float& beta [[buffer(11)]],
+                               constant uint& splits [[buffer(12)]], constant uint& kchunk [[buffer(13)]], constant uint& vec [[buffer(14)]],
+                               uint3 gridp [[threadgroup_position_in_grid]], ushort tidx [[thread_index_in_threadgroup]],
+                               ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sh[LG_SH];
+    learn_gemm_mma<true, false>(A, B, C, P, M, N, K, sa, sb, sc, alpha, beta, splits, kchunk, vec, gridp, tidx, sg, sh);
+}
+
+kernel void learn_gemm_mma_tt(device const float* A [[buffer(0)]], device const float* B [[buffer(1)]], device float* C [[buffer(2)]],
+                               device float* P [[buffer(3)]],
+                               constant uint& M [[buffer(4)]], constant uint& N [[buffer(5)]], constant uint& K [[buffer(6)]],
+                               constant uint& sa [[buffer(7)]], constant uint& sb [[buffer(8)]], constant uint& sc [[buffer(9)]],
+                               constant float& alpha [[buffer(10)]], constant float& beta [[buffer(11)]],
+                               constant uint& splits [[buffer(12)]], constant uint& kchunk [[buffer(13)]], constant uint& vec [[buffer(14)]],
+                               uint3 gridp [[threadgroup_position_in_grid]], ushort tidx [[thread_index_in_threadgroup]],
+                               ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sh[LG_SH];
+    learn_gemm_mma<true, true>(A, B, C, P, M, N, K, sa, sb, sc, alpha, beta, splits, kchunk, vec, gridp, tidx, sg, sh);
+}
+
+// C = alpha * Sum_s P[z][s] + beta * C over the split-K partials, in split order.
+kernel void learn_gemm_mma_reduce(device const float* P [[buffer(0)]], device float* C [[buffer(1)]],
+                                  constant uint& M [[buffer(2)]], constant uint& N [[buffer(3)]], constant uint& batch [[buffer(4)]],
+                                  constant uint& sc [[buffer(5)]], constant uint& splits [[buffer(6)]],
+                                  constant float& alpha [[buffer(7)]], constant float& beta [[buffer(8)]],
+                                  uint3 gid [[threadgroup_position_in_grid]], uint3 tid [[thread_position_in_threadgroup]], uint3 bs [[threads_per_threadgroup]]) {
+    long i = (long)gid.x * bs.x + tid.x, mn = (long)M * N;
+    if (i >= mn * batch) return;
+    long z = i / mn, o = i % mn;
+    device const float* p = P + z * splits * mn + o;
+    float s = 0.0f;
+    for (uint k = 0; k < splits; k++) s += p[k * mn];
+    device float* c = C + z * sc + o;
+    float v = alpha * s;
+    *c = beta == 0.0f ? v : v + beta * *c;
+}
+"#;

@@ -619,9 +619,12 @@ name = "ojas-learn"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "half",
  "image",
+ "ojas-arch",
  "ojas-core",
  "ojas-cuda",
+ "ojas-decision",
  "ojas-formats",
  "ojas-metal",
  "serde_json",

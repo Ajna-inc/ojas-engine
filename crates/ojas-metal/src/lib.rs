@@ -29,3 +29,7 @@ pub mod kernels;
 mod device;
 #[cfg(any(target_os = "macos", feature = "device"))]
 pub use device::*;
+/// The `metal` crate this device is built on, for callers that hold its command buffers
+/// (`MetalEnc`) and need the types without depending on the crate themselves.
+#[cfg(any(target_os = "macos", feature = "device"))]
+pub use metal;

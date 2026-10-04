@@ -11,6 +11,11 @@ repository.workspace = true
 anyhow = "1"
 ojas-core = { path = "../ojas-core" }
 ojas-formats = { path = "../ojas-formats" }
+# The text encoder's shape, and the decision server's prompts and calibration, which a
+# trained decision model is served and checked through.
+ojas-arch = { path = "../ojas-arch" }
+ojas-decision = { path = "../ojas-decision" }
+half = "2"
 image = { workspace = true }
 serde_json = "1"
 sha2 = "0.10"
@@ -102,3 +107,10 @@ required-features = ["cuda"]
 [[example]]
 name = "static_fp"
 required-features = ["cuda"]
+
+[[example]]
+name = "marker_step"
+required-features = ["metal"]
+
+[[example]]
+name = "decision_rl"

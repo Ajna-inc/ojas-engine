@@ -269,4 +269,8 @@ pub trait Backend {
 
     #[allow(clippy::too_many_arguments)]
     fn adamw(&self, p: &Self::Buf, g: &Self::Buf, m: &Self::Buf, v: &Self::Buf, lr: f32, b1: f32, b2: f32, eps: f32, wd: f32, step: u32);
+
+    /// Give back memory a finished workload no longer needs (cached buffers, queued
+    /// work); a backend with nothing to give back does nothing.
+    fn trim(&self) {}
 }

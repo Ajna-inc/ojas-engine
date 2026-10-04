@@ -124,9 +124,12 @@ impl<M: MarkerBackend> MarkerHead<M> {
         Ok((ids, markers))
     }
 
-    fn sequences(&self, state: &Json, questions: &[Question]) -> Result<Sequences> {
+    pub(super) fn sequences(&self, state: &Json, questions: &[Question]) -> Result<Sequences> {
         Ok(questions.iter().map(|q| self.sequence(state, q)).collect::<Result<Vec<_>>>()?.into_iter().unzip())
     }
+
+    /// The loaded encoder.
+    pub(super) fn backend(&self) -> &M { &self.dec }
 
     /// Each request's option scores, in one option order. The questions of every
     /// request run together, in GPU passes of at most [`PASS_TOKENS`] tokens; a

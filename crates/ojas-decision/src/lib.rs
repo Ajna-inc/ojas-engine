@@ -411,6 +411,18 @@ enum Engine<M, C> {
     Causal(causal::CausalHead<C>),
 }
 
+/// One question's prompt for an encoder model, as its head reads it: the tokens, the
+/// question type (its row of the type embedding), the positions of the option
+/// markers in the request's option order, and the calibration temperature its
+/// option scores are divided by.
+#[derive(Clone, Debug)]
+pub struct MarkerPrompt {
+    pub ids: Vec<u32>,
+    pub qtype: u32,
+    pub markers: Vec<usize>,
+    pub temperature: f32,
+}
+
 /// A loaded decision model, on the backend `G` loaded it with.
 pub struct DecisionModel<'a, G: DecisionGpu + 'a> {
     name: String,
@@ -548,6 +560,25 @@ impl<'a, G: DecisionGpu + 'a> DecisionModel<'a, G> {
             descriptions: options.into_iter().map(|o| o.description).collect(),
             probabilities,
         }
+    }
+
+    /// The loaded encoder of an encoder model, for a host that trains it; `None` for a
+    /// causal model.
+    pub fn marker_backend(&self) -> Option<&G::Marker<'a>> {
+        match &self.engine {
+            Engine::Markers(m) => Some(m.backend()),
+            Engine::Causal(_) => None,
+        }
+    }
+
+    /// Each question's encoder prompt, exactly as [`Self::decide`] builds it.
+    pub fn marker_prompts(&self, req: &Request) -> Result<Vec<MarkerPrompt>> {
+        let Engine::Markers(m) = &self.engine else { bail!("{} is not an encoder model", self.name) };
+        let (seqs, markers) = m.sequences(&req.state, &req.questions)?;
+        Ok(req.questions.iter().zip(seqs).zip(markers).map(|((q, ids), markers)| MarkerPrompt {
+            ids, qtype: q.kind.index(), markers,
+            temperature: self.calibration.temperature(q.kind, q.options.len(), self.profile.buckets),
+        }).collect())
     }
 
     /// Per-category GPU time of the encoder over `req`'s prompts.

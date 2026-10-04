@@ -10,6 +10,7 @@ pub mod backend;
 pub mod check;
 pub mod cpu;
 pub mod data;
+pub mod decision_rl;
 pub mod eval;
 #[cfg(feature = "cuda")]
 pub mod cuda;

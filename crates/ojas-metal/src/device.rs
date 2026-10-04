@@ -361,6 +361,14 @@ pub fn wait_checked(
     Err(err)
 }
 
+/// GPU execution time of a completed command buffer in seconds (`GPUEndTime - GPUStartTime`),
+/// excluding the host's commit and wait. Zero for a buffer that has not run.
+pub fn gpu_seconds(cb: &metal::CommandBufferRef) -> f64 {
+    let start: f64 = unsafe { msg_send![cb, GPUStartTime] };
+    let end: f64 = unsafe { msg_send![cb, GPUEndTime] };
+    (end - start).max(0.0)
+}
+
 /// Compatibility boundary for call sites that cannot yet return a `Result`.
 ///
 /// The fault is latched either way, so the engine stops and the session is marked
