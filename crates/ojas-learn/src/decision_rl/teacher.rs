@@ -174,16 +174,27 @@ pub struct Cache {
 
 impl Cache {
     pub fn open(inner: Box<dyn Teacher>, path: &Path) -> Result<Self> {
+        // A line that does not parse is a judgement lost, not a file lost: it is
+        // skipped and counted, and the teacher is asked again when it comes up.
         let mut known = HashMap::new();
+        let mut unreadable = 0;
         if path.is_file() {
             for line in std::fs::read_to_string(path)?.lines().filter(|l| !l.trim().is_empty()) {
-                let row = Json::parse(line).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-                let key = row.get("key").and_then(Json::as_str).context("a cache row's key")?;
-                let judgement = row.get("judgement").and_then(Json::as_array).context("a cache row's judgement")?;
-                let j: Judgement = judgement.iter().map(|q| q.as_object().unwrap_or(&[]).iter()
-                    .map(|(k, v)| (k.clone(), v.as_f64().unwrap_or(0.0))).collect()).collect();
-                known.insert(key.to_string(), j);
+                let parsed = Json::parse(line).ok().and_then(|row| {
+                    let key = row.get("key").and_then(Json::as_str)?.to_string();
+                    let judgement = row.get("judgement").and_then(Json::as_array)?;
+                    let j: Judgement = judgement.iter().map(|q| q.as_object().unwrap_or(&[]).iter()
+                        .map(|(k, v)| (k.clone(), v.as_f64().unwrap_or(0.0))).collect()).collect();
+                    Some((key, j))
+                });
+                match parsed {
+                    Some((key, j)) => { known.insert(key, j); }
+                    None => unreadable += 1,
+                }
             }
+        }
+        if unreadable > 0 {
+            eprintln!("{}: {unreadable} unreadable lines skipped", path.display());
         }
         Ok(Cache { inner, path: path.to_path_buf(), known: Mutex::new(known) })
     }
