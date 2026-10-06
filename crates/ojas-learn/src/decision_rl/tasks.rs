@@ -19,6 +19,8 @@ pub struct Task {
     pub family: String,
     pub body: Json,
     pub gold: Vec<Option<String>>,
+    /// Passages a fact memory retrieved for the request, when it has any.
+    pub background: Option<Vec<String>>,
 }
 
 /// The families that know their answers.
@@ -74,7 +76,7 @@ fn request(state: Json, questions: Vec<(&str, Json)>) -> Json {
     obj(vec![("state", state), ("questions", Json::Object(questions.into_iter().map(|(k, v)| (k.to_string(), v)).collect()))])
 }
 
-fn task(family: &str, body: Json, gold: Vec<Option<String>>) -> Task { Task { family: family.to_string(), body, gold } }
+fn task(family: &str, body: Json, gold: Vec<Option<String>>) -> Task { Task { family: family.to_string(), body, gold, background: None } }
 
 fn truth(holds: bool) -> Option<String> { Some(if holds { "true" } else { "false" }.to_string()) }
 
@@ -225,8 +227,11 @@ fn set(o: &Json, key: &str, value: Json) -> Json {
 /// level index.
 pub struct FileSource {
     family: String,
-    bodies: Vec<(Json, Vec<Option<String>>)>,
+    bodies: Vec<Entry>,
 }
+
+/// One line of a request file: the request, its known answers, its retrieved passages.
+type Entry = (Json, Vec<Option<String>>, Option<Vec<String>>);
 
 impl FileSource {
     pub fn open(path: &Path) -> Result<Self> {
@@ -246,7 +251,8 @@ impl FileSource {
                 Json::Int(d) => Some(d.clone()),
                 _ => None,
             })).collect();
-            bodies.push((body, gold));
+            let background = entry_background(&row);
+            bodies.push((body, gold, background));
         }
         let family = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file").to_string();
         Ok(FileSource { family, bodies })
@@ -268,9 +274,26 @@ impl FileSource {
     pub fn is_empty(&self) -> bool { self.bodies.is_empty() }
 
     pub fn draw(&self, rng: &mut Rng) -> Task {
-        let (body, gold) = rng.pick(&self.bodies).clone();
-        Task { family: self.family.clone(), body, gold }
+        let (body, gold, background) = rng.pick(&self.bodies).clone();
+        Task { family: self.family.clone(), body, gold, background }
     }
+}
+
+/// A line's `background` passages, when it carries any.
+fn entry_background(row: &Json) -> Option<Vec<String>> {
+    let passages: Vec<String> = row.get("background")?.as_array()?.iter().filter_map(|p| p.as_str().map(str::to_string)).collect();
+    (!passages.is_empty()).then_some(passages)
+}
+
+/// `body` with its state wrapped beside the passages, as the fact memory hands them
+/// to the model: `{"background": [...], "input": <state>}`.
+pub fn with_background(body: &Json, passages: &[String]) -> Json {
+    let state = body.get("state").cloned().unwrap_or(Json::Null);
+    let wrapped = Json::Object(vec![
+        ("background".into(), Json::Array(passages.iter().map(|p| Json::Str(p.clone())).collect())),
+        ("input".into(), state),
+    ]);
+    set(body, "state", wrapped)
 }
 
 #[cfg(test)]

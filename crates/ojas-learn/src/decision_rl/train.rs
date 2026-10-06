@@ -70,6 +70,27 @@ pub struct Config {
     pub freeze: Vec<String>,
     /// Longest prompt trained on, in tokens; longer ones are left out.
     pub max_seq_tokens: usize,
+    /// Tensor-name prefixes trained until `stitch_after`; every other tensor is held.
+    /// Empty trains every tensor from the start.
+    pub train_only: Vec<String>,
+    /// The step after which every tensor trains, at `stitch_lr`.
+    pub stitch_after: usize,
+    pub stitch_lr: f32,
+    /// How strongly an item's surprise (the divergence of the model's distribution from
+    /// the reward's) scales its share of the update; 0 weighs every item alike.
+    pub surprise_gain: f32,
+    /// How strongly the model's uncertainty on an item (one less its top probability)
+    /// scales the item's share of the update; 0 weighs every item alike.
+    pub uncertainty_gain: f32,
+    /// Items kept for replay; 0 keeps none and never sleeps.
+    pub replay: usize,
+    /// Wake steps between sleeps, and the replay steps of one sleep.
+    pub sleep_every: usize,
+    pub sleep_steps: usize,
+    /// In sleep, the weight of the model's own distribution when it reads the request's
+    /// retrieved passages, in the target for the same request without them: the share of
+    /// a replayed item's target that moves memory into the weights.
+    pub consolidate: f64,
     /// Activation memory a pass may take, in GB; 0 is a third of the machine's.
     pub memory_gb: f64,
 }
@@ -102,14 +123,27 @@ pub struct EvalStats {
 }
 
 /// One question ready to train on: its prompt, its reward per option in the prompt's
-/// option order, its calibration temperature, and its anchor distribution once computed.
+/// option order (the target trained towards; `given` is the reward the task and teacher
+/// gave, before sleep mixes in the model's reading of retrieved passages), its
+/// calibration temperature, its anchor distribution once computed, the prompt of the
+/// same question with its retrieved passages, and its latest surprise.
+#[derive(Clone)]
 struct Item {
     family: String,
     seq: MarkerSeq,
     kind: QuestionKind,
     reward: Vec<f64>,
+    given: Vec<f64>,
     temperature: f32,
     anchor: Option<Vec<f64>>,
+    recall: Option<MarkerSeq>,
+    surprise: f64,
+    /// The prompt carries retrieved passages. The anchor, the model as loaded, was never
+    /// taught to read them, so it does not pull on such an item.
+    recalled: bool,
+    /// Times sleep has replayed the item; each halves its priority, so replay moves on
+    /// from what it cannot learn instead of returning to it.
+    replays: u32,
 }
 
 /// Rewards per option of `q` from the teacher's judgement and the right answer.
@@ -154,6 +188,11 @@ pub struct Trainer<'m, 'b, B: Backend> {
     grads: Vec<Option<B::Buf>>,
     /// The held-out requests, by their canonical text, which training never draws.
     held: HashSet<String>,
+    /// Items for replay in sleep, overwritten oldest first once full.
+    replay: Vec<Item>,
+    replay_next: usize,
+    /// Every tensor trains: the schedule is past `stitch_after`, or never restricted.
+    stitched: bool,
 }
 
 impl<'m, 'b, B: Backend> Trainer<'m, 'b, B> {
@@ -179,7 +218,8 @@ impl<'m, 'b, B: Backend> Trainer<'m, 'b, B> {
                   budget.pass as f64 / 1e9, budget.resident as f64 / 1e9, cfg.max_seq_tokens);
         let n = model.marker_backend().expect("checked above").model.params().len();
         Ok(Trainer { be, model, anchor, teacher, cfg, source: source.to_path_buf(), files, error, rng: Rng::new(cfg.seed), opt,
-                     budget, grads: (0..n).map(|_| None).collect(), held: HashSet::new() })
+                     budget, grads: (0..n).map(|_| None).collect(), held: HashSet::new(), replay: Vec::new(), replay_next: 0,
+                     stitched: cfg.train_only.is_empty() })
     }
 
     /// The passes `items` are run in under the budget, and the items left out of them.
@@ -263,13 +303,27 @@ impl<'m, 'b, B: Backend> Trainer<'m, 'b, B> {
             ensure!(judged.is_some() || task.gold.iter().all(Option::is_some),
                 "{}: a question has no known answer and no teacher to judge it", task.family);
             let prompts = self.model.marker_prompts(&req)?;
-            for (i, (q, p)) in req.questions.iter().zip(prompts).enumerate() {
+            // The same request with its retrieved passages, question for question: the
+            // model learns to read them, and sleep teaches the bare request what reading
+            // them gives.
+            let recalled: Vec<Option<MarkerSeq>> = match &task.background {
+                Some(passages) => {
+                    let aug = self.model.request(&tasks::with_background(body, passages))?;
+                    self.model.marker_prompts(&aug)?.into_iter()
+                        .map(|p| (p.ids.len() <= self.cfg.max_seq_tokens).then_some(MarkerSeq { ids: p.ids, qtype: p.qtype, markers: p.markers }))
+                        .collect()
+                }
+                None => vec![None; prompts.len()],
+            };
+            for (i, ((q, p), recall)) in req.questions.iter().zip(prompts).zip(recalled).enumerate() {
                 if p.ids.len() > self.cfg.max_seq_tokens { continue; }
                 let reward = rewards(q, judged.as_ref().map(|j| &j[i]), task.gold.get(i).and_then(|g| g.as_deref()), self.cfg)?;
-                items.push(Item {
-                    family: task.family.clone(), kind: q.kind, reward, temperature: p.temperature, anchor: None,
-                    seq: MarkerSeq { ids: p.ids, qtype: p.qtype, markers: p.markers },
-                });
+                let item = |seq: MarkerSeq, recall: Option<MarkerSeq>, recalled: bool| Item {
+                    family: task.family.clone(), kind: q.kind, reward: reward.clone(), given: reward.clone(),
+                    temperature: p.temperature, anchor: None, recall, surprise: 1.0, recalled, replays: 0, seq,
+                };
+                if let Some(r) = &recall { items.push(item(r.clone(), None, true)); }
+                items.push(item(MarkerSeq { ids: p.ids, qtype: p.qtype, markers: p.markers }, recall, false));
             }
         }
         Ok(items)
@@ -278,7 +332,7 @@ impl<'m, 'b, B: Backend> Trainer<'m, 'b, B> {
     /// The anchor model's calibrated distribution for each item, computed once.
     fn anchor_distributions(&self, items: &mut [Item]) -> Result<()> {
         let Some(anchor) = self.anchor else { return Ok(()) };
-        let pending: Vec<usize> = items.iter().enumerate().filter(|(_, it)| it.anchor.is_none()).map(|(i, _)| i).collect();
+        let pending: Vec<usize> = items.iter().enumerate().filter(|(_, it)| it.anchor.is_none() && !it.recalled).map(|(i, _)| i).collect();
         if pending.is_empty() { return Ok(()); }
         let lengths: Vec<usize> = pending.iter().map(|&i| items[i].seq.ids.len()).collect();
         let (passes, _) = memory::passes(&self.bert().spec, &lengths, self.budget.pass, false);
@@ -298,13 +352,37 @@ impl<'m, 'b, B: Backend> Trainer<'m, 'b, B> {
         Ok(())
     }
 
+    /// The model's calibrated distribution for each of `seqs`, without gradients, in
+    /// passes under the budget; `None` for a sequence the memory guard left out.
+    fn distributions(&self, seqs: &[(MarkerSeq, f32)]) -> Result<Vec<Option<Vec<f64>>>> {
+        let mut out = vec![None; seqs.len()];
+        let lengths: Vec<usize> = seqs.iter().map(|(s, _)| s.ids.len()).collect();
+        let (passes, _) = memory::passes(&self.bert().spec, &lengths, self.budget.pass, false);
+        for pass in passes {
+            if !self.may_start_pass("recall") { break; }
+            let batch: Vec<MarkerSeq> = seqs[pass.clone()].iter().map(|(s, _)| s.clone()).collect();
+            let mut t = Tape::new(self.be);
+            let scores = self.bert().scores(&mut t, &batch)?;
+            let values = t.value(scores);
+            let mut at = 0;
+            for i in pass {
+                let n = seqs[i].0.markers.len();
+                out[i] = Some(softmax(&values[at..at + n], seqs[i].1));
+                at += n;
+            }
+        }
+        Ok(out)
+    }
+
     /// The loss over `items` on one tape, scaled by `1 / divisor` rather than by their
-    /// count, and each question's probabilities.
-    fn loss(&self, t: &mut Tape<'_, B>, items: &[Item], divisor: usize) -> Result<(Var, Vec<Vec<f64>>)> {
+    /// count, each question's probabilities and its surprise. An item's share of the
+    /// loss grows with its surprise and the model's uncertainty on it, by the configured
+    /// gains, normalised to a mean of one over the pass.
+    fn loss(&self, t: &mut Tape<'_, B>, items: &[Item], divisor: usize) -> Result<(Var, Vec<Vec<f64>>, Vec<f64>)> {
         let seqs: Vec<MarkerSeq> = items.iter().map(|it| it.seq.clone()).collect();
         let scores = self.bert().scores(t, &seqs)?;
         let mut terms = Vec::with_capacity(items.len());
-        let mut probabilities = Vec::with_capacity(items.len());
+        let mut probabilities: Vec<Vec<f64>> = Vec::with_capacity(items.len());
         let mut at = 0;
         for it in items {
             let n = it.seq.markers.len();
@@ -337,9 +415,24 @@ impl<'m, 'b, B: Backend> Trainer<'m, 'b, B> {
             terms.push(term);
             at += n;
         }
+        let surprise: Vec<f64> = items.iter().zip(&probabilities)
+            .map(|(it, p)| it.reward.iter().zip(p.iter()).map(|(r, q): (&f64, &f64)| if *r > 0.0 { r * (r / q.max(1e-12)).ln() } else { 0.0 }).sum::<f64>().max(0.0))
+            .collect();
+        if self.cfg.surprise_gain > 0.0 || self.cfg.uncertainty_gain > 0.0 {
+            let uncertainty: Vec<f64> = probabilities.iter().map(|p| 1.0 - p.iter().copied().fold(0.0, f64::max)).collect();
+            let mean = |v: &[f64]| (v.iter().sum::<f64>() / v.len() as f64).max(1e-9);
+            let (ms, mu) = (mean(&surprise), mean(&uncertainty));
+            let raw: Vec<f64> = surprise.iter().zip(&uncertainty).map(|(s, u)| {
+                ((s / ms).max(1e-3).powf(self.cfg.surprise_gain as f64) * (u / mu).max(1e-3).powf(self.cfg.uncertainty_gain as f64)).clamp(0.25, 4.0)
+            }).collect();
+            let norm = mean(&raw);
+            for (term, w) in terms.iter_mut().zip(&raw) {
+                *term = t.scale(*term, (w / norm) as f32)?;
+            }
+        }
         let total = t.concat(&terms, 0)?;
         let loss = t.sum_scaled(total, 1.0 / divisor as f32);
-        Ok((loss, probabilities))
+        Ok((loss, probabilities, surprise))
     }
 
     /// Add the gradients on `t` to the step's sums.
@@ -347,6 +440,7 @@ impl<'m, 'b, B: Backend> Trainer<'m, 'b, B> {
         let bert = self.bert();
         for (i, p) in bert.params().iter().enumerate() {
             if self.cfg.freeze.iter().any(|f| p.name.starts_with(f.as_str())) { continue; }
+            if !self.stitched && !self.cfg.train_only.iter().any(|f| p.name.starts_with(f.as_str())) { continue; }
             let Some(g) = t.param_var(p).and_then(|v| t.grad(v)) else { continue };
             let acc = self.grads[i].get_or_insert_with(|| self.be.alloc(p.shape.iter().product()));
             self.be.axpby(g, acc, 1.0, 1.0);
@@ -384,8 +478,13 @@ impl<'m, 'b, B: Backend> Trainer<'m, 'b, B> {
         }
         for step in 1..=self.cfg.steps {
             let start = Instant::now();
+            if !self.stitched && step > self.cfg.stitch_after {
+                self.stitched = true;
+                eprintln!("step {step}: every tensor trains from here, at {}", self.cfg.stitch_lr);
+            }
             let progress = (step - 1) as f32 / self.cfg.steps.max(1) as f32;
-            self.opt.lr = self.cfg.lr_min + (self.cfg.lr - self.cfg.lr_min) * 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
+            let top = if self.stitched && !self.cfg.train_only.is_empty() { self.cfg.stitch_lr } else { self.cfg.lr };
+            self.opt.lr = self.cfg.lr_min + (top - self.cfg.lr_min).max(0.0) * 0.5 * (1.0 + (std::f32::consts::PI * progress).cos());
             let mut items = Vec::new();
             for _ in 0..self.cfg.batch {
                 let family = self.draw_family();
@@ -396,44 +495,15 @@ impl<'m, 'b, B: Backend> Trainer<'m, 'b, B> {
                 }
             }
             if items.is_empty() { eprintln!("step {step}: nothing to train on"); continue; }
-            self.anchor_distributions(&mut items)?;
-            let (passes, mut skipped) = self.passes(&items, true);
-            let trained: usize = passes.iter().map(|p| p.len()).sum();
-            let (mut loss, mut agreed, mut seen) = (0.0, 0, 0);
-            for pass in passes {
-                if !self.may_start_pass("the step") { skipped += trained - seen; break; }
-                let chunk = &items[pass];
-                let mut t = Tape::new(self.be);
-                let (l, probabilities) = self.loss(&mut t, chunk, trained)?;
-                let value = t.value(l)[0];
-                if !value.is_finite() {
-                    eprintln!("step {step}: a pass of {} questions gave a {value} loss and was left out", chunk.len());
-                    skipped += chunk.len();
-                    seen += chunk.len();
-                    continue;
-                }
-                t.backward(l)?;
-                self.accumulate(&t);
-                loss += value as f64;
-                for (it, p) in chunk.iter().zip(&probabilities) {
-                    let right = argmax(p) == argmax(&it.reward);
-                    agreed += right as usize;
-                    let e = self.error.entry(it.family.clone()).or_insert(1.0);
-                    *e = 0.9 * *e + 0.1 * (!right) as u8 as f64;
-                }
-                seen += chunk.len();
-            }
-            // The passes' losses were scaled for every trained question; what the skipped
-            // ones would have added is made up by scaling the sum back to a mean.
-            let used = trained - skipped;
-            self.apply(if used > 0 && used < trained { trained as f32 / used as f32 } else { 1.0 });
-            let loss = if used > 0 { loss * trained as f64 / used as f64 } else { loss };
-            let stats = StepStats { step, loss, agreement: if used > 0 { agreed as f64 / used as f64 } else { 0.0 },
-                                    questions: used, skipped, seconds: start.elapsed().as_secs_f64() };
+            let stats = self.train_items(&mut items, step, start)?;
             eprintln!("step {step}: loss {:.4} agreement {:.0}% ({} questions{}, {:.1} s, {:.1} GB resident)", stats.loss, stats.agreement * 100.0,
-                      stats.questions, if skipped > 0 { format!(", {skipped} skipped") } else { String::new() }, stats.seconds,
+                      stats.questions, if stats.skipped > 0 { format!(", {} skipped", stats.skipped) } else { String::new() }, stats.seconds,
                       memory::resident_bytes() as f64 / 1e9);
             report.steps.push(stats);
+            self.remember(items);
+            if self.cfg.replay > 0 && self.cfg.sleep_every > 0 && step % self.cfg.sleep_every == 0 {
+                self.sleep(step)?;
+            }
             if self.cfg.eval_every > 0 && step % self.cfg.eval_every == 0 {
                 report.evals.push(self.evaluate(step, &held_out)?);
             }
@@ -442,6 +512,100 @@ impl<'m, 'b, B: Backend> Trainer<'m, 'b, B> {
             }
         }
         Ok(report)
+    }
+
+    /// One optimiser step over `items`: their anchors, then passes under the budget with
+    /// the gradients summed, then the update. Each item's surprise is updated.
+    fn train_items(&mut self, items: &mut [Item], step: usize, start: Instant) -> Result<StepStats> {
+        self.anchor_distributions(items)?;
+        let (passes, mut skipped) = self.passes(items, true);
+        let trained: usize = passes.iter().map(|p| p.len()).sum();
+        let (mut loss, mut agreed, mut seen) = (0.0, 0, 0);
+        for pass in passes {
+            if !self.may_start_pass("the step") { skipped += trained - seen; break; }
+            let mut t = Tape::new(self.be);
+            let (l, probabilities, surprise) = self.loss(&mut t, &items[pass.clone()], trained)?;
+            let value = t.value(l)[0];
+            if !value.is_finite() {
+                eprintln!("step {step}: a pass of {} questions gave a {value} loss and was left out", pass.len());
+                skipped += pass.len();
+                seen += pass.len();
+                continue;
+            }
+            t.backward(l)?;
+            self.accumulate(&t);
+            loss += value as f64;
+            for ((it, p), s) in items[pass.clone()].iter_mut().zip(&probabilities).zip(surprise) {
+                let right = argmax(p) == argmax(&it.reward);
+                agreed += right as usize;
+                it.surprise = s;
+                let e = self.error.entry(it.family.clone()).or_insert(1.0);
+                *e = 0.9 * *e + 0.1 * (!right) as u8 as f64;
+            }
+            seen += pass.len();
+        }
+        // The passes' losses were scaled for every trained question; what the skipped
+        // ones would have added is made up by scaling the sum back to a mean.
+        let used = trained - skipped;
+        self.apply(if used > 0 && used < trained { trained as f32 / used as f32 } else { 1.0 });
+        let loss = if used > 0 { loss * trained as f64 / used as f64 } else { loss };
+        Ok(StepStats { step, loss, agreement: if used > 0 { agreed as f64 / used as f64 } else { 0.0 },
+                       questions: used, skipped, seconds: start.elapsed().as_secs_f64() })
+    }
+
+    /// Keep `items` for replay, overwriting the oldest once the buffer is full.
+    fn remember(&mut self, items: Vec<Item>) {
+        if self.cfg.replay == 0 { return; }
+        for it in items {
+            if self.replay.len() < self.cfg.replay {
+                self.replay.push(it);
+            } else {
+                self.replay[self.replay_next] = it;
+                self.replay_next = (self.replay_next + 1) % self.cfg.replay;
+            }
+        }
+    }
+
+    /// Replay: half of each sleep step's items are the remembered ones of highest
+    /// priority — surprise, halved for every time the item was replayed already — and
+    /// half are drawn at random, so what is new is learned among what is old. A replayed
+    /// item that has retrieved passages trains towards a mix of its reward and the
+    /// model's own distribution when it reads the passages, which carries what the
+    /// memory supplies into the weights.
+    fn sleep(&mut self, step: usize) -> Result<()> {
+        let per = (self.cfg.batch * 3).min(self.replay.len());
+        if per == 0 { return Ok(()); }
+        for round in 1..=self.cfg.sleep_steps {
+            let start = Instant::now();
+            let mut order: Vec<usize> = (0..self.replay.len()).collect();
+            let priority = |it: &Item| it.surprise * 0.5f64.powi(it.replays as i32);
+            order.sort_by(|&a, &b| priority(&self.replay[b]).total_cmp(&priority(&self.replay[a])));
+            let mut chosen: Vec<usize> = order[..per / 2].to_vec();
+            while chosen.len() < per {
+                let i = self.rng.below(self.replay.len());
+                if !chosen.contains(&i) { chosen.push(i); }
+            }
+            let mut batch: Vec<Item> = chosen.iter().map(|&i| self.replay[i].clone()).collect();
+            if self.cfg.consolidate > 0.0 {
+                let recalls: Vec<(usize, (MarkerSeq, f32))> = batch.iter().enumerate()
+                    .filter_map(|(i, it)| it.recall.clone().map(|r| (i, (r, it.temperature)))).collect();
+                let seqs: Vec<(MarkerSeq, f32)> = recalls.iter().map(|(_, s)| s.clone()).collect();
+                let c = self.cfg.consolidate;
+                for ((i, _), dist) in recalls.iter().zip(self.distributions(&seqs)?) {
+                    let Some(dist) = dist else { continue };
+                    let it = &mut batch[*i];
+                    it.reward = it.given.iter().zip(&dist).map(|(g, d)| (1.0 - c) * g + c * d).collect();
+                }
+            }
+            let stats = self.train_items(&mut batch, step, start)?;
+            for (&i, it) in chosen.iter().zip(&batch) {
+                self.replay[i].surprise = it.surprise;
+                self.replay[i].replays += 1;
+            }
+            eprintln!("sleep {step}.{round}: loss {:.4} agreement {:.0}% ({} replayed, {:.1} s)",
+                      stats.loss, stats.agreement * 100.0, stats.questions, stats.seconds);
+        }
+        Ok(())
     }
 
     /// Held-out items of every family, from a seed of their own, so the same ones
@@ -469,7 +633,7 @@ impl<'m, 'b, B: Backend> Trainer<'m, 'b, B> {
             if !self.may_start_pass("the evaluation") { break; }
             let chunk = &items[pass];
             let mut t = Tape::new(self.be);
-            let (_, probabilities) = self.loss(&mut t, chunk, chunk.len())?;
+            let (_, probabilities, _) = self.loss(&mut t, chunk, chunk.len())?;
             for (it, p) in chunk.iter().zip(probabilities) {
                 let e = per.entry(it.family.clone()).or_default();
                 e.0 += (argmax(&p) == argmax(&it.reward)) as u8 as f64;

@@ -19,7 +19,7 @@ fn main() -> Result<()> {
     let (model_path, request_path) = (args.get(1).context("model path")?, args.get(2).context("request path")?);
     let steps: usize = args.get(3).map_or(Ok(5), |s| s.parse())?;
     let be = Metal::new()?;
-    let gpu = LearnDecision(&be);
+    let gpu = LearnDecision::new(&be);
     let model = DecisionModel::load(&gpu, model_path)?;
     let body = Json::parse(&std::fs::read_to_string(request_path)?).map_err(|e| anyhow::anyhow!("{e}"))?;
     let req = model.request(&body)?;

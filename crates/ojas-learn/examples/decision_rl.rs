@@ -7,7 +7,14 @@
 //!     --teacher openjev=http://127.0.0.1:8080 [--teacher kev=http://10.0.0.5:8080:0.5] \
 //!     --out runs/laya-rl [--steps 500] [--batch 4] [--lr 1e-5] [--anchor 0.1] \
 //!     [--families compare,json_lookup] [--requests pool_dir_or.jsonl] [--judge-known] [--freeze token_embd] \
-//!     [--max-seq-tokens 1024] [--memory-gb 30] [--distill 1.0] [--lr-min 1e-6] [--judge-threads 4]
+//!     [--max-seq-tokens 1024] [--memory-gb 30] [--distill 1.0] [--lr-min 1e-6] [--judge-threads 4] \
+//!     [--grow 6 --stitch-after 1500 --stitch-lr 3e-6] [--surprise-gain 0.5] [--uncertainty-gain 0.5] \
+//!     [--replay 20000 --sleep-every 50 --sleep-steps 10 --consolidate 0.5]
+//!
+//! Requests whose lines carry `background` passages (`hippocampus.py augment --keep`)
+//! train both with and without them; sleep replays the most surprising items among
+//! random older ones and, with `--consolidate`, teaches the bare request what the model
+//! answers when it reads the passages.
 //! ```
 //!
 //! The teacher is swapped by naming another server; several servers with weights
@@ -46,7 +53,10 @@ fn main() -> Result<()> {
         teacher_weight: 1.0, gold_weight: 1.0, judge_known: false, families: FAMILIES.iter().map(|f| f.to_string()).collect(),
         files: Vec::new(), eval_every: 25, eval_items: 20, checkpoint_every: 100, seed: 1,
         out: PathBuf::from("runs/decision-rl"), freeze: Vec::new(), max_seq_tokens: 1024, memory_gb: 0.0,
+        train_only: Vec::new(), stitch_after: 0, stitch_lr: 3e-6, surprise_gain: 0.0, uncertainty_gain: 0.0,
+        replay: 0, sleep_every: 0, sleep_steps: 0, consolidate: 0.0,
     };
+    let mut grow = 0usize;
     let mut no_anchor = false;
     while let Some(a) = args.next() {
         let mut value = || args.next().with_context(|| format!("{a} needs a value"));
@@ -75,6 +85,16 @@ fn main() -> Result<()> {
             "--seed" => cfg.seed = value()?.parse()?,
             "--freeze" => cfg.freeze = value()?.split(',').map(str::to_string).collect(),
             "--max-seq-tokens" => cfg.max_seq_tokens = value()?.parse()?,
+            "--grow" => grow = value()?.parse()?,
+            "--train-only" => cfg.train_only = value()?.split(',').filter(|p| !p.is_empty()).map(str::to_string).collect(),
+            "--stitch-after" => cfg.stitch_after = value()?.parse()?,
+            "--stitch-lr" => cfg.stitch_lr = value()?.parse()?,
+            "--surprise-gain" => cfg.surprise_gain = value()?.parse()?,
+            "--uncertainty-gain" => cfg.uncertainty_gain = value()?.parse()?,
+            "--replay" => cfg.replay = value()?.parse()?,
+            "--sleep-every" => cfg.sleep_every = value()?.parse()?,
+            "--sleep-steps" => cfg.sleep_steps = value()?.parse()?,
+            "--consolidate" => cfg.consolidate = value()?.parse()?,
             "--memory-gb" => cfg.memory_gb = value()?.parse()?,
             other => bail!("unknown argument {other}"),
         }
@@ -85,8 +105,19 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&cfg.out)?;
 
     let be = device()?;
-    let gpu = LearnDecision(&be);
+    let gpu = LearnDecision::grown(&be, grow);
     let model = DecisionModel::load(&gpu, &model_path)?;
+    // A grown model trains its new blocks, its head and its scorer first, the old
+    // blocks held, until `--stitch-after`; then everything, at `--stitch-lr`.
+    if grow > 0 && cfg.train_only.is_empty() {
+        let spec = &model.marker_backend().context("not an encoder model")?.model.spec;
+        let head = spec.marker_head.as_ref().context("no decision head")?;
+        cfg.train_only = (spec.layers as usize - grow..spec.layers as usize).map(|l| format!("blk.{l}."))
+            .chain((head.first..head.first + head.blocks).map(|l| format!("blk.{l}.")))
+            .chain(["cls.".to_string(), "output_norm".to_string(), "token_types".to_string()])
+            .collect();
+        eprintln!("grown by {grow} blocks; training {} until step {}", cfg.train_only.join(" "), cfg.stitch_after);
+    }
     let anchor = if no_anchor { None } else {
         let mut g = Gguf::open(&model_path)?;
         Some(ModernBert::from_gguf(&be, &mut g)?)

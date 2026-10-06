@@ -6,7 +6,7 @@ use crate::backend::Backend;
 use anyhow::{Context, Result};
 use ojas_decision::QuestionKind;
 use ojas_formats::gguf::{Gguf, Meta};
-use ojas_formats::gguf_write::{write_gguf, TensorOut};
+use ojas_formats::gguf_write::{write_gguf, MetaValue, TensorOut};
 use std::path::Path;
 
 /// Write `model` to `dst` with `src`'s metadata. `temperatures` are
@@ -16,11 +16,26 @@ use std::path::Path;
 pub fn export<B: Backend>(be: &B, model: &ModernBert<B>, src: &Path, dst: &Path, temperatures: &[(String, f32)]) -> Result<()> {
     let g = Gguf::open(src.to_str().context("source path")?)?;
     let prefix = format!("{}.decision.temperature.", g.arch());
-    let set: Vec<(String, f32)> = temperatures.iter()
-        .map(|(k, t)| (format!("{prefix}{k}"), *t))
+    let mut set: Vec<(String, MetaValue)> = temperatures.iter()
+        .map(|(k, t)| (format!("{prefix}{k}"), MetaValue::Float(*t as f64)))
         .filter(|(k, _)| matches!(g.meta.get(k), Some(Meta::F32(_))))
         .collect();
-    let set_refs: Vec<(&str, f32)> = set.iter().map(|(k, t)| (k.as_str(), *t)).collect();
+    // A model grown by blocks says so in its shape keys: the block count, and one
+    // feed-forward width per block.
+    let arch = g.arch();
+    let spec = &model.spec;
+    let head = spec.marker_head.as_ref().map_or(0, |h| h.blocks);
+    let total = spec.layers + head;
+    if g.meta_u32(&format!("{arch}.block_count")) != Some(total) {
+        set.push((format!("{arch}.block_count"), MetaValue::Int(total as i64)));
+        if let Some(Meta::IntArr(widths)) = g.meta.get(&format!("{arch}.feed_forward_length")) {
+            let head_width = widths.last().copied().unwrap_or(spec.ffn as i64);
+            let mut grown: Vec<i64> = vec![spec.ffn as i64; spec.layers as usize];
+            grown.extend(std::iter::repeat_n(head_width, head as usize));
+            set.push((format!("{arch}.feed_forward_length"), MetaValue::IntArray(grown)));
+        }
+    }
+    let set_refs: Vec<(&str, MetaValue)> = set.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
     let values: Vec<Vec<f32>> = model.params().iter().map(|p| be.download(&p.val)).collect();
     let tensors: Vec<TensorOut<'_>> = model.params().iter().zip(&values).map(|(p, data)| TensorOut {
         name: &p.name,

@@ -19,7 +19,7 @@
 
 use crate::backend::Backend;
 use crate::tape::{Param, Tape, Var};
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use ojas_arch::text_encoder::TextEncoderSpec;
 use ojas_decision::{CausalBackend, CausalLoad, DecisionGpu, MarkerBackend, MarkerHeadOut, SlotPrefill};
 use ojas_formats::gguf::Gguf;
@@ -68,6 +68,46 @@ impl<B: Backend> ModernBert<B> {
     }
 
     pub fn params(&self) -> &[Param<B>] { &self.params }
+
+    /// Add `n` encoder blocks after the last one, before the decision head, and return
+    /// their name prefixes. Each new block starts as a copy of the nearest existing
+    /// block with the same local or global attention (which the block's index fixes),
+    /// with its attention output and down projections zeroed, so the residual stream
+    /// passes through unchanged and the grown model answers exactly as before. The
+    /// head's blocks are renumbered after the new ones.
+    pub fn grow(&mut self, be: &B, n: usize) -> Result<Vec<String>> {
+        let layers = self.spec.layers as usize;
+        let head = self.spec.marker_head.clone().context("no decision head")?;
+        let rename = |name: &str| -> String {
+            for i in head.first as usize..(head.first + head.blocks) as usize {
+                if let Some(rest) = name.strip_prefix(&format!("blk.{i}.")) {
+                    return format!("blk.{}.{rest}", i + n);
+                }
+            }
+            name.to_string()
+        };
+        for p in &mut self.params { p.name = rename(&p.name); }
+        let mut added = Vec::with_capacity(n);
+        for j in 0..n {
+            let local = self.spec.is_local(layers + j);
+            let source = (0..layers).rev().find(|&l| self.spec.is_local(l) == local).unwrap_or(layers - 1);
+            let src = format!("blk.{source}.");
+            let dst = format!("blk.{}.", layers + j);
+            let copies: Vec<(String, Vec<usize>, Vec<f32>)> = self.params.iter().filter(|p| p.name.starts_with(&src)).map(|p| {
+                let name = format!("{dst}{}", &p.name[src.len()..]);
+                let zero = name.ends_with("attn_output.weight") || name.ends_with("ffn_down.weight");
+                let data = if zero { vec![0.0; p.shape.iter().product()] } else { be.download(&p.val) };
+                (name, p.shape.clone(), data)
+            }).collect();
+            ensure!(!copies.is_empty(), "no tensors under {src}");
+            for (name, shape, data) in copies { self.params.push(Param::new(be, name, &shape, &data)); }
+            added.push(dst);
+        }
+        self.spec.layers += n as u32;
+        if let Some(h) = self.spec.marker_head.as_mut() { h.first += n as u32; }
+        self.index = self.params.iter().enumerate().map(|(i, p)| (p.name.clone(), i)).collect();
+        Ok(added)
+    }
 
     pub fn param(&self, name: &str) -> Result<&Param<B>> {
         self.index.get(name).map(|&i| &self.params[i]).ok_or_else(|| anyhow!("no tensor {name}"))
@@ -273,9 +313,20 @@ fn local_mask(n: usize, window: usize) -> Vec<f32> {
 }
 
 /// A training backend as a decision GPU: marker models (Laya) load as [`ModernBert`]
-/// and answer through `ojas_decision`'s own prompts and calibration. Causal models are
-/// not trained here and are refused.
-pub struct LearnDecision<'b, B: Backend>(pub &'b B);
+/// and answer through `ojas_decision`'s own prompts and calibration, optionally grown
+/// by encoder blocks as they load ([`ModernBert::grow`]). Causal models are not trained
+/// here and are refused.
+pub struct LearnDecision<'b, B: Backend> {
+    be: &'b B,
+    grow: usize,
+}
+
+impl<'b, B: Backend> LearnDecision<'b, B> {
+    pub fn new(be: &'b B) -> Self { LearnDecision { be, grow: 0 } }
+
+    /// Every marker model loaded gains `blocks` encoder blocks.
+    pub fn grown(be: &'b B, blocks: usize) -> Self { LearnDecision { be, grow: blocks } }
+}
 
 /// A loaded [`ModernBert`] answering on its backend, one tape per pass.
 pub struct LearnMarker<'b, B: Backend> {
@@ -326,7 +377,9 @@ impl<'b, B: Backend> DecisionGpu for LearnDecision<'b, B> {
     const NAME: &'static str = "learn";
 
     fn load_marker<'a>(&'a self, g: &mut Gguf) -> Result<Self::Marker<'a>> {
-        Ok(LearnMarker { be: self.0, model: ModernBert::from_gguf(self.0, g)? })
+        let mut model = ModernBert::from_gguf(self.be, g)?;
+        if self.grow > 0 { model.grow(self.be, self.grow)?; }
+        Ok(LearnMarker { be: self.be, model })
     }
 
     fn load_causal<'a>(&'a self, g: &mut Gguf, _: CausalLoad) -> Result<Self::Causal<'a>> {

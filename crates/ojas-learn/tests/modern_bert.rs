@@ -32,14 +32,14 @@ fn encoders_only() -> PathBuf {
 #[ignore = "needs the decision model files; set OJAS_DECISION_MODELS"]
 fn encoder_decisions_match_the_reference_responses() {
     let be = ojas_learn::metal::Metal::new().expect("a Metal device");
-    testkit::decisions_match_the_reference_responses(&LearnDecision(&be), &encoders_only());
+    testkit::decisions_match_the_reference_responses(&LearnDecision::new(&be), &encoders_only());
 }
 
 #[cfg(not(feature = "metal"))]
 #[test]
 #[ignore = "needs the decision model files; set OJAS_DECISION_MODELS"]
 fn encoder_decisions_match_the_reference_responses() {
-    testkit::decisions_match_the_reference_responses(&LearnDecision(&ojas_learn::cpu::Cpu), &encoders_only());
+    testkit::decisions_match_the_reference_responses(&LearnDecision::new(&ojas_learn::cpu::Cpu), &encoders_only());
 }
 
 /// Gradients reach the whole model: a few AdamW steps of cross-entropy towards the
@@ -53,7 +53,7 @@ fn training_moves_the_served_answer() {
 
     let path = testkit::models_dir().join("tinylaya-Q8_0.gguf");
     let be = ojas_learn::cpu::Cpu;
-    let gpu = LearnDecision(&be);
+    let gpu = LearnDecision::new(&be);
     let model = DecisionModel::load(&gpu, path.to_str().unwrap()).unwrap();
     let body = testkit::read_json(&testkit::fixtures().join("requests/ticket.json"));
     let req = model.request(&body).unwrap();
