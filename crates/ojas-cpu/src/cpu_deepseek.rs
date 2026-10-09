@@ -121,10 +121,7 @@ impl CpuDeepseek {
             bail!("CpuDeepseek supports the lite arch (q_lora=0) for now; got q_lora={q_lora}");
         }
 
-        #[cfg(target_arch = "aarch64")]
-        let dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
-        #[cfg(not(target_arch = "aarch64"))]
-        let dotprod = false;
+        let dotprod = crate::cpu_math::fast_i8();
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         tracing::info!(target: "cpu:deepseek2", "d={d} L={n_layers} heads={n_head} kv_lora={kv_lora} k={k_mla}(nope {nope}+rope {qk_rope}) v={v_mla} \
                    | moe {n_expert}e top{n_used} +{n_shared}sh ffn_exp={ffn_exp} dense0..{leading_dense} | mscale={mscale:.3} q8 sdot={dotprod}");

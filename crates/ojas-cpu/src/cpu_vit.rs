@@ -468,10 +468,7 @@ impl CpuVit {
         let pos_side = image_size / patch;
 
         let f32_mode = ojas_core::config::flag("OJAS_VIT_F32");
-        #[cfg(target_arch = "aarch64")]
-        let dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
-        #[cfg(not(target_arch = "aarch64"))]
-        let dotprod = false;
+        let dotprod = crate::cpu_math::fast_i8();
         let threads = ojas_core::config::var("OJAS_CPU_THREADS").ok().and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
             .or_else(crate::cpu_math::perf_cores)

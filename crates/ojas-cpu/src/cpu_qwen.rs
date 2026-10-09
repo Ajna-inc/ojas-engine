@@ -79,10 +79,7 @@ impl CpuQwen {
         // has int8 dot-product instructions (fewest bytes/token = fastest on a
         // byte-bound decode; per-row scales, same requant as the GPU q8 path);
         // f32 = exact tier when it fits OJAS_CPU_F32_GB; f16 = half-RAM fallback.
-        #[cfg(target_arch = "aarch64")]
-        let dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
-        #[cfg(not(target_arch = "aarch64"))]
-        let dotprod = false;
+        let dotprod = crate::cpu_math::fast_i8();
         let f32_budget = ojas_core::config::var("OJAS_CPU_F32_GB").ok()
             .and_then(|v| v.parse::<f64>().ok()).unwrap_or(16.0) * 1e9;
         let approx_params = (n_layers * (2 * d * d + 2 * d * (n_kv * head_dim) + 3 * d * ffn) + vocab * d) as f64;
@@ -212,6 +209,15 @@ impl CpuQwen {
             } })
             .collect();
         let kv = &mut *self.kv.borrow_mut();
+        // Attention reads rows 0..base_pos+t by position, so the cache must hold exactly
+        // base_pos rows before this batch appends. Rows past base_pos belong to whatever
+        // sequence ran before (another request with a different prefix) and would be
+        // attended to as if they were this one's. Same rule as `CpuSsm`.
+        for l in 0..self.n_layers {
+            assert!(kv.k[l].len() >= base_pos * kvdim, "KV holds {} rows, forward at {base_pos}", kv.k[l].len() / kvdim);
+            kv.k[l].truncate(base_pos * kvdim);
+            kv.v[l].truncate(base_pos * kvdim);
+        }
         let mut q = vec![vec![0f32; qdim]; m];
         let mut k = vec![vec![0f32; kvdim]; m];
         let mut v = vec![vec![0f32; kvdim]; m];
@@ -336,5 +342,9 @@ impl DecoderModel for CpuQwen {
     fn forward_logits(&self, token: u32, pos: usize) -> Option<Vec<f32>> {
         if STREAM_CANCEL.load(Ordering::Relaxed) { return None; }
         self.forward_batch(&[token], pos, true)
+    }
+    fn reset_session(&self) {
+        let kv = &mut *self.kv.borrow_mut();
+        kv.k.iter_mut().chain(kv.v.iter_mut()).for_each(Vec::clear);
     }
 }

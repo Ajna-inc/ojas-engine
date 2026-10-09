@@ -177,10 +177,7 @@ impl CpuGlm {
             n_layers
         };
 
-        #[cfg(target_arch = "aarch64")]
-        let dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
-        #[cfg(not(target_arch = "aarch64"))]
-        let dotprod = false;
+        let dotprod = crate::cpu_math::fast_i8();
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let cache_budget = (ojas_core::config::var("OJAS_EXPERT_CACHE_GB").ok()
             .and_then(|v| v.parse::<f64>().ok()).unwrap_or(32.0) * 1e9) as usize;
