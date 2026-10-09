@@ -3,10 +3,22 @@ name = "ojas-swarm"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+description = "Swarm training in the engine: models trained by DiLoCo rounds on CPU, CUDA and Metal, and the coordinator that aggregates them."
 
 [dependencies]
+anyhow = "1"
 tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 ojas-core = { path = "../ojas-core" }
+ojas-swarm-proto = { path = "../ojas-swarm-proto" }
+ojas-learn = { path = "../ojas-learn" }
+
+# The legacy Metal pipeline worker (`legacy.rs`) trains Qwen3-0.6B through `ojas-train`.
+[target.'cfg(target_os = "macos")'.dependencies]
 ojas-metal = { path = "../ojas-metal" }
 ojas-train = { path = "../ojas-train" }
-anyhow = "1"
+
+[features]
+cuda = ["ojas-learn/cuda"]
+metal = ["ojas-learn/metal"]

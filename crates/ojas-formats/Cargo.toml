@@ -11,5 +11,11 @@ tracing = { workspace = true }
 anyhow = "1"
 half = "2"
 serde_json = "1"
+# `swarm_id`: a GGUF's swarm identity, shared by the engine worker and the node.
+ojas-swarm-proto = { path = "../ojas-swarm-proto" }
+
+[target.'cfg(unix)'.dependencies]
+# `swarm_id` hashes tensor data through mmap on Unix.
+libc = "0.2"
 
 [dev-dependencies]

@@ -9,6 +9,9 @@ members = [
     "crates/ojas-metal",
     "crates/ojas-train",
     "crates/ojas-swarm",
+    "crates/ojas-swarm-proto",
+    "crates/ojas-net",
+    "crates/ojas-node",
     "crates/ojas-models",
     "crates/ojas-decision",
     "crates/ojas-cpu",
@@ -41,11 +44,16 @@ axum = "0.8"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+# Swarm networking (ojas-net / ojas-node). Not "upnp": nodes that need inbound
+# reachability get it from the coordinator's relay, which is a data path here.
+libp2p = { version = "0.56", features = ["tokio", "quic", "tcp", "dns", "noise", "yamux", "kad", "gossipsub", "request-response", "identify", "autonat", "dcutr", "relay", "mdns", "macros", "ed25519"] }
+libp2p-stream = "0.4.0-alpha"
 
 # --- serialization ------------------------------------------------------------
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+toml = "0.8"
 schemars = "0.8"
 
 # --- utilities ----------------------------------------------------------------

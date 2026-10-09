@@ -1,0 +1,18 @@
+{
+  "run": "bytes-demo",
+  "model": { "kind": "tiny_gpt", "vocab": 256, "ctx": 128, "d_model": 128, "n_layers": 4, "n_heads": 4, "d_ff": 512, "init_seed": 1 },
+  "data": "data/train.ojtk",
+  "heldout": "data/heldout.ojtk",
+  "inner_steps": 50,
+  "batch": 8,
+  "inner_lr": 0.001,
+  "weight_decay": 0.1,
+  "outer_lr": 0.7,
+  "outer_momentum": 0.9,
+  "rounds": 100,
+  "min_members": 1,
+  "max_members": 8,
+  "round_deadline_secs": 900,
+  "checkpoint_dir": "ckpt",
+  "eval_seqs": 32
+}

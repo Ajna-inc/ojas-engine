@@ -19,6 +19,7 @@ mod sched;
 mod serve;
 mod vserve;
 mod vision;
+mod worker;
 
 use anyhow::Result;
 use ojas_core::config::EngineConfig;
@@ -39,6 +40,8 @@ usage:
   ojas plate  <det.onnx> <rec.onnx> <dict.txt> <image|dir>  detect + read plates
   ojas vbench <model.onnx>              vision forward-pass timing
   ojas decide <model.gguf>              typed decisions (decision models, Metal or CUDA; serve and bench take one too)
+  ojas engine-worker --socket <unix:PATH|tcp:HOST:PORT> --device <auto|metal|cuda|cpu> [--context N]
+                                        swarm compute process; connects to its node
 ";
 
 // No `\` line-continuation: it would strip the leading indent off the first
@@ -120,6 +123,10 @@ fn main() -> Result<()> {
     if argv.iter().skip(1).any(|a| a == "-h" || a == "--help") {
         print!("{USAGE}{SWARM_USAGE}\n{FLAGS}");
         return Ok(());
+    }
+    // Has flags of its own (--socket, --context) that the shared parser would reject.
+    if argv.get(1).map(String::as_str) == Some("engine-worker") {
+        return worker::main(argv);
     }
     let (cfg, opts, a) = flags::parse(argv)?;
     // Context is an engine flag, but the backends need it as a number here. The

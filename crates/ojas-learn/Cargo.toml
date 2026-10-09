@@ -14,6 +14,8 @@ ojas-formats = { path = "../ojas-formats" }
 image = { workspace = true }
 serde_json = "1"
 sha2 = "0.10"
+# TinyGpt's config and model identity are the swarm contract's (`ojas-swarm-proto`).
+ojas-swarm-proto = { path = "../ojas-swarm-proto" }
 # CUDA backend (f32 `learn` kernel family); builds everywhere, runs where a driver is.
 ojas-cuda = { path = "../ojas-cuda", optional = true }
 

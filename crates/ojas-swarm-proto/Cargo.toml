@@ -1,0 +1,23 @@
+[package]
+name = "ojas-swarm-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+description = "Wire contract of the ojas swarm: node <-> engine-worker IPC, node <-> node messages, tensor codec, model identity. No I/O beyond framing, no GPU."
+
+[features]
+default = []
+# Async framing over tokio streams, for the libp2p node. The engine worker uses the
+# blocking std::io framing and does not need it.
+tokio = ["dep:tokio"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = "1"
+half = "2"
+tokio = { workspace = true, optional = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -1,4 +1,5 @@
-//! ojas-swarm — decentralized pipeline workers over the ojas wire protocol.
+//! The first swarm prototype: a static TCP chain of Metal pipeline workers over wire v1, and
+//! DiLoCo on the Qwen3-0.6B `Trainer`. Kept until `engine-worker` and `ojas-node` replace it.
 use anyhow::Result;
 use ojas_core::{diloco, wire, Gate, Learner};
 use ojas_metal::MetalGpu;

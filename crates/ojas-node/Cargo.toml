@@ -1,0 +1,42 @@
+[package]
+name = "ojas-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT"
+description = "The ojas swarm daemon: libp2p node, engine-worker supervision, OpenAI-compatible local API, DiLoCo member and coordinator."
+
+[[bin]]
+name = "ojas-node"
+path = "src/main.rs"
+
+[features]
+default = ["coordinator"]
+# The DiLoCo coordinator lives in `ojas-swarm`, which links the training crates.
+# A member-only or inference-only node can build without it.
+coordinator = ["dep:ojas-swarm"]
+
+[dependencies]
+ojas-net = { path = "../ojas-net" }
+ojas-swarm-proto = { path = "../ojas-swarm-proto", features = ["tokio"] }
+ojas-swarm = { path = "../ojas-swarm", optional = true }
+ojas-tokenize = { path = "../ojas-tokenize" }
+ojas-formats = { path = "../ojas-formats" }
+ojas-infer = { path = "../ojas-infer" }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+blake3 = "1"
+rand = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+blake3 = "1"

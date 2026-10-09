@@ -14,3 +14,4 @@ pub mod mtp;
 pub mod mmproj;
 pub mod onnx;
 pub mod pth;
+pub mod swarm_id;
