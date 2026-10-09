@@ -79,10 +79,7 @@ impl CpuQwen {
         // has int8 dot-product instructions (fewest bytes/token = fastest on a
         // byte-bound decode; per-row scales, same requant as the GPU q8 path);
         // f32 = exact tier when it fits OJAS_CPU_F32_GB; f16 = half-RAM fallback.
-        #[cfg(target_arch = "aarch64")]
-        let dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
-        #[cfg(not(target_arch = "aarch64"))]
-        let dotprod = false;
+        let dotprod = crate::cpu_math::fast_i8();
         let f32_budget = ojas_core::config::var("OJAS_CPU_F32_GB").ok()
             .and_then(|v| v.parse::<f64>().ok()).unwrap_or(16.0) * 1e9;
         let approx_params = (n_layers * (2 * d * d + 2 * d * (n_kv * head_dim) + 3 * d * ffn) + vocab * d) as f64;

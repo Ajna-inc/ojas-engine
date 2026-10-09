@@ -28,24 +28,38 @@ pub enum W {
 // measured spawn/join was ~150 us per matmul, two thirds of the step. These
 // workers are created once and parked on a condvar between jobs.
 
-struct PoolState {
-    gen: u64,
-    quit: bool,
-    /// (erased `&F`, trampoline that restores its type and calls it)
-    job: Option<(*const (), unsafe fn(*const (), usize, usize))>,
-    next_id: usize,
-    done: usize,
-    nt: usize,
-}
-// SAFETY: the payload pointer is only dereferenced between posting a job and
-// `run` observing done == workers, and `run` does not return until then — so
-// the referent outlives every use. `F: Sync` makes the shared &F sound.
-unsafe impl Send for PoolState {}
-
+// Dispatch is ATOMIC, not mutex + condvar. The previous design took one shared mutex twice per
+// worker per job (once to claim a share id, once to count the completion) and broadcast two
+// condvars around it. At ~253 matmuls a token and 32 workers that is ~16k contended lock
+// acquisitions per token, and it showed: measured 9 Oct 2026 on a dual EPYC 9554, one core did
+// 5.87 tok/s and thirty-two did 18 — a 3x return on 32x the cores, about 9 % parallel efficiency,
+// with two cores already only 1.13x. That curve is synchronisation, not bandwidth (4 GB of q8
+// weights a token at 18 tok/s is 72 GB/s against a socket that can do roughly 300).
+//
+// So: a generation counter workers watch, an atomic id they claim with fetch_add, an atomic
+// completion count the caller watches. No lock on the hot path at all.
+//
+// Workers SPIN BRIEFLY AND THEN SLEEP. Spinning is what makes a short parallel region cheap —
+// a futex round trip costs more than the region itself — but this box also runs the camera
+// pipeline, so idle workers must not burn 32 cores. After the spin budget they park on a condvar
+// and the caller wakes them only when `sleepers` says someone is there to wake.
 struct PoolInner {
-    m: std::sync::Mutex<PoolState>,
-    cv_work: std::sync::Condvar,
-    cv_done: std::sync::Condvar,
+    /// Bumped once per job; a worker that sees a new value has work.
+    gen: std::sync::atomic::AtomicU64,
+    /// Share ids, claimed with `fetch_add`.
+    next_id: std::sync::atomic::AtomicUsize,
+    /// Shares finished; the caller waits for this to reach `workers`.
+    done: std::sync::atomic::AtomicUsize,
+    nt: std::sync::atomic::AtomicUsize,
+    /// The erased `&F` and the trampoline that restores its type, published by the Release on
+    /// `gen` and read after the matching Acquire.
+    job_p: std::sync::atomic::AtomicPtr<()>,
+    job_f: std::sync::atomic::AtomicUsize,
+    quit: std::sync::atomic::AtomicBool,
+    /// How many workers are parked, so the caller can skip the futex wake when none are.
+    sleepers: std::sync::atomic::AtomicUsize,
+    m: std::sync::Mutex<()>,
+    cv: std::sync::Condvar,
 }
 
 pub struct Pool {
@@ -66,38 +80,67 @@ unsafe fn trampoline<F: Fn(usize, usize) + Sync>(p: *const (), id: usize, nt: us
     (*(p as *const F))(id, nt)
 }
 
+/// Spin this many times before yielding, and this many more before parking. The spin phase is
+/// sized to comfortably cover a short matmul share; the park keeps an idle pool off the CPU.
+const SPIN: u32 = 2_000;
+const YIELD_UNTIL: u32 = 6_000;
+
 impl Pool {
     fn new(threads: usize) -> Pool {
+        use std::sync::atomic::*;
         let workers = threads.saturating_sub(1); // the caller is worker `workers`
         let inner = std::sync::Arc::new(PoolInner {
-            m: std::sync::Mutex::new(PoolState {
-                gen: 0, quit: false, job: None, next_id: 0, done: 0, nt: threads,
-            }),
-            cv_work: std::sync::Condvar::new(),
-            cv_done: std::sync::Condvar::new(),
+            gen: AtomicU64::new(0),
+            next_id: AtomicUsize::new(0),
+            done: AtomicUsize::new(0),
+            nt: AtomicUsize::new(threads),
+            job_p: AtomicPtr::new(std::ptr::null_mut()),
+            job_f: AtomicUsize::new(0),
+            quit: AtomicBool::new(false),
+            sleepers: AtomicUsize::new(0),
+            m: std::sync::Mutex::new(()),
+            cv: std::sync::Condvar::new(),
         });
         for _ in 0..workers {
             let inner = inner.clone();
             std::thread::spawn(move || {
                 let mut seen = 0u64;
                 loop {
-                    let (f, p, id, nt) = {
-                        let mut st = inner.m.lock().unwrap();
-                        while st.gen == seen && !st.quit {
-                            st = inner.cv_work.wait(st).unwrap();
+                    let mut spins = 0u32;
+                    let g = loop {
+                        let g = inner.gen.load(Ordering::Acquire);
+                        if g != seen { break g; }
+                        if inner.quit.load(Ordering::Relaxed) { return; }
+                        spins += 1;
+                        if spins < SPIN {
+                            std::hint::spin_loop();
+                        } else if spins < YIELD_UNTIL {
+                            std::thread::yield_now();
+                        } else {
+                            // park, but re-check under the lock so a job posted in the gap is
+                            // not missed; the timeout bounds any wake we still race with
+                            inner.sleepers.fetch_add(1, Ordering::SeqCst);
+                            if inner.gen.load(Ordering::Acquire) == seen && !inner.quit.load(Ordering::Relaxed) {
+                                let guard = inner.m.lock().unwrap();
+                                if inner.gen.load(Ordering::Acquire) == seen && !inner.quit.load(Ordering::Relaxed) {
+                                    let _ = inner.cv.wait_timeout(guard, std::time::Duration::from_millis(2));
+                                }
+                            }
+                            inner.sleepers.fetch_sub(1, Ordering::SeqCst);
                         }
-                        if st.quit { return; }
-                        seen = st.gen;
-                        let id = st.next_id;
-                        st.next_id += 1;
-                        let (p, f) = st.job.unwrap();
-                        (f, p, id, st.nt)
                     };
-                    // SAFETY: see `unsafe impl Send for PoolState`.
-                    unsafe { f(p, id, nt) };
-                    let mut st = inner.m.lock().unwrap();
-                    st.done += 1;
-                    if st.done == nt - 1 { inner.cv_done.notify_all(); }
+                    seen = g;
+                    let nt = inner.nt.load(Ordering::Acquire);
+                    let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
+                    let p = inner.job_p.load(Ordering::Acquire) as *const ();
+                    let raw = inner.job_f.load(Ordering::Acquire);
+                    if id + 1 < nt && raw != 0 {
+                        // SAFETY: `gen`'s Release published both halves; the referent outlives the
+                        // job because `run` does not return until every share has counted itself.
+                        let f: unsafe fn(*const (), usize, usize) = unsafe { std::mem::transmute(raw) };
+                        unsafe { f(p, id, nt) };
+                    }
+                    inner.done.fetch_add(1, Ordering::Release);
                 }
             });
         }
@@ -107,21 +150,25 @@ impl Pool {
     /// Run `f(worker_id, nt)` on every worker plus the calling thread, and block
     /// until all shares finish.
     fn run<F: Fn(usize, usize) + Sync>(&self, f: &F) {
+        use std::sync::atomic::*;
         let Ok(_busy) = self.busy.try_lock() else { f(0, 1); return; };
+        if self.workers == 0 { f(0, 1); return; }
         let nt = self.workers + 1;
-        {
-            let mut st = self.inner.m.lock().unwrap();
-            st.job = Some((f as *const F as *const (), trampoline::<F>));
-            st.gen += 1;
-            st.next_id = 0;
-            st.done = 0;
-            st.nt = nt;
+        self.inner.next_id.store(0, Ordering::Relaxed);
+        self.inner.done.store(0, Ordering::Relaxed);
+        self.inner.nt.store(nt, Ordering::Relaxed);
+        self.inner.job_p.store(f as *const F as *mut (), Ordering::Relaxed);
+        self.inner.job_f.store(trampoline::<F> as usize, Ordering::Relaxed);
+        self.inner.gen.fetch_add(1, Ordering::Release); // publishes the two stores above
+        if self.inner.sleepers.load(Ordering::SeqCst) > 0 {
+            let _g = self.inner.m.lock().unwrap();
+            self.inner.cv.notify_all();
         }
-        self.inner.cv_work.notify_all();
         f(self.workers, nt); // caller takes the last share
-        let mut st = self.inner.m.lock().unwrap();
-        while st.done < self.workers {
-            st = self.inner.cv_done.wait(st).unwrap();
+        let mut spins = 0u32;
+        while self.inner.done.load(Ordering::Acquire) < self.workers {
+            spins += 1;
+            if spins < SPIN { std::hint::spin_loop(); } else { std::thread::yield_now(); }
         }
     }
 }
@@ -197,9 +244,16 @@ pub fn matmul(w: &W, n: usize, k: usize, xs: &[&[f32]], bias: Option<&[f32]>,
         xq.iter().map(|(q, _)| deinterleave4_i8(q)).collect()
     } else { Vec::new() };
     let prep_ns = t_prep.elapsed().as_nanos() as u64;
-    // Scoped-spawn cost is ~0.5 ms; below ~4M MACs single-thread wins (a
-    // 512-dim decoder matvec is ~26 us of SDOT, so threading it is a loss).
-    let nt = if n * k * m < (1 << 22) { 1 } else { threads.min(n.max(1)) };
+    // The threshold below which threading loses. It used to be 4M MACs, sized against a dispatch
+    // that cost ~0.5 ms — `std::thread::scope` spawning and joining per call. That dispatch is
+    // gone: the pool is persistent and its hand-off is now a pair of atomics, costing single-digit
+    // microseconds. At the old threshold roughly a hundred of the ~253 matmuls in a token (the KV
+    // and SSM projections, every one of them under 4M MACs) still ran on ONE core while 63 sat
+    // idle, which is most of the serial fraction an Amdahl fit of the core-scaling curve finds.
+    //
+    // 64k MACs is about 2 us of work per thread at a 32-wide split — still comfortably above the
+    // hand-off, and it lets the small projections use the machine.
+    let nt = if n * k * m < (1 << 16) { 1 } else { threads.min(n.max(1)) };
     let outs_addr = outs.as_mut_ptr() as usize;
     const BLOCK: usize = 16;
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -275,7 +329,43 @@ pub fn matmul(w: &W, n: usize, k: usize, xs: &[&[f32]], bias: Option<&[f32]>,
 
 // OJAS_CPU_PROF=1 accounting: total time inside matmul, and how much of that was
 // the serial activation prep (quantize + de-interleave) before any worker starts.
+//
+// The switch and the counters were here already; nothing read the environment and nothing printed
+// them, so the numbers were never visible (9 Oct 2026). Both ends are wired now, because a
+// core-scaling curve tells you there IS a serial fraction and only this tells you WHERE.
 pub static PROF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Read `OJAS_CPU_PROF` once and latch `PROF`. Called from the model loaders.
+pub fn prof_from_env() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var("OJAS_CPU_PROF").map(|v| v != "0" && !v.is_empty()).unwrap_or(false));
+    PROF.store(on, std::sync::atomic::Ordering::Relaxed);
+    on
+}
+
+/// Where a decode step went, against the wall time the caller measured. Everything outside
+/// `matmul` and the attention loop is the rest: norms, rope, the SSM recurrence, sampling.
+pub fn prof_report(wall_ns: u64) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (mm, prep, attn) = (T_MM.load(Relaxed), T_PREP.load(Relaxed), T_ATTN.load(Relaxed));
+    let pct = |v: u64| if wall_ns > 0 { 100.0 * v as f64 / wall_ns as f64 } else { 0.0 };
+    let rest = wall_ns.saturating_sub(mm).saturating_sub(attn);
+    format!(
+        "cpu profile over {:.2}s: matmul {:.1}% ({:.2}s, of which serial activation prep {:.1}%), \
+         single-threaded attention {:.1}% ({:.2}s), everything else {:.1}% ({:.2}s)",
+        wall_ns as f64 / 1e9,
+        pct(mm), mm as f64 / 1e9, pct(prep),
+        pct(attn), attn as f64 / 1e9,
+        pct(rest), rest as f64 / 1e9,
+    )
+}
+
+/// Zero the counters (between warmup and the measured reps).
+pub fn prof_reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    T_MM.store(0, Relaxed); T_PREP.store(0, Relaxed); T_ATTN.store(0, Relaxed);
+}
 pub static T_MM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static T_PREP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Time in the single-threaded per-head attention loop (scores/softmax/AV).
@@ -398,7 +488,51 @@ pub fn dequant_q2_0_row(row: &[u8], k: usize) -> Vec<f32> {
     out
 }
 
-/// int8 dot: NEON SDOT (16 MACs/instruction) where available; scalar fallback.
+/// Does this CPU have an int8 dot worth taking? aarch64 asks for NEON `dotprod`; x86-64 asks for
+/// AVX2 (AVX-512 is used when present, and implies it).
+///
+/// Until 9 Oct 2026 the answer on x86-64 was a hard-coded `false` and every int8 dot fell to a
+/// scalar loop — on a machine whose `lscpu` lists `avx512_vnni`, one instruction of which does 64
+/// of those multiply-accumulates. The decoder also *chooses its weight precision* from this flag
+/// (`cpu_qwen`), so a false answer cost the q8 path as well as the kernel.
+///
+/// Cached: the detection is a CPUID call, and this is asked inside hot loops.
+pub fn fast_i8() -> bool {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<bool> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        #[cfg(target_arch = "aarch64")]
+        { std::arch::is_aarch64_feature_detected!("dotprod") }
+        #[cfg(target_arch = "x86_64")]
+        { std::arch::is_x86_feature_detected!("avx2") }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        { false }
+    })
+}
+
+/// The three x86 tiers, detected once: VNNI (one `vpdpbusd` per 64 bytes), plain AVX-512 BW
+/// (widen to i16 and `vpmaddwd`, 32 bytes), and AVX2 (the same, 16 bytes).
+#[cfg(target_arch = "x86_64")]
+fn x86_vnni() -> bool {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<bool> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        x86_avx512()
+            && std::arch::is_x86_feature_detected!("avx512vl")
+            && std::arch::is_x86_feature_detected!("avx512vnni")
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn x86_avx512() -> bool {
+    use std::sync::OnceLock;
+    static CAP: OnceLock<bool> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512bw")
+    })
+}
+
+/// int8 dot: NEON SDOT or AVX2/AVX-512 where available; scalar fallback.
 /// Exact integer math → deterministic. i8·i8 over k≤16384 cannot overflow i32.
 #[inline]
 pub fn dot_i8(a: &[i8], b: &[i8], dotprod: bool) -> i32 {
@@ -407,11 +541,150 @@ pub fn dot_i8(a: &[i8], b: &[i8], dotprod: bool) -> i32 {
         // SAFETY: gated on runtime dotprod detection at load.
         return unsafe { dot_i8_sdot(a, b) };
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: each is gated on its own runtime detection.
+        // The widening path first, VNNI second, which looks backwards and is not. `vpdpbusd`
+        // needs an unsigned operand, and paying for that with `w ^ 0x80` plus a second dot
+        // against ones to recover `128·Σx` costs more than it saves ONCE A CORE IS
+        // MEMORY-BOUND — measured on the EPYC, 6.35 tok/s widening against 5.82 VNNI on one
+        // core. It would win on weights stored unsigned (which is what llama.cpp's repack
+        // does, and why it can use `vpdpbusd` with no correction at all).
+        if x86_avx512() { return unsafe { dot_i8_avx512(a, b) }; }
+        if x86_vnni() { return unsafe { dot_i8_vnni(a, b) }; }
+        if std::arch::is_x86_feature_detected!("avx2") { return unsafe { dot_i8_avx2(a, b) }; }
+    }
     let _ = dotprod;
     let n = a.len().min(b.len());
     let mut s = 0i32;
     for i in 0..n { s += a[i] as i32 * b[i] as i32; }
     s
+}
+
+/// i8·i8 through VNNI, which is what llama.cpp's x86 path uses and what this machine has.
+///
+/// `vpdpbusd` wants its first operand UNSIGNED, which is why llama.cpp keeps its quantised
+/// weights unsigned and why a signed `W::Q8` cannot use it directly. It does not need a new
+/// storage format though: `w ^ 0x80` reinterpreted as u8 IS `w + 128`, one instruction, and
+///
+///     Σ (w+128)·x  =  Σ w·x + 128·Σ x
+///
+/// so the true dot is the VNNI result minus `128·Σx`, and `Σx` comes free from a second
+/// `vpdpbusd` against a vector of ones in the same pass.
+///
+/// Three instructions per 64 elements against the widening path's eight — `vpmaddwd` only takes
+/// 32 bytes a time and needs two `vpmovsxbw` to feed it. Four accumulators, as above.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx512vl")]
+unsafe fn dot_i8_vnni(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    let flip = _mm512_set1_epi8(0x80u8 as i8);
+    let ones = _mm512_set1_epi8(1);
+    let (mut d0, mut d1) = (_mm512_setzero_si512(), _mm512_setzero_si512());
+    let (mut s0, mut s1) = (_mm512_setzero_si512(), _mm512_setzero_si512());
+    let mut i = 0;
+    while i + 128 <= n {
+        let w0 = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
+        let x0 = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
+        let w1 = _mm512_loadu_si512(a.as_ptr().add(i + 64) as *const __m512i);
+        let x1 = _mm512_loadu_si512(b.as_ptr().add(i + 64) as *const __m512i);
+        d0 = _mm512_dpbusd_epi32(d0, _mm512_xor_si512(w0, flip), x0);
+        d1 = _mm512_dpbusd_epi32(d1, _mm512_xor_si512(w1, flip), x1);
+        s0 = _mm512_dpbusd_epi32(s0, ones, x0);
+        s1 = _mm512_dpbusd_epi32(s1, ones, x1);
+        i += 128;
+    }
+    while i + 64 <= n {
+        let w = _mm512_loadu_si512(a.as_ptr().add(i) as *const __m512i);
+        let x = _mm512_loadu_si512(b.as_ptr().add(i) as *const __m512i);
+        d0 = _mm512_dpbusd_epi32(d0, _mm512_xor_si512(w, flip), x);
+        s0 = _mm512_dpbusd_epi32(s0, ones, x);
+        i += 64;
+    }
+    let dot = _mm512_reduce_add_epi32(_mm512_add_epi32(d0, d1));
+    let xsum = _mm512_reduce_add_epi32(_mm512_add_epi32(s0, s1));
+    let mut r = dot - 128 * xsum;
+    while i < n { r += a[i] as i32 * b[i] as i32; i += 1; }
+    r
+}
+
+/// i8·i8 on AVX-512: widen 32 bytes of each side to i16 and `madd` them into i32 lanes. Widening
+/// rather than VNNI because `vpdpbusd` wants its first operand unsigned, and the bias correction
+/// that buys costs more than it saves here. Exact, and in the scalar summation order.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn dot_i8_avx512(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    // FOUR independent accumulators. `vpmaddwd` has about five cycles of latency and one per
+    // cycle of throughput, so a single accumulator chains on itself and retires one every five —
+    // the kernel then runs at a fifth of the issue width, which is exactly what the single-core
+    // number showed (23 GB/s, the speed of 4 uops per 32 bytes, not the speed of the memory).
+    // `dot_f32` right below has carried this comment since the beginning; the int8 path did not.
+    let (mut a0, mut a1, mut a2, mut a3) = (_mm512_setzero_si512(), _mm512_setzero_si512(), _mm512_setzero_si512(), _mm512_setzero_si512());
+    let mut i = 0;
+    while i + 128 <= n {
+        let l = |o: usize| _mm512_cvtepi8_epi16(_mm256_loadu_si256(a.as_ptr().add(i + o) as *const __m256i));
+        let r = |o: usize| _mm512_cvtepi8_epi16(_mm256_loadu_si256(b.as_ptr().add(i + o) as *const __m256i));
+        a0 = _mm512_add_epi32(a0, _mm512_madd_epi16(l(0), r(0)));
+        a1 = _mm512_add_epi32(a1, _mm512_madd_epi16(l(32), r(32)));
+        a2 = _mm512_add_epi32(a2, _mm512_madd_epi16(l(64), r(64)));
+        a3 = _mm512_add_epi32(a3, _mm512_madd_epi16(l(96), r(96)));
+        i += 128;
+    }
+    while i + 32 <= n {
+        let av = _mm512_cvtepi8_epi16(_mm256_loadu_si256(a.as_ptr().add(i) as *const __m256i));
+        let bv = _mm512_cvtepi8_epi16(_mm256_loadu_si256(b.as_ptr().add(i) as *const __m256i));
+        a0 = _mm512_add_epi32(a0, _mm512_madd_epi16(av, bv));
+        i += 32;
+    }
+    // the four partials are summed in a fixed order, so the result stays deterministic
+    let acc = _mm512_add_epi32(_mm512_add_epi32(a0, a1), _mm512_add_epi32(a2, a3));
+    let mut s = _mm512_reduce_add_epi32(acc);
+    while i < n { s += a[i] as i32 * b[i] as i32; i += 1; }
+    s
+}
+
+/// The AVX2 form of the same: 16 elements a step.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_i8_avx2(a: &[i8], b: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    let n = a.len().min(b.len());
+    // four accumulators, for the reason in `dot_i8_avx512`
+    let (mut a0, mut a1, mut a2, mut a3) = (_mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256(), _mm256_setzero_si256());
+    let mut i = 0;
+    while i + 64 <= n {
+        let l = |o: usize| _mm256_cvtepi8_epi16(_mm_loadu_si128(a.as_ptr().add(i + o) as *const __m128i));
+        let r = |o: usize| _mm256_cvtepi8_epi16(_mm_loadu_si128(b.as_ptr().add(i + o) as *const __m128i));
+        a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(l(0), r(0)));
+        a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(l(16), r(16)));
+        a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(l(32), r(32)));
+        a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(l(48), r(48)));
+        i += 64;
+    }
+    while i + 16 <= n {
+        let av = _mm256_cvtepi8_epi16(_mm_loadu_si128(a.as_ptr().add(i) as *const __m128i));
+        let bv = _mm256_cvtepi8_epi16(_mm_loadu_si128(b.as_ptr().add(i) as *const __m128i));
+        a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(av, bv));
+        i += 16;
+    }
+    let acc = _mm256_add_epi32(_mm256_add_epi32(a0, a1), _mm256_add_epi32(a2, a3));
+    let mut s = hsum_epi32_avx2(acc);
+    while i < n { s += a[i] as i32 * b[i] as i32; i += 1; }
+    s
+}
+
+/// Horizontal sum of eight i32 lanes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum_epi32_avx2(v: std::arch::x86_64::__m256i) -> i32 {
+    use std::arch::x86_64::*;
+    let q = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    let d = _mm_add_epi32(q, _mm_shuffle_epi32(q, 0b00_01_10_11));
+    let t = _mm_add_epi32(d, _mm_shuffle_epi32(d, 0b00_00_00_01));
+    _mm_cvtsi128_si32(t)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -578,7 +851,10 @@ fn f16b(b: &[u8], off: usize) -> f32 {
     half::f16::from_bits(u16::from_le_bytes([b[off], b[off + 1]])).to_f32()
 }
 
-/// 32-element integer dot: u8 nibble-expanded weights (0..15 or 0..31) × i8.
+/// 32-element integer dot: u8 nibble-expanded weights (0..15, 0..31 or 0..63) × i8.
+///
+/// Unsigned weights against signed activations is precisely what AVX-512 VNNI's `vpdpbusd`
+/// computes, so the whole 32-element loop becomes one instruction on a machine that has it.
 #[inline]
 fn idot32(w: &[u8; 32], x: &[i8], dotprod: bool) -> i32 {
     #[cfg(target_arch = "aarch64")]
@@ -586,10 +862,39 @@ fn idot32(w: &[u8; 32], x: &[i8], dotprod: bool) -> i32 {
         // SAFETY: gated on runtime dotprod detection.
         return unsafe { idot32_sdot(w, x) };
     }
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: each is gated on its own runtime detection.
+        if x86_vnni() { return unsafe { idot32_vnni(w, x) }; }
+        if std::arch::is_x86_feature_detected!("avx2") { return unsafe { idot32_avx2(w, x) }; }
+    }
     let _ = dotprod;
     let mut s = 0i32;
     for i in 0..32 { s += w[i] as i32 * x[i] as i32; }
     s
+}
+
+/// One `vpdpbusd`: 32 unsigned×signed products accumulated into eight i32 lanes.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vnni,avx512vl,avx2")]
+unsafe fn idot32_vnni(w: &[u8; 32], x: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    let wv = _mm256_loadu_si256(w.as_ptr() as *const __m256i);
+    let xv = _mm256_loadu_si256(x.as_ptr() as *const __m256i);
+    hsum_epi32_avx2(_mm256_dpbusd_epi32(_mm256_setzero_si256(), wv, xv))
+}
+
+/// AVX2 without VNNI: `maddubs` then widen. It saturates at i16, which cannot bite here — the
+/// weights are at most 63 and the activations at most 128 in magnitude, so a pair of products is
+/// at most 16,128 against a 32,767 ceiling.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn idot32_avx2(w: &[u8; 32], x: &[i8]) -> i32 {
+    use std::arch::x86_64::*;
+    let wv = _mm256_loadu_si256(w.as_ptr() as *const __m256i);
+    let xv = _mm256_loadu_si256(x.as_ptr() as *const __m256i);
+    let p = _mm256_maddubs_epi16(wv, xv);
+    hsum_epi32_avx2(_mm256_madd_epi16(p, _mm256_set1_epi16(1)))
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1282,5 +1587,85 @@ mod iq4nl_tests {
         let got = dot_iq4nl(&row, &x);
         let tol = 1e-3 * want.abs().max(1.0);
         assert!((got - want).abs() <= tol, "dot_iq4nl {got} vs dequant reference {want}");
+    }
+}
+
+#[cfg(test)]
+mod simd_parity {
+    use super::*;
+
+    /// A cheap deterministic spread; no dev-dependency for one test.
+    fn lcg(seed: &mut u64) -> u32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*seed >> 33) as u32
+    }
+
+    fn scalar_i8(a: &[i8], b: &[i8]) -> i32 {
+        let n = a.len().min(b.len());
+        (0..n).map(|i| a[i] as i32 * b[i] as i32).sum()
+    }
+
+    /// The SIMD kernels are EXACT integer arithmetic, so they must agree with the scalar loop to
+    /// the bit — a wrong lane would not look like a wrong answer, it would look like a slightly
+    /// worse model. Lengths either side of the vector width catch the tail handling.
+    #[test]
+    fn dot_i8_matches_the_scalar_loop() {
+        let mut seed = 0x5eed_1234u64;
+        for len in [0usize, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 255, 256, 1024] {
+            let a: Vec<i8> = (0..len).map(|_| lcg(&mut seed) as i8).collect();
+            let b: Vec<i8> = (0..len).map(|_| lcg(&mut seed) as i8).collect();
+            assert_eq!(dot_i8(&a, &b, true), scalar_i8(&a, &b), "len {len}");
+            assert_eq!(dot_i8(&a, &b, false), scalar_i8(&a, &b), "len {len}, flag off");
+        }
+    }
+
+    /// Extremes matter more than averages for a saturating instruction: `maddubs` would clip if a
+    /// pair of products could pass 32,767. The widest case we feed it is a Q6_K weight (63) with a
+    /// full-scale activation, which is 16,128 for the pair — this pins that.
+    #[test]
+    fn idot32_matches_the_scalar_loop_including_the_extremes() {
+        let mut seed = 0xd07_c0deu64;
+        let scalar = |w: &[u8; 32], x: &[i8]| -> i32 { (0..32).map(|i| w[i] as i32 * x[i] as i32).sum() };
+        for round in 0..256 {
+            let mut w = [0u8; 32];
+            let mut x = [0i8; 32];
+            for i in 0..32 {
+                // sweep the quant widths the K-quants actually produce: 4-bit, 5-bit, 6-bit
+                let hi = match round % 3 { 0 => 15u32, 1 => 31, _ => 63 };
+                w[i] = (lcg(&mut seed) % (hi + 1)) as u8;
+                x[i] = lcg(&mut seed) as i8;
+            }
+            if round == 0 { w = [63; 32]; x = [-128; 32]; }   // the saturation corner
+            if round == 1 { w = [63; 32]; x = [127; 32]; }
+            assert_eq!(idot32(&w, &x, true), scalar(&w, &x), "round {round}");
+            assert_eq!(idot32(&w, &x, false), scalar(&w, &x), "round {round}, flag off");
+        }
+    }
+
+    #[test]
+    fn the_capability_is_stable_and_cached() {
+        assert_eq!(fast_i8(), fast_i8());
+    }
+}
+
+#[cfg(test)]
+mod pool_cost {
+    /// What one fork/join costs, which is the number that decides whether per-operation
+    /// parallelism can work at all. A decode step issues ~253 of them, so at 45 ms a token a
+    /// dispatch of 50 us would be a quarter of the budget on its own.
+    ///
+    /// Ignored by default: it is a measurement, not an assertion.
+    #[test]
+    #[ignore]
+    fn dispatch_cost() {
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+        let reps = 20_000;
+        // a body that does essentially nothing: what is left is the hand-off
+        let body = |_id: usize, _nt: usize| {};
+        super::parallel(threads, &body); // warm the pool
+        let t = std::time::Instant::now();
+        for _ in 0..reps { super::parallel(threads, &body); }
+        let per = t.elapsed().as_nanos() as f64 / reps as f64;
+        println!("  {threads} threads: {per:.0} ns per fork/join, so {:.1} ms over the ~253 of a decode step", per * 253.0 / 1e6);
     }
 }
