@@ -396,11 +396,16 @@ impl CpuSsm {
             for (i, v) in a.iter().take(4).enumerate() { mrope_sections[i] = (*v).max(0) as u32; }
         }
 
-        #[cfg(target_arch = "aarch64")]
-        let dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
-        #[cfg(not(target_arch = "aarch64"))]
-        let dotprod = false;
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let dotprod = crate::cpu_math::fast_i8();
+        crate::cpu_math::prof_from_env();
+        // OJAS_CPU_THREADS pins the worker count, as `cpu_qwen` and `cpu_vit` already allowed —
+        // this model did not, and took `available_parallelism()` raw. Inside a container that is
+        // the CGROUP QUOTA, which on the Delhi node reports 25 however many cores the process is
+        // actually pinned to, so a 64-core taskset still ran 25 workers (9 Oct 2026).
+        let threads = ojas_core::config::var("OJAS_CPU_THREADS").ok().and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .or_else(crate::cpu_math::perf_cores)
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
         tracing::info!(target: "cpu:qwen35", "d={d} L={n_layers} attn {n_head}/{n_kv} hd={hd} rot={n_rot} \
                    sections={mrope_sections:?} | GDN S={s_st} Hk={h_k} Hv={h_v} d_inner={d_inner} conv_k={conv_k} \
                    every={attn_interval} | {}", if exact { "EXACT f16 weights / f32 math".to_string() } else { format!("q8 sdot={dotprod}") });
@@ -531,11 +536,16 @@ impl CpuSsm {
             for (i, v) in a.iter().take(4).enumerate() { mrope_sections[i] = v.as_u64().unwrap_or(0) as u32; }
         }
 
-        #[cfg(target_arch = "aarch64")]
-        let dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
-        #[cfg(not(target_arch = "aarch64"))]
-        let dotprod = false;
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let dotprod = crate::cpu_math::fast_i8();
+        crate::cpu_math::prof_from_env();
+        // OJAS_CPU_THREADS pins the worker count, as `cpu_qwen` and `cpu_vit` already allowed —
+        // this model did not, and took `available_parallelism()` raw. Inside a container that is
+        // the CGROUP QUOTA, which on the Delhi node reports 25 however many cores the process is
+        // actually pinned to, so a 64-core taskset still ran 25 workers (9 Oct 2026).
+        let threads = ojas_core::config::var("OJAS_CPU_THREADS").ok().and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .or_else(crate::cpu_math::perf_cores)
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
         tracing::info!(target: "cpu:qwen35:st", "d={d} L={n_layers} attn {n_head}/{n_kv} hd={hd} rot={n_rot} | \
                    GDN S={s_st} Hk={h_k} Hv={h_v} d_inner={d_inner} conv_k={conv_k} every={attn_interval} | f32 exact");
         let kmap: Vec<usize> = (0..h_v).map(|hh| hh / (h_v / h_k.max(1)).max(1)).collect();

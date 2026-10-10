@@ -98,10 +98,7 @@ impl CpuWhisper {
         let (lang_en, transcribe) = (tok(g, "lang_en"), tok(g, "transcribe"));
         let (no_timestamps, ts_begin) = (tok(g, "no_timestamps"), tok(g, "ts_begin"));
 
-        #[cfg(target_arch = "aarch64")]
-        let dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
-        #[cfg(not(target_arch = "aarch64"))]
-        let dotprod = false;
+        let dotprod = crate::cpu_math::fast_i8();
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         tracing::info!(target: "cpu:whisper", "d={d} enc={n_enc} dec={n_dec} heads={n_head} mel={n_mel} vocab={vocab} | q8 sdot={dotprod}");
 
