@@ -49,7 +49,7 @@ use anyhow::{bail, ensure, Context, Result};
 use ojas_formats::onnx::{OnnxDim, OnnxModel};
 
 pub use import::import;
-pub use plate_ocr::{Dictionary, PlateRead};
+pub use plate_ocr::{CtcSteps, Dictionary, PlateRead, CTC_BLANK};
 pub use pre::{ChanNorm, Letterbox, OcrNorm, Window, WindowGeom};
 pub use yolo::{Detection, DecodeCfg};
 pub use model::{Model, ModelKind, Output, TensorHead, TensorModel, TensorSpec};
@@ -578,11 +578,14 @@ pub struct OcrCfg {
     pub norm: pre::OcrNorm,
     /// Feed planes in BGR order (Paddle-native exports trained on cv2 BGR).
     pub bgr: bool,
+    /// Keep each CTC timestep's `top_k` classes in `PlateRead::steps` (0 = off),
+    /// for callers that vote per character across frames of one plate.
+    pub top_k: usize,
 }
 
 impl Default for OcrCfg {
     fn default() -> Self {
-        OcrCfg { height: 48, width: 320, norm: pre::OcrNorm::Signed, bgr: false }
+        OcrCfg { height: 48, width: 320, norm: pre::OcrNorm::Signed, bgr: false, top_k: 0 }
     }
 }
 
@@ -749,11 +752,12 @@ impl PlateOcr {
             self.input_buf = input;
             let step = self.t_steps * self.classes;
             for slot in 0..chunk.len() {
-                out.push(plate_ocr::ctc_greedy(
+                out.push(plate_ocr::ctc_greedy_topk(
                     &outs[0][slot * step..(slot + 1) * step],
                     self.t_steps,
                     self.classes,
                     &self.dict,
+                    self.cfg.top_k,
                 )?);
             }
         }

@@ -12,7 +12,7 @@ use crate::gpu::GpuDev;
 use crate::gpu_pre::{Placement, Roi};
 use crate::person::DetrHead;
 use crate::pipeline::{detect, run_stage, upload_rgb, BucketsOf, DetHead, HostRgb};
-use crate::plate_ocr::{ctc_greedy, Dictionary, PlateRead};
+use crate::plate_ocr::{ctc_greedy_topk, Dictionary, PlateRead};
 use crate::yolo::{DecodeCfg, Detection};
 use crate::{bind_input_dims, DetectorCfg, Frame, OcrCfg};
 
@@ -159,7 +159,7 @@ impl<G: GpuDev> GpuOcr<G> {
             run_stage(exec, &dev, chunk, place).context("ocr stage")?;
             let probs = exec.read_output(0, chunk.len())?;
             for i in 0..chunk.len() {
-                out.push(ctc_greedy(&probs[i * per..(i + 1) * per], self.steps, self.classes, &self.dict)?);
+                out.push(ctc_greedy_topk(&probs[i * per..(i + 1) * per], self.steps, self.classes, &self.dict, self.cfg.top_k)?);
             }
         }
         Ok(out)

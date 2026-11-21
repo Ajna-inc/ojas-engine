@@ -107,7 +107,8 @@ runtime flags:
          --host H --port P   serve address (default 127.0.0.1:8080)
   -r,    --reps N         bench repetitions (default 3)
          --conf N --iou N  vision thresholds (detect/plate)
-         --json           detect/decide: JSON output
+         --json           detect/plate/decide: JSON output
+         --ctc-topk N     plate --json: the N likeliest classes of every CTC timestep
          --state S / --state-file F          decide: JSON object or text to decide about
          --questions Q / --questions-file F  decide: {id: {type, instructions, criteria}}
          --image F                           decide: an image the request carries (repeatable)

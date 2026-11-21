@@ -118,6 +118,9 @@ pub fn detect(model: &str, input: &str, opts: &RunOpts) -> Result<()> {
 
 /// `ojas plate det.onnx rec.onnx dict.txt image|dir` — detect plates, crop,
 /// read. The detector is a single-class plate model; crops get 8% padding.
+/// `--json` prints one object per image; with `--ctc-topk N` each read carries
+/// `steps`, the N likeliest classes of every CTC timestep (class 0, char null =
+/// blank), which a caller voting across frames of one plate aligns on.
 pub fn plate(det_model: &str, rec_model: &str, dict: &str, input: &str, opts: &RunOpts) -> Result<()> {
     let rt = Runtime::new(RuntimeCfg::default())?;
     let mut det = rt.detector(det_model, DetectorCfg { conf: opts.conf.unwrap_or(0.3), ..detector_cfg(opts) })?;
@@ -134,11 +137,20 @@ pub fn plate(det_model: &str, rec_model: &str, dict: &str, input: &str, opts: &R
         "unit" => OcrNorm::Unit,
         other => bail!("--ocr-norm {other:?}: want signed or unit, optionally with ,bgr"),
     };
-    let mut ocr = rt.plate_ocr(rec_model, dict, OcrCfg { norm, bgr, ..Default::default() })?;
+    ensure!(opts.ctc_topk == 0 || opts.json, "--ctc-topk needs --json");
+    let dict = ojas_vision::Dictionary::load(dict)?;
+    let mut ocr = rt.plate_ocr_with_dict(rec_model, dict.clone(), OcrCfg { norm, bgr, top_k: opts.ctc_topk, ..Default::default() })?;
+    let mut first = true;
+    if opts.json {
+        println!("[");
+    }
     for p in image_paths(input)? {
         let (w, h, rgb) = ojas_cpu::vit_preprocess::decode_rgb8_path(&p)?;
         let dets = det.run(&[Frame::Rgb8 { w, h, data: &rgb }])?.remove(0);
-        println!("{p}  ({} plates)", dets.len());
+        let mut plates = vec![];
+        if !opts.json {
+            println!("{p}  ({} plates)", dets.len());
+        }
         for d in &dets {
             // crop with 8% padding
             let pw = (d.x1 - d.x0) * 0.08;
@@ -157,11 +169,40 @@ pub fn plate(det_model: &str, rec_model: &str, dict: &str, input: &str, opts: &R
                 crop[y * cw * 3..(y + 1) * cw * 3].copy_from_slice(src);
             }
             let read = ocr.run(&[Frame::Rgb8 { w: cw, h: chh, data: &crop }])?.remove(0);
+            if opts.json {
+                let mut o = serde_json::json!({
+                    "box": [d.x0, d.y0, d.x1, d.y1],
+                    "score": d.score,
+                    "text": read.text,
+                    "mean_conf": read.mean_conf,
+                    "char_conf": read.char_conf,
+                    "alternatives": read.alternatives.iter().map(|a| a.map(|(c, p)| serde_json::json!({"char": c, "p": p}))).collect::<Vec<_>>(),
+                });
+                if let Some(steps) = &read.steps {
+                    let rows: Vec<Vec<serde_json::Value>> = steps
+                        .iter()
+                        .map(|s| s.iter().map(|&(c, p)| serde_json::json!({"class": c, "char": dict.char_at(c as usize), "p": p})).collect())
+                        .collect();
+                    o["steps"] = rows.into();
+                }
+                plates.push(o);
+                continue;
+            }
             println!(
                 "  [{:>6.1},{:>6.1},{:>6.1},{:>6.1}] conf {:.2} -> {:?} (mean {:.2})",
                 d.x0, d.y0, d.x1, d.y1, d.score, read.text, read.mean_conf
             );
         }
+        if opts.json {
+            if !first {
+                println!(",");
+            }
+            first = false;
+            print!("{}", serde_json::json!({"image": p, "plates": plates}));
+        }
+    }
+    if opts.json {
+        println!("\n]");
     }
     Ok(())
 }

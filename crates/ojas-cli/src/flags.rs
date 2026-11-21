@@ -60,6 +60,8 @@ pub struct RunOpts {
     /// Vision (`plate`): OCR input normalization — "signed" (default) or
     /// "unit" for exports with normalization folded in-graph (see MANIFEST).
     pub ocr_norm: Option<String>,
+    /// Vision (`plate --json`): classes kept per CTC timestep of each read; 0 = none.
+    pub ctc_topk: usize,
     /// `vision-serve`: bearer token, or the file holding one; callers from a
     /// `--trust` range need neither.
     pub token: Option<String>,
@@ -112,6 +114,7 @@ impl Default for RunOpts {
             images: Vec::new(),
             requests_file: None,
             ocr_norm: None,
+            ctc_topk: 0,
             sample_set: false,
         }
     }
@@ -380,6 +383,7 @@ pub fn take_run_flags(args: &mut Vec<String>) -> Result<RunOpts> {
             "--image" => o.images.push(take(&mut i)?),
             "--requests-file" => o.requests_file = Some(take(&mut i)?),
             "--ocr-norm" => o.ocr_norm = Some(take(&mut i)?),
+            "--ctc-topk" => o.ctc_topk = num!(&mut i),
             "--token" => o.token = Some(take(&mut i)?),
             "--token-file" => o.token_file = Some(take(&mut i)?),
             "--trust" => o.trust = Some(take(&mut i)?),
@@ -404,7 +408,7 @@ pub fn take_run_flags(args: &mut Vec<String>) -> Result<RunOpts> {
                      runtime: -n/--predict, -p/--prompt, -f/--file, -sys/--system, --raw,\n\
                      \x20        --temp, --top-p, --top-k, --repeat-penalty, --repeat-last-n, -s/--seed,\n\
                      \x20        --device, --precision, -ngl/--n-gpu-layers, --host, --port, -r/--reps,\n\
-                     \x20        --conf, --iou, --json (vision)"
+                     \x20        --conf, --iou, --json, --ctc-topk (vision)"
                 );
             }
             _ => rest.push(a),

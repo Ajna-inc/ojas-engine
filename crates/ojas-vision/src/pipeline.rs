@@ -16,7 +16,7 @@ use anyhow::{ensure, Result};
 use crate::exec_gpu::{ArenaOf, GpuExecutor};
 use crate::gpu::GpuDev;
 use crate::gpu_pre::{descriptors, launch, DevFrame, PixFmt, Placement, Roi};
-use crate::plate_ocr::{ctc_greedy, Dictionary, PlateRead};
+use crate::plate_ocr::{ctc_greedy_topk, Dictionary, PlateRead};
 use crate::pre::OcrNorm;
 use crate::yolo::{self, DecodeCfg, Detection};
 
@@ -35,6 +35,8 @@ pub struct PipelineCfg {
     pub min_plate_h: usize,
     pub ocr_norm: OcrNorm,
     pub ocr_bgr: bool,
+    /// Keep each CTC timestep's top-k classes in `PlateRead::steps` (0 = off).
+    pub ocr_top_k: usize,
 }
 
 impl Default for PipelineCfg {
@@ -51,6 +53,7 @@ impl Default for PipelineCfg {
             min_plate_h: 8,
             ocr_norm: OcrNorm::Signed,
             ocr_bgr: true,
+            ocr_top_k: 0,
         }
     }
 }
@@ -395,7 +398,7 @@ impl<G: GpuDev> PlatePipelineOf<G> {
             let probs = exec.read_output(0, chunk.len())?;
             let per = self.ocr_steps * self.ocr_classes;
             for (k, &i) in owners.iter().enumerate() {
-                out[i] = Some(ctc_greedy(&probs[k * per..(k + 1) * per], self.ocr_steps, self.ocr_classes, &self.dict)?);
+                out[i] = Some(ctc_greedy_topk(&probs[k * per..(k + 1) * per], self.ocr_steps, self.ocr_classes, &self.dict, self.cfg.ocr_top_k)?);
             }
         }
         self.times.ocr_crops = orois.len();
