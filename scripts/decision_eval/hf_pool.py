@@ -248,6 +248,20 @@ def rosetta(df, path, rng):
         yield choice_row({"code": r.code}, "Which programming language is this code written in?", options, r.language_name)
 
 
+def rosetta_task(df, path, rng):
+    """Which task a program solves, among eight Rosetta Code task names: code
+    understanding rather than recognising the language."""
+    df = df[df.language_name.isin(set(CODE_LANGUAGES))]
+    names = sorted(df.task_name.dropna().unique())
+    for r in df.itertuples():
+        if not short(r.code) or len(r.code) < 80:
+            continue
+        others = rng.sample([t for t in names if t != r.task_name], 7)
+        options = others + [r.task_name]
+        rng.shuffle(options)
+        yield choice_row({"code": r.code}, "Which task does this code solve?", options, r.task_name)
+
+
 def defects(df, path, rng):
     for r in df.itertuples():
         if not short(r.func):
@@ -286,6 +300,7 @@ DATASETS = {
                                                                 state=lambda r: {"first": r.sentence1, "second": r.sentence2})),
     "hf_cola": ("nyu-mll/glue", ("cola/train",), labelled_noul("label", "sentence", "Is the sentence grammatically acceptable?")),
     "hf_rosetta": ("christopher/rosetta-code", ("train",), rosetta),
+    "hf_rosetta_task": ("christopher/rosetta-code", ("train",), rosetta_task),
     "hf_defects": ("code_x_glue_cc_defect_detection", ("train",), defects),
 }
 

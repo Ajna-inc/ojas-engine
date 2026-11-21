@@ -11,6 +11,9 @@ bigrams, so it needs no model.
     hippocampus.py build <data_dir> <index_dir>
     hippocampus.py augment <index_dir> <in.jsonl|dir> <out_dir> [--k 3] [--keep]
     hippocampus.py show <index_dir> "query text"
+    hippocampus.py dense <index_dir> <embedder_dir>    # adds semantic search
+    hippocampus.py recall <index_dir> <in.jsonl|dir> <out_dir> --embedder <model.gguf> --vectors <dense.f16>
+        [--only family,family] [--k 3] [--keep]       # semantic search through the engine
 
 `augment` rewrites `{"body": ..., "gold": ...}` lines (or bare request bodies) with
 the state replaced by `{"background": [passages], "input": <original state>}`; with
@@ -87,6 +90,41 @@ def natural_earth():
             p = f["properties"]
             if p.get("FEATURECLA") == "Admin-0 capital":
                 yield f"{p['NAME']} is the capital of {p['ADM0NAME']}."
+
+
+def embedder(model_dir):
+    """A sentence embedder from a Hugging Face encoder directory: mean-pooled,
+    normalised hidden states, on the GPU when there is one."""
+    import torch
+    from transformers import AutoModel, AutoTokenizer
+    device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+    tok = AutoTokenizer.from_pretrained(model_dir)
+    model = AutoModel.from_pretrained(model_dir, torch_dtype=torch.float16 if device != "cpu" else torch.float32).to(device).eval()
+
+    def embed(texts, batch=128, max_len=256):
+        out = []
+        with torch.no_grad():
+            for s in range(0, len(texts), batch):
+                enc = tok(texts[s:s + batch], padding=True, truncation=True, max_length=max_len, return_tensors="pt").to(device)
+                h = model(**enc).last_hidden_state
+                m = enc["attention_mask"].unsqueeze(-1).to(h.dtype)
+                v = (h * m).sum(1) / m.sum(1).clamp(min=1)
+                out.append(torch.nn.functional.normalize(v.float(), dim=-1).cpu().numpy().astype(np.float16))
+        return np.concatenate(out) if out else np.zeros((0, model.config.hidden_size), np.float16)
+    return embed
+
+
+def build_dense(index, model_dir):
+    """Embed every passage of `index` with the encoder in `model_dir`."""
+    import time
+    passages = [json.loads(line) for line in (index / "passages.jsonl").open()]
+    embed = embedder(model_dir)
+    start, chunks = time.time(), []
+    for s in range(0, len(passages), 8192):
+        chunks.append(embed(passages[s:s + 8192]))
+        done = s + len(chunks[-1])
+        print(f"{done}/{len(passages)} passages, {done / (time.time() - start):.0f}/s", flush=True)
+    np.save(index / "dense.npy", np.concatenate(chunks))
 
 
 def build(data, index):
@@ -179,6 +217,55 @@ def augment(index, src, out, k, keep=False):
         print(f"{f.name:30s} {len(rows):6d} augmented")
 
 
+def engine_embed(binary, model, texts, out, prompt_name):
+    """Unit-length vectors for `texts` from the engine's `embed_texts`, as float16."""
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "texts.jsonl"
+        src.write_text("".join(json.dumps(t) + "\n" for t in texts))
+        cmd = [str(binary), str(model), str(src), str(out)] + (["--prompt-name", prompt_name] if prompt_name else [])
+        subprocess.run(cmd, check=True, stderr=subprocess.DEVNULL)
+    width = json.loads(Path(f"{out}.json").read_text())["width"]
+    return np.fromfile(out, dtype=np.float16).reshape(-1, width)
+
+
+def recall(index, src, out, k, keep, embedder, vectors, only, binary):
+    """Attach to each request the `k` passages nearest to it in meaning: the request's
+    question and state are embedded with the engine's embedder (its question-answering
+    prompt) and compared against the passage vectors in `vectors`. Files whose family
+    is not in `only` (when given) are copied unchanged: their requests need no facts."""
+    passages = [json.loads(line) for line in (index / "passages.jsonl").open()]
+    store = np.fromfile(vectors, dtype=np.float16).reshape(len(passages), -1).astype(np.float32)
+    out.mkdir(parents=True, exist_ok=True)
+    files = sorted(src.glob("*.jsonl")) if src.is_dir() else [src]
+    for f in files:
+        rows = [json.loads(line) for line in f.open()]
+        if only and f.stem not in only:
+            (out / f.name).write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+            print(f"{f.name:30s} {len(rows):6d} copied without facts")
+            continue
+        bodies = [r["body"] if "body" in r else r for r in rows]
+        scratch = out / f".{f.stem}.f16"
+        queries = engine_embed(binary, embedder, [query_text(b) for b in bodies], scratch, "QuestionAnswering").astype(np.float32)
+        scratch.unlink()
+        Path(f"{scratch}.json").unlink()
+        with (out / f.name).open("w") as o:
+            for s in range(0, len(rows), 256):
+                block = (store @ queries[s:s + 256].T).T
+                top = np.argpartition(-block, k, axis=1)[:, :k]
+                for i, t in enumerate(top):
+                    facts = [passages[j] for j in t[np.argsort(-block[i, t])]]
+                    r, b = rows[s + i], bodies[s + i]
+                    if keep:
+                        line = {**r, "background": facts} if "body" in r else {"body": b, "background": facts}
+                    else:
+                        nb = augment_body(b, facts)
+                        line = {**r, "body": nb} if "body" in r else nb
+                    o.write(json.dumps(line, ensure_ascii=False) + "\n")
+        print(f"{f.name:30s} {len(rows):6d} with facts")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -187,11 +274,21 @@ def main():
     a.add_argument("out", type=Path); a.add_argument("--k", type=int, default=3)
     a.add_argument("--keep", action="store_true")
     s = sub.add_parser("show"); s.add_argument("index", type=Path); s.add_argument("query")
+    d = sub.add_parser("dense"); d.add_argument("index", type=Path); d.add_argument("model", type=Path)
+    r = sub.add_parser("recall"); r.add_argument("index", type=Path); r.add_argument("src", type=Path); r.add_argument("out", type=Path)
+    r.add_argument("--embedder", type=Path, required=True); r.add_argument("--vectors", type=Path, required=True)
+    r.add_argument("--only", default=""); r.add_argument("--k", type=int, default=3); r.add_argument("--keep", action="store_true")
+    r.add_argument("--embed-binary", type=Path, default=Path(__file__).resolve().parents[2] / "target/release/examples/embed_texts")
     args = parser.parse_args()
     if args.cmd == "build":
         build(args.data, args.index)
     elif args.cmd == "augment":
         augment(args.index, args.src, args.out, args.k, args.keep)
+    elif args.cmd == "dense":
+        build_dense(args.index, args.model)
+    elif args.cmd == "recall":
+        only = {f for f in args.only.split(",") if f}
+        recall(args.index, args.src, args.out, args.k, args.keep, args.embedder, args.vectors, only, args.embed_binary)
     else:
         for p in Memory(args.index).search([args.query], 5)[0]:
             print("-", p[:300])

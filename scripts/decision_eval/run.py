@@ -26,6 +26,7 @@ The summary is written to `<out>/summary.json` and printed as tables: accuracy b
 category and by task, calibration, and throughput.
 
     run.py <model.gguf>... [--tasks a,b] [--limit N] [--clients 4] [--out DIR]
+    run.py <model.gguf>... --suite DIR  # a suite from `public_bench.py` instead
     run.py --report DIR                 # score answers already written
 """
 
@@ -42,7 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from geo import World  # noqa: E402
-from tasks import all_tasks  # noqa: E402
+from tasks import Item, Task, all_tasks  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -86,6 +87,20 @@ class Server:
     def __exit__(self, *exc):
         self.proc.terminate()
         self.proc.wait()
+
+
+def suite_tasks(directory):
+    """The tasks of a suite written by `public_bench.py`: `suite.json` names each task's
+    category and request file, whose lines are `{"body": request, "gold": answers}`."""
+    out = []
+    for spec in json.loads((directory / "suite.json").read_text()):
+        task = Task(spec["name"], spec["category"], spec["description"])
+        for i, line in enumerate((directory / spec["file"]).read_text().splitlines()):
+            row = json.loads(line)
+            gold = {qid: g == "true" if row["body"]["questions"][qid]["type"] == "noul" else g for qid, g in row["gold"].items()}
+            task.items.append(Item(f"{spec['name']}-{i}", row["body"]["state"], row["body"]["questions"], gold))
+        out.append(task)
+    return out
 
 
 def run_model(binary, model, tasks, out_dir, clients, port):
@@ -294,6 +309,7 @@ def main():
     parser.add_argument("--ojas", type=Path, default=REPO / "target/release/ojas")
     parser.add_argument("--port", type=int, default=8210)
     parser.add_argument("--report", type=Path, help="score the answers already in this directory")
+    parser.add_argument("--suite", type=Path, help="evaluate on the suite in this directory instead of the built-in tasks")
     args = parser.parse_args()
 
     if args.report:
@@ -301,7 +317,7 @@ def main():
     else:
         if not args.models:
             parser.error("name at least one model, or --report a directory")
-        tasks = all_tasks(World())
+        tasks = suite_tasks(args.suite) if args.suite else all_tasks(World())
         if args.tasks:
             wanted = set(args.tasks.split(","))
             tasks = [t for t in tasks if t.name in wanted]
