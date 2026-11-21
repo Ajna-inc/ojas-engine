@@ -291,13 +291,30 @@ struct State {
 pub struct CpuSsmOpts {
     /// Keep F16 weights as f16 and compute in f32 (no int8 repack). The oracle mode.
     pub exact: bool,
+    /// Load only `blk.lo .. blk.hi` — a SHARD of the model, for running one stretch of layers on
+    /// this device and the rest somewhere else.
+    ///
+    /// The layer index stays ABSOLUTE: `blk.{i}` names the file's tensor and
+    /// `(i + 1) % full_attention_interval` decides whether layer `i` is attention or SSM, so a
+    /// shard's layers behave exactly as they would in the whole model.
+    ///
+    /// A shard that does not start at 0 has no `token_embd` and must be entered with
+    /// [`CpuSsm::forward_shard`]'s rows; one that does not end at `block_count` has no
+    /// `output_norm` or LM head and cannot produce logits. Leaving the big head (636 MB on
+    /// Qwen3.5-4B) off every shard but the last is most of the point.
+    pub layers: Option<(usize, usize)>,
 }
 
 impl CpuSsmOpts {
     /// `OJAS_CPU_EXACT=1` (any value but empty/"0") selects the exact mode.
     pub fn from_env() -> CpuSsmOpts {
         let exact = std::env::var("OJAS_CPU_EXACT").map(|v| !v.is_empty() && v != "0").unwrap_or(false);
-        CpuSsmOpts { exact }
+        CpuSsmOpts { exact, layers: None }
+    }
+
+    /// Load only this half-open layer range.
+    pub fn shard(lo: usize, hi: usize) -> CpuSsmOpts {
+        CpuSsmOpts { exact: CpuSsmOpts::from_env().exact, layers: Some((lo, hi)) }
     }
 }
 
@@ -307,6 +324,8 @@ impl CpuSsmOpts {
 const CHUNK: usize = 128;
 
 pub struct CpuSsm {
+    /// Absolute `lo..hi` layer range this instance loaded (the whole model unless sharded).
+    span: (usize, usize),
     d: usize,
     n_head: usize,
     n_kv: usize,
@@ -447,8 +466,12 @@ impl CpuSsm {
         };
 
         let t0 = std::time::Instant::now();
-        let mut layers = Vec::with_capacity(n_layers);
-        for i in 0..n_layers {
+        // The shard's half-open layer range; the whole model unless asked otherwise.
+        let (lo, hi) = opts.layers.unwrap_or((0, n_layers));
+        if !(lo < hi && hi <= n_layers) { bail!("layer range {lo}..{hi} is not inside 0..{n_layers}"); }
+        let (is_first, is_last) = (lo == 0, hi == n_layers);
+        let mut layers = Vec::with_capacity(hi - lo);
+        for i in lo..hi {
             let p = |s: &str| format!("blk.{i}.{s}");
             let is_attn = (i + 1) % attn_interval == 0;
             let mixer = if is_attn {
@@ -482,20 +505,26 @@ impl CpuSsm {
                 ffn_down: readw(g, &p("ffn_down.weight"))?,
             });
         }
-        let output_norm = readf32(g, "output_norm.weight")?;
-        let head = if g.tensors.contains_key("output.weight") {
+        // Only the tail shard norms and projects to logits, and only the head shard embeds. On
+        // Qwen3.5-4B the LM head is 636 M parameters, so loading it into every shard would cost
+        // more than the layers do.
+        let output_norm = if is_last { readf32(g, "output_norm.weight")? } else { Vec::new() };
+        let head = if !is_last {
+            W::F32(Vec::new())
+        } else if g.tensors.contains_key("output.weight") {
             readw(g, "output.weight")?
         } else {
             readw(g, "token_embd.weight")? // tied
         };
-        let embd = readw(g, "token_embd.weight")?;
-        tracing::info!(target: "cpu:qwen35", "loaded {n_layers} layers in {:.0}s", t0.elapsed().as_secs_f32());
+        let embd = if is_first { readw(g, "token_embd.weight")? } else { W::F32(Vec::new()) };
+        tracing::info!(target: "cpu:qwen35", "loaded layers {lo}..{hi} of {n_layers} in {:.0}s{}",
+            t0.elapsed().as_secs_f32(), if is_first && is_last { "" } else { " (shard)" });
 
         let st = new_state(&layers, conv_k, conv_ch, h_v, s_st);
         Ok(CpuSsm {
             d, n_head, n_kv, hd, n_rot, s_st, h_k, h_v, d_inner, head_v, conv_ch, conv_k,
             ffn, vocab, rope_base, eps, mrope_sections, mrope_mode: MROPE_INTERLEAVED, exact, kmap,
-            layers, output_norm, head, embd, threads, dotprod, vit: None,
+            layers, output_norm, head, embd, threads, dotprod, vit: None, span: (lo, hi),
             st: RefCell::new(st),
             tracer: RefCell::new(env_tracer()),
         })
@@ -625,7 +654,7 @@ impl CpuSsm {
         Ok(CpuSsm {
             d, n_head, n_kv, hd, n_rot, s_st, h_k, h_v, d_inner, head_v, conv_ch, conv_k,
             ffn, vocab, rope_base, eps, mrope_sections, mrope_mode: MROPE_INTERLEAVED, exact: true, kmap,
-            layers, output_norm, head, embd, threads, dotprod, vit: None,
+            layers, output_norm, head, embd, threads, dotprod, vit: None, span: (0, n_layers),
             st: RefCell::new(st),
             tracer: RefCell::new(env_tracer()),
         })
@@ -721,6 +750,39 @@ impl CpuSsm {
         }
         last.unwrap()
     }
+
+    /// Run THIS SHARD's layers over rows supplied directly and return the residual stream for the
+    /// next shard to continue from — the same rows `forward_embeds_logits` would have fed to the
+    /// next layer, stopped early.
+    ///
+    /// The handoff is `rope.len() * hidden_dim` f32: about **10 KB a token** at d = 2560. That is
+    /// why splitting a model across two devices in ONE MACHINE is almost free (a PCIe copy of
+    /// 10 KB is microseconds) and why splitting it across two machines is not (a round trip
+    /// between our Delhi and Chennai nodes is ~25 ms, which would set the token rate on its own).
+    pub fn forward_shard(&self, x: &[f32], rope: &[RopeAt], base_row: usize) -> Vec<f32> {
+        assert_eq!(x.len(), rope.len() * self.d, "x must be rope.len() * hidden_dim");
+        assert!(!rope.is_empty());
+        let n = rope.len();
+        let mut out = Vec::with_capacity(n * self.d);
+        for c0 in (0..n).step_by(CHUNK) {
+            let c1 = (c0 + CHUNK).min(n);
+            let xs: Vec<Vec<f32>> = (c0..c1).map(|i| x[i * self.d..(i + 1) * self.d].to_vec()).collect();
+            // `local_hidden` keeps the residual after every layer; the last one is this shard's
+            // output, and asking for no logits is what lets a shard omit the head entirely.
+            let hid = self.forward_rows(xs, &rope[c0..c1], base_row + c0, false, true, true).1
+                .expect("local_hidden was requested");
+            // hid[row] is [input, after layer 0, .., after the last layer] and, on a shard that
+            // ends the model, one more for the output norm. Index rather than `last`, so a tail
+            // shard asked for its residual still gives the residual.
+            for row in hid {
+                out.extend_from_slice(&row[self.layers.len()]);
+            }
+        }
+        out
+    }
+
+    /// The layer range this instance holds, as absolute indices into the file.
+    pub fn layer_span(&self) -> (usize, usize) { self.span }
 
     fn forward(&self, token: usize, pos: usize, want_logits: bool) -> Option<Vec<f32>> {
         self.forward_rows(vec![self.embed_row(token)], &[RopeAt::Scalar(pos)], pos, want_logits, false, false).0
@@ -980,10 +1042,14 @@ impl CpuSsm {
             if keep_hidden { for r in 0..m { hid[r].push(x[r].clone()); } }
         }
 
-        // Final norm + LM head, only for rows that need it.
+        // Final norm + LM head, only for rows that need it — and only on a shard that HAS them.
+        // A shard that does not end the model carries no `output_norm` and no head (see
+        // `CpuSsmOpts::layers`), so there is nothing to apply and `hid` simply ends at the last
+        // layer's residual, which is what the next shard wants.
         let need: Vec<bool> = (0..m).map(|r| (last_logits && r == m - 1) || (traced[r] && t_logits)).collect();
         let mut logits: Vec<Option<Vec<f32>>> = vec![None; m];
-        if keep_hidden || need.iter().any(|&b| b) {
+        debug_assert!(!(need.iter().any(|&b| b) && self.output_norm.is_empty()), "logits asked of a shard with no LM head");
+        if !self.output_norm.is_empty() && (keep_hidden || need.iter().any(|&b| b)) {
             let xn: Vec<Vec<f32>> = x.iter().map(|r| rmsnorm(r, &self.output_norm, self.eps)).collect();
             let idx: Vec<usize> = (0..m).filter(|&r| need[r]).collect();
             if !idx.is_empty() {

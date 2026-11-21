@@ -165,7 +165,7 @@ fn synth_gguf(tag: &str, sections: Option<[i32; 4]>) -> PathBuf {
 
 fn load(path: &Path, exact: bool) -> CpuSsm {
     let mut g = Gguf::open(path.to_str().unwrap()).unwrap();
-    CpuSsm::load_with(&mut g, CpuSsmOpts { exact }).unwrap()
+    CpuSsm::load_with(&mut g, CpuSsmOpts { exact, layers: None }).unwrap()
 }
 
 fn prompt(n: usize) -> Vec<u32> { (0..n).map(|i| ((i * 7 + 3) % VOCAB) as u32).collect() }
@@ -528,4 +528,71 @@ fn surya_image_and_text_prefill_runs() {
     let b = run(&text_pos3(5, n_img));
     assert!(a != b, "image coordinates must reach the rope");
     let _ = MROPE_OFF;
+}
+
+// ============================ sharding ======================================
+
+fn load_shard(path: &Path, lo: usize, hi: usize) -> CpuSsm {
+    let mut g = Gguf::open(path.to_str().unwrap()).unwrap();
+    CpuSsm::load_with(&mut g, CpuSsmOpts { exact: true, layers: Some((lo, hi)) }).unwrap()
+}
+
+/// A model cut into two shards must answer exactly what the whole one does.
+///
+/// This is the mechanism a CPU+GPU split needs, proved CPU-to-CPU where there is no device
+/// difference to hide behind: shard A embeds and runs layers `0..k`, hands over the residual
+/// stream, shard B runs `k..n` and owns the norm and the LM head. Every cut point is tried,
+/// because the layer at the boundary is the one that would be run twice or not at all, and
+/// because `(i + 1) % full_attention_interval` makes some boundaries fall on an attention layer
+/// and some on an SSM layer — the SSM ones carry recurrent state across the cut.
+///
+/// Equality is EXACT. The arithmetic and its order are identical to the whole model's; a shard
+/// only stops early. Anything less than bit-identical would mean the split changed the maths.
+#[test]
+fn a_model_split_into_shards_answers_exactly_as_the_whole_one() {
+    let path = synth_gguf("shardsplit", None);
+    let whole = load(&path, true);
+    let n = whole.n_layers();
+    assert!(n >= 2, "need at least two layers to cut between");
+    let toks = prompt(6);
+    let probe = 3u32;
+    let pos = toks.len();
+
+    whole.prefill(&toks, 0);
+    let want = whole.forward_logits(probe, pos).unwrap();
+
+    for k in 1..n {
+        let a = load_shard(&path, 0, k);
+        let b = load_shard(&path, k, n);
+        assert_eq!(a.layer_span(), (0, k));
+        assert_eq!(b.layer_span(), (k, n));
+
+        // prefill: A over the prompt, B continuing from A's residual stream
+        let rope: Vec<RopeAt> = (0..toks.len()).map(RopeAt::Scalar).collect();
+        let h = a.forward_shard(&embeds(&a, &toks), &rope, 0);
+        assert_eq!(h.len(), toks.len() * whole.hidden_dim(), "handoff is rows x d");
+        assert!(b.prefill_embeds(&toks, &h, 0, None), "shard B took the injected rows");
+
+        // one decode step through both shards
+        let hd = a.forward_shard(&a.embed_row(probe as usize), &[RopeAt::Scalar(pos)], pos);
+        let got = b.forward_embeds_logits(&hd, &[RopeAt::Scalar(pos)], pos);
+
+        assert_eq!(got.len(), want.len(), "split at {k}");
+        let worst = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0f32, f32::max);
+        assert_eq!(worst, 0.0, "split at layer {k}: logits differ by up to {worst:e}");
+    }
+}
+
+/// The point of leaving the head off every shard but the last.
+#[test]
+fn only_the_tail_shard_carries_the_lm_head() {
+    let path = synth_gguf("shardhead", None);
+    let whole = load(&path, true);
+    let n = whole.n_layers();
+    let head = load_shard(&path, 0, 1);
+    let tail = load_shard(&path, 1, n);
+    // the head shard embeds and the tail one does not; the tail norms and projects and the head
+    // one does not. Asking a non-tail shard for logits is a programming error, not a fallback.
+    assert!(head.forward_shard(&head.embed_row(1), &[RopeAt::Scalar(0)], 0).len() == whole.hidden_dim());
+    assert!(tail.forward_embeds_logits(&vec![0.0; whole.hidden_dim()], &[RopeAt::Scalar(0)], 0).len() > 1);
 }
