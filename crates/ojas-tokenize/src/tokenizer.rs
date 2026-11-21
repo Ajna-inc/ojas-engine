@@ -1,7 +1,39 @@
 //! BPE tokenizer (GPT2/Qwen/Llama/SPM families) + chat templates — one
 //! implementation shared by every embedder.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
+
+/// Merge ranks (`tokenizer.ggml.merges`), looked up without allocating: a pair whose
+/// sides are both vocabulary tokens is keyed by their ids, which is every pair in a
+/// well-formed vocabulary; the rest keep their text.
+#[derive(Default)]
+struct Merges {
+    by_id: HashMap<(usize, usize), usize>,
+    by_text: HashMap<(String, String), usize>,
+}
+
+impl Merges {
+    /// `(rank, (left, right))` pairs; a pair listed twice keeps the rank it is given last.
+    fn new<'s>(pairs: impl Iterator<Item = (usize, (&'s str, &'s str))>, vocab: &HashMap<String, usize>) -> Merges {
+        let mut m = Merges::default();
+        for (rank, (a, b)) in pairs {
+            match (vocab.get(a), vocab.get(b)) {
+                (Some(&x), Some(&y)) => { m.by_id.insert((x, y), rank); }
+                _ => { m.by_text.insert((a.to_string(), b.to_string()), rank); }
+            }
+        }
+        m
+    }
+
+    fn rank(&self, a: &str, a_id: Option<usize>, b: &str, b_id: Option<usize>) -> Option<usize> {
+        match (a_id, b_id) {
+            (Some(x), Some(y)) => self.by_id.get(&(x, y)).copied(),
+            _ if self.by_text.is_empty() => None,
+            _ => self.by_text.get(&(a.to_string(), b.to_string())).copied(),
+        }
+    }
+}
 
 // ---- byte-level tokenizer (GPT2 map) ----
 pub fn byte_maps() -> (HashMap<u8, char>, HashMap<char, u8>) {
@@ -41,7 +73,7 @@ pub fn byte_maps() -> (HashMap<u8, char>, HashMap<char, u8>) {
 pub struct Bpe {
     tokens: Vec<String>,
     vocab: HashMap<String, usize>,
-    ranks: HashMap<(String, String), usize>, // merge pair -> priority (lower = earlier)
+    ranks: Merges, // merge pair -> priority (lower = earlier)
     scores: Vec<f32>,               // SPM: per-token score (higher merges first)
     spm: bool,                      // true = SentencePiece score-BPE (model="llama", gemma3)
     g4: bool,                       // gemma-4: SPM-style BPE (▁ spaces, merge-by-rank, <0xXX> fallback)
@@ -80,15 +112,10 @@ impl Bpe {
     pub fn from_gguf(g: &ojas_formats::gguf::Gguf) -> Self {
         let tokens = g.str_arr("tokenizer.ggml.tokens").cloned().unwrap_or_default();
         let vocab: HashMap<String, usize> = tokens.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
-        let mut ranks = HashMap::new();
-        if let Some(merges) = g.str_arr("tokenizer.ggml.merges") {
-            for (rank, m) in merges.iter().enumerate() {
-                // "a b" — split on the first space (byte-encoded tokens never contain ' ').
-                if let Some(sp) = m.find(' ') {
-                    ranks.insert((m[..sp].to_string(), m[sp + 1..].to_string()), rank);
-                }
-            }
-        }
+        // "a b" — split on the first space (byte-encoded tokens never contain ' ').
+        // A line without one is skipped but keeps its rank slot.
+        let ranks = Merges::new(g.str_arr("tokenizer.ggml.merges").into_iter().flatten().enumerate()
+            .filter_map(|(rank, m)| m.split_once(' ').map(|pair| (rank, pair))), &vocab);
         // SPM (SentencePiece): tokenizer.ggml.model is "llama"/"gemma*"; uses scores not merges.
         let model = match g.meta.get("tokenizer.ggml.model") {
             Some(ojas_formats::gguf::Meta::Str(s)) => s.clone(),
@@ -207,23 +234,64 @@ impl Bpe {
     /// Rank-ordered merges over one span of characters, then `<0xXX>` byte fallback
     /// for any piece the vocabulary lacks.
     fn bpe_g4_word(&self, norm: &str, out: &mut Vec<usize>) {
-        let mut parts: Vec<String> = norm.chars().map(|c| c.to_string()).collect();
-        if parts.is_empty() { return; }
-        while parts.len() > 1 {
-            let mut best: Option<(usize, usize)> = None; // (rank, index)
-            for i in 0..parts.len() - 1 {
-                if let Some(&r) = self.ranks.get(&(parts[i].clone(), parts[i + 1].clone())) {
-                    if best.map_or(true, |(br, _)| r < br) { best = Some((r, i)); }
-                }
+        for (piece, id) in self.merge_ranked(norm) {
+            match id {
+                Some(id) => out.push(id),
+                None => for b in norm[piece].bytes() {
+                    if let Some(&id) = self.vocab.get(&format!("<0x{b:02X}>")) { out.push(id); }
+                },
             }
-            let Some((_, idx)) = best else { break };
-            let merged = format!("{}{}", parts[idx], parts[idx + 1]);
-            parts.splice(idx..idx + 2, [merged]);
         }
-        for s in &parts {
-            if let Some(&id) = self.vocab.get(s.as_str()) { out.push(id); }
-            else { for b in s.bytes() { if let Some(&id) = self.vocab.get(&format!("<0x{b:02X}>")) { out.push(id); } } }
+    }
+
+    /// Byte-pair merging by rank over the characters of `text`: repeatedly join the
+    /// adjacent pair with the lowest merge rank, the leftmost among equal ranks, until
+    /// no adjacent pair has one. Returns each final piece's byte range and vocabulary
+    /// id. A heap of candidate pairs, invalidated lazily when a neighbour merges, makes
+    /// this `O(n log n)` in the characters, against `O(n^2)` for rescanning every pair
+    /// after each merge, which is what the order is defined by.
+    fn merge_ranked(&self, text: &str) -> Vec<(std::ops::Range<usize>, Option<usize>)> {
+        const NONE: usize = usize::MAX;
+        struct Sym { start: usize, end: usize, prev: usize, next: usize, id: Option<usize>, live: bool }
+        let mut syms: Vec<Sym> = Vec::with_capacity(text.len());
+        for (i, (start, c)) in text.char_indices().enumerate() {
+            let end = start + c.len_utf8();
+            syms.push(Sym { start, end, prev: if i == 0 { NONE } else { i - 1 }, next: i + 1,
+                            id: self.vocab.get(&text[start..end]).copied(), live: true });
         }
+        let Some(last) = syms.last_mut() else { return Vec::new() };
+        last.next = NONE;
+        // (rank, left start, left index, right end): the right end tells a stale entry
+        // from a live one, since it moves whenever either side merges with another.
+        let mut heap: BinaryHeap<Reverse<(usize, usize, usize, usize)>> = BinaryHeap::new();
+        let push = |heap: &mut BinaryHeap<_>, syms: &[Sym], l: usize| {
+            let r = syms[l].next;
+            if r == NONE { return; }
+            let (a, b) = (&syms[l], &syms[r]);
+            if let Some(rank) = self.ranks.rank(&text[a.start..a.end], a.id, &text[b.start..b.end], b.id) {
+                heap.push(Reverse((rank, a.start, l, b.end)));
+            }
+        };
+        for l in 0..syms.len() { push(&mut heap, &syms, l); }
+        while let Some(Reverse((_, _, l, right_end))) = heap.pop() {
+            let r = syms[l].next;
+            if !syms[l].live || r == NONE || syms[r].end != right_end { continue; }
+            let (end, next) = (syms[r].end, syms[r].next);
+            syms[r].live = false;
+            syms[l].end = end;
+            syms[l].next = next;
+            if next != NONE { syms[next].prev = l; }
+            syms[l].id = self.vocab.get(&text[syms[l].start..end]).copied();
+            if syms[l].prev != NONE { push(&mut heap, &syms, syms[l].prev); }
+            push(&mut heap, &syms, l);
+        }
+        let mut pieces = Vec::new();
+        let mut i = 0;
+        while i != NONE {
+            pieces.push((syms[i].start..syms[i].end, syms[i].id));
+            i = syms[i].next;
+        }
+        pieces
     }
 
     /// SentencePiece: normalize spaces to ▁, then greedily merge the adjacent pair
@@ -268,25 +336,9 @@ impl Bpe {
     }
 
     fn bpe_word(&self, piece: &str, out: &mut Vec<usize>) {
-        let mut parts: Vec<String> = piece.chars().map(|c| c.to_string()).collect();
-        if parts.is_empty() { return; }
-        while parts.len() > 1 {
-            // find the adjacent pair with the lowest merge rank
-            let mut best: Option<(usize, usize)> = None; // (rank, index)
-            for i in 0..parts.len() - 1 {
-                if let Some(&r) = self.ranks.get(&(parts[i].clone(), parts[i + 1].clone())) {
-                    if best.map_or(true, |(br, _)| r < br) { best = Some((r, i)); }
-                }
-            }
-            let Some((_, idx)) = best else { break };
-            let merged = format!("{}{}", parts[idx], parts[idx + 1]);
-            parts.splice(idx..idx + 2, [merged]);
-        }
-        for p in &parts {
-            if let Some(&id) = self.vocab.get(p.as_str()) { out.push(id); }
-            // unknown piece: byte-encoded chars are always in vocab for these models,
-            // so a miss is rare; silently drop.
-        }
+        // Unknown piece: byte-encoded chars are always in vocab for these models, so a
+        // miss is rare; it is dropped.
+        out.extend(self.merge_ranked(piece).into_iter().filter_map(|(_, id)| id));
     }
 
     /// Raw bytes for one token. A multi-byte UTF-8 character is routinely split
@@ -834,7 +886,7 @@ mod pretokenize_tests {
 
 #[cfg(test)]
 mod metaspace_tests {
-    use super::{byte_maps, Bpe, PreSplit};
+    use super::{byte_maps, Bpe, Merges, PreSplit};
     use std::collections::HashMap;
 
     /// A vocabulary where the merges could join words if nothing stopped them:
@@ -842,8 +894,7 @@ mod metaspace_tests {
     fn bpe(prefix: bool, split: bool) -> Bpe {
         let tokens: Vec<String> = ["▁", "a", "b", "▁a", "▁b", "▁▁", "<0x21>"].iter().map(|s| s.to_string()).collect();
         let vocab: HashMap<String, usize> = tokens.iter().enumerate().map(|(i, t)| (t.clone(), i)).collect();
-        let ranks: HashMap<(String, String), usize> = [("▁", "▁"), ("▁", "a"), ("▁", "b")].iter().enumerate()
-            .map(|(r, (x, y))| ((x.to_string(), y.to_string()), r)).collect();
+        let ranks = Merges::new([("▁", "▁"), ("▁", "a"), ("▁", "b")].into_iter().enumerate(), &vocab);
         let (enc, dec) = byte_maps();
         Bpe {
             tokens, vocab, ranks, scores: Vec::new(), spm: false, g4: true, g4_prefix: prefix, g4_split: split,
@@ -883,6 +934,40 @@ mod metaspace_tests {
         assert_eq!(pieces(&b, " a"), ["▁a"]);
         // Unknown characters fall back to bytes.
         assert_eq!(pieces(&b, "a!"), ["▁a", "<0x21>"]);
+    }
+
+    /// The merge order by definition: rescan every adjacent pair after each merge.
+    fn rescan(b: &Bpe, text: &str) -> Vec<String> {
+        let mut parts: Vec<String> = text.chars().map(|c| c.to_string()).collect();
+        loop {
+            let best = (0..parts.len().saturating_sub(1))
+                .filter_map(|i| b.ranks.rank(&parts[i], b.vocab.get(&parts[i]).copied(),
+                                             &parts[i + 1], b.vocab.get(&parts[i + 1]).copied()).map(|r| (r, i)))
+                .min();
+            let Some((_, i)) = best else { return parts };
+            let merged = format!("{}{}", parts[i], parts[i + 1]);
+            parts.splice(i..i + 2, [merged]);
+        }
+    }
+
+    #[test]
+    fn heap_merging_matches_rescanning() {
+        // Overlapping and competing merges, including one whose sides are not tokens.
+        let tokens: Vec<String> = ["a", "b", "c", "ab", "bc", "abc", "aa", "aaa", "ca", "cab"].iter().map(|s| s.to_string()).collect();
+        let vocab: HashMap<String, usize> = tokens.iter().enumerate().map(|(i, t)| (t.clone(), i)).collect();
+        let merges = [("b", "c"), ("a", "a"), ("a", "b"), ("aa", "a"), ("ab", "c"), ("c", "a"), ("ca", "b"), ("x", "y"), ("a", "bc")];
+        let mut b = bpe(false, false);
+        b.ranks = Merges::new(merges.into_iter().enumerate(), &vocab);
+        b.vocab = vocab;
+        b.tokens = tokens;
+        let mut seed = 0x2545F4914F6CDD1Du64;
+        for _ in 0..2000 {
+            seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+            let len = (seed % 24) as usize;
+            let text: String = (0..len).map(|i| ['a', 'b', 'c', 'x', 'y', 'é'][((seed >> (i % 20 * 3)) % 6) as usize]).collect();
+            let heap: Vec<String> = b.merge_ranked(&text).into_iter().map(|(r, _)| text[r].to_string()).collect();
+            assert_eq!(heap, rescan(&b, &text), "{text:?}");
+        }
     }
 
     #[test]

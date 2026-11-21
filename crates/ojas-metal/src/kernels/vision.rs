@@ -40,6 +40,12 @@
 //! 5. `vit_merge_permute` — the 2×2 spatial reorder that runs before block 0.
 //! 6. `vit_gelu` — `act_m` with act 1, kept only for the CUDA twin's name (see the
 //!    kernel).
+//! 7. `enc_head_prep`, `enc_rms_add_m`, `enc_ple_gate_m` and `enc_pool_rows` — the
+//!    split-projection text encoder (`ojas-models/src/decoder/text_split.rs`): per-head
+//!    Q/K/V RMSNorm with the rotation and the half store for separately projected
+//!    (grouped-query) heads, a sandwich norm fused with its residual add and layer
+//!    scale, the per-layer input gate, and pooling of packed sequences into one
+//!    vector each. Metal only; they have no CUDA twins.
 //!
 //! # Constraints these kernels encode
 //!
@@ -313,5 +319,119 @@ kernel void vit_merge_permute(device const float* src [[buffer(0)]], device floa
     uint b = t >> 2, r = t & 3u, hb = pw >> 1;
     uint y = 2u*(b/hb) + (r >> 1), x = 2u*(b%hb) + (r & 1u);
     dst[gid] = src[(ulong)(y*pw + x)*(ulong)d + i];
+}
+// ---- Split-projection text encoder (Gemma-style stack over packed sequences) ----
+
+// Per-head RMSNorm, rotation and the half conversion of separately projected Q, K
+// and V, one simdgroup per (row, head slot). Slots `[0, nh)` are query heads,
+// `[nh, nh+nkv)` key heads and `[nh+nkv, nh+2*nkv)` value heads. Q is normalized
+// and rotated, in place as f32 or (flag bit 2) into `qh` as half; K is normalized,
+// rotated and stored as half; V is normalized (without a weight) and stored as half. The rotation is NEOX over the
+// whole head, pair `(j, j + hd/2)`, angle `pos * base^(-2j/hd)` with `pos` read from
+// the encoder's position table (stream 0 of row `m`, after four section sizes).
+//
+// buffers: 0 q[M,nh*hd] f32 (in/out)  1 k[M,nkv*hd] f32  2 v[M,nkv*hd] f32
+//          3 kh[M,nkv*hd] half  4 vh[M,nkv*hd] half  5 q_norm[hd]  6 k_norm[hd]  7 mpos
+//          14 qh[M,nh*hd] half (read with flag bit 2)
+// consts : 8 hd  9 nh  10 nkv  13 flags (bit 0: weighted Q/K norm, bit 1: V norm,
+//          bit 2: Q to qh)
+// float  : 11 eps  12 base
+// grid   : M*(nh + 2*nkv) threadgroups of 32 threads
+kernel void enc_head_prep(device float* q [[buffer(0)]], device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]], device half* kh [[buffer(3)]], device half* vh [[buffer(4)]],
+    device const float* qw [[buffer(5)]], device const float* kw [[buffer(6)]],
+    device const uint* mpos [[buffer(7)]],
+    constant uint& hd [[buffer(8)]], constant uint& nh [[buffer(9)]], constant uint& nkv [[buffer(10)]],
+    constant float& eps [[buffer(11)]], constant float& base [[buffer(12)]], constant uint& flags [[buffer(13)]],
+    device half* qh [[buffer(14)]],
+    uint tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint slots = nh + 2u*nkv;
+    uint m = tg / slots, s = tg % slots;
+    uint nd = hd/2u;
+    uint kind = s < nh ? 0u : (s < nh + nkv ? 1u : 2u);           // 0 Q, 1 K, 2 V
+    uint head = kind == 0u ? s : (kind == 1u ? s - nh : s - nh - nkv);
+    ulong o = kind == 0u ? (ulong)m*(ulong)(nh*hd) + (ulong)(head*hd)
+                         : (ulong)m*(ulong)(nkv*hd) + (ulong)(head*hd);
+    device const float* src = kind == 0u ? q + o : (kind == 1u ? k + o : v + o);
+    bool norm = kind == 2u ? (flags & 2u) != 0u : (flags & 1u) != 0u;
+    device const float* w = kind == 0u ? qw : kw;
+    bool weighted = kind != 2u && norm;
+    float inv = 1.0;
+    if (norm) {
+        float ss = 0.0;
+        for (uint i = lane; i < hd; i += 32u) { float x = src[i]; ss += x*x; }
+        inv = rsqrt(simd_sum(ss)/float(hd) + eps);
+    }
+    float pos = float(mpos[4u + 4u*m]);
+    for (uint j = lane; j < nd; j += 32u) {
+        float x0 = src[j]*inv, x1 = src[j + nd]*inv;
+        if (weighted) { x0 *= w[j]; x1 *= w[j + nd]; }
+        if (kind != 2u) {
+            float th = pos * (1.0/pow(base, 2.0*float(j)/float(hd)));
+            float sn = sin(th), cs = cos(th);
+            float a = x0, b = x1;  x0 = a*cs - b*sn;  x1 = a*sn + b*cs;
+        }
+        if (kind == 0u && (flags & 4u) != 0u) { qh[o + j] = half(x0); qh[o + j + nd] = half(x1); }
+        else if (kind == 0u) { q[o + j] = x0;        q[o + j + nd] = x1; }
+        else if (kind == 1u) { kh[o + j] = half(x0); kh[o + j + nd] = half(x1); }
+        else                 { vh[o + j] = half(x0); vh[o + j + nd] = half(x1); }
+    }
+}
+
+// x[r] = (x[r] + rmsnorm(t[r]) * w) * oscale over M rows: a sandwich norm on a
+// sub-block's output, its residual add, and an optional per-layer output scale.
+// buffers: 0 x[M,d] (in/out)  1 t[M,d]  2 w[d]   consts: 3 d   float: 4 eps  5 oscale
+// grid   : M threadgroups of 256 threads
+kernel void enc_rms_add_m(device float* x [[buffer(0)]], device const float* t [[buffer(1)]],
+    device const float* w [[buffer(2)]], constant uint& d [[buffer(3)]], constant float& eps [[buffer(4)]],
+    constant float& oscale [[buffer(5)]],
+    uint m [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]],
+    uint ts [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float part[32];
+    device float* xm = x + (ulong)m*(ulong)d; device const float* tm = t + (ulong)m*(ulong)d;
+    float s = 0.0;
+    for (uint i = lid; i < d; i += ts) { float v = tm[i]; s += v*v; }
+    s = simd_sum(s);
+    if (lane == 0u) { part[sg] = s; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.0;
+    for (uint j = 0u; j < ts/32u; j++) { tot += part[j]; }
+    float inv = rsqrt(tot/float(d) + eps);
+    for (uint i = lid; i < d; i += ts) { xm[i] = (xm[i] + tm[i]*inv*w[i]) * oscale; }
+}
+
+// The per-layer input gate: y[r, c] = act(y[r, c]) * ple[r*stride + off + c] for
+// c < p. `ple` holds every layer's per-layer input side by side in each row.
+// buffers: 0 y[M,p] (in/out)  1 ple[M,stride]   consts: 2 p  3 n = M*p  4 stride  5 off  6 act
+// grid   : ceil(n/256) x 256
+kernel void enc_ple_gate_m(device float* y [[buffer(0)]], device const float* ple [[buffer(1)]],
+    constant uint& p [[buffer(2)]], constant uint& n [[buffer(3)]], constant uint& stride [[buffer(4)]],
+    constant uint& off [[buffer(5)]], constant uint& act [[buffer(6)]], uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) { return; }
+    uint r = gid / p, c = gid % p;
+    y[gid] = ffn_act(y[gid], act) * ple[(ulong)r*(ulong)stride + off + c];
+}
+
+// One vector per packed sequence: sequence s owns rows [starts[s], starts[s+1]).
+// mode 0 averages them, 1 takes the first row, 2 the last.
+// buffers: 0 x[M,d]  1 starts[S+1]  2 out[S,d]   consts: 3 d  4 mode
+// grid   : S threadgroups of 256 threads
+kernel void enc_pool_rows(device const float* x [[buffer(0)]], device const uint* starts [[buffer(1)]],
+    device float* out [[buffer(2)]], constant uint& d [[buffer(3)]], constant uint& mode [[buffer(4)]],
+    uint s [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]],
+    uint ts [[threads_per_threadgroup]]) {
+    uint r0 = starts[s], r1 = starts[s + 1u];
+    for (uint i = lid; i < d; i += ts) {
+        float v;
+        if (mode == 1u)      { v = x[(ulong)r0*(ulong)d + i]; }
+        else if (mode == 2u) { v = x[(ulong)(r1 - 1u)*(ulong)d + i]; }
+        else {
+            float acc = 0.0;
+            for (uint r = r0; r < r1; r++) { acc += x[(ulong)r*(ulong)d + i]; }
+            v = acc / float(r1 - r0);
+        }
+        out[(ulong)s*(ulong)d + i] = v;
+    }
 }
 "#;

@@ -1148,6 +1148,7 @@ pub use profile::{FlashTargetTiming, FlashTraceEvent};
 mod span;
 mod spec;
 mod text_encoder;
+mod text_split;
 mod vision;
 pub(crate) use ojas_decision::SlotPrefill;
 pub(crate) use vision::VIT_PATCH_FOLD;

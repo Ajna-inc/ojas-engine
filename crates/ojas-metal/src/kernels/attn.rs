@@ -226,6 +226,55 @@ pub fn attn_mma_span_src(hd: u32) -> String {
     format!("#include <metal_stdlib>\nusing namespace metal;\n{body}")
 }
 
+/// Name of the kernel [`attn_mma_dq_span_src`] generates for head dim `hd`.
+pub fn attn_mma_dq_span_name(hd: u32) -> String { format!("attention_m_mma_dq_span_{hd}") }
+
+/// The span-masked tiled attention of [`attn_mma_span_src`] for heads up to 512 wide,
+/// generated from `attention_m_mma_dq`: Q is read as half fragments straight from
+/// device instead of being staged, since a staged 32-row tile of a 512-wide head
+/// (33 KB) would not fit in threadgroup memory. Each simdgroup holds `hd/64` 8x8
+/// output tiles per row block (eight at 512), and the score buffer that doubles as the
+/// tail-store stage grows to eight rows of `hd`.
+///
+/// Buffers as [`attn_mma_span_src`], except slot 0: `q` is half, `[rows, n_head*hd]`,
+/// and must be readable 32 rows past the last query row (its tile reads whole 8-row
+/// blocks; the extra rows are masked, so any finite values do).
+pub fn attn_mma_dq_span_src(hd: u32) -> String {
+    assert!(hd.is_multiple_of(64) && hd <= 512, "attn_mma_dq_span_src: head dim {hd} is not a multiple of 64 up to 512");
+    let s = ATTN_KERNELS;
+    let start = s.find("kernel void attention_m_mma_dq(").expect("dq kernel in source");
+    let end = start + s[start..].find("\nkernel void ").expect("kernel after dq");
+    let tiles = (hd / 64).max(4);
+    let stage = (8 * hd).max(32 * 64);
+    let mut body = s[start..end].to_string();
+    for (from, to) in [
+        ("attention_m_mma_dq(".to_string(), format!("{}(", attn_mma_dq_span_name(hd))),
+        ("constant uint& mtok [[buffer(10)]],".into(),
+         "constant uint& mtok [[buffer(10)]], device const uint4* tiles [[buffer(11)]], \
+          device const uint2* span [[buffer(12)]],".into()),
+        ("constant uint& hd [[buffer(4)]]".into(), "constant uint& hd_rt [[buffer(4)]]".into()),
+        ("const uint ts = 256u;".into(), format!("const uint ts = 256u; const uint hd = {hd}u; (void)hd_rt;")),
+        ("threadgroup float ss[32*64];".into(), format!("threadgroup float ss[{stage}];")),
+        ("simdgroup_float8x8 lo[4][4];".into(), format!("simdgroup_float8x8 lo[4][{tiles}];")),
+        ("uint q0 = qt*32u;\n    uint nq = min(32u, mtok - q0);".into(),
+         "uint4 td = tiles[qt]; uint q0 = td.x; uint nq = td.y; (void)mtok;".into()),
+        ("uint maxseq = base_pos + q0 + nq;              // longest causal row in this tile".into(),
+         "uint klo = td.z; uint maxseq = td.w; (void)base_pos;   // keys [klo, maxseq) cover every row".into()),
+        ("for (uint c0 = 0u; c0 < maxseq; c0 += C) {".into(), "for (uint c0 = klo; c0 < maxseq; c0 += C) {".into()),
+        ("uint myseq = base_pos + q0 + r + 1u;   // causal bound (valid rows only)\n            \
+          bool ok0 = (r < nq) && (c0 + lane < myseq);\n            \
+          bool ok1 = (r < nq) && (c0 + lane + 32u < myseq);".into(),
+         "uint2 rsp = span[q0 + min(r, nq - 1u)];   // this row's keys [rsp.x, rsp.y)\n            \
+          bool ok0 = (r < nq) && (c0 + lane >= rsp.x) && (c0 + lane < rsp.y);\n            \
+          bool ok1 = (r < nq) && (c0 + lane + 32u >= rsp.x) && (c0 + lane + 32u < rsp.y);".into()),
+    ] {
+        assert!(body.contains(from.as_str()), "attention_m_mma_dq changed shape; the span rewrite of `{from}` is stale");
+        body = body.replacen(from.as_str(), &to, 1);
+    }
+    assert!(!body.contains("base_pos + q0"), "a causal bound survived the span rewrite");
+    format!("#include <metal_stdlib>\nusing namespace metal;\n{body}")
+}
+
 pub const ATTN_KERNELS: &str = r#"
 #include <metal_stdlib>
 using namespace metal;

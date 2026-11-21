@@ -221,8 +221,23 @@ impl VisionConfig {
 
 /// Every tensor the GPU reads for a text encoder, in upload order.
 fn text_encoder_tensors(te: &TextEncoderConfig, g: &Gguf) -> Vec<String> {
-    let mut names: Vec<String> = vec!["token_embd.weight".into(), "token_embd_norm.weight".into(),
-                                      "output_norm.weight".into()];
+    let mut names: Vec<String> = te.dense.iter().map(|m| m.tensor.clone()).collect();
+    if let ojas_arch::text_encoder::Layout::Split(sp) = &te.layout {
+        names.extend(["token_embd.weight".to_string(), "output_norm.weight".into()]);
+        if sp.ple_width.is_some() {
+            names.extend(["per_layer_model_proj.weight".to_string(), "per_layer_proj_norm.weight".into()]);
+        }
+        for i in 0..te.layers {
+            let mut parts = vec!["attn_norm", "attn_q", "attn_k", "attn_v", "attn_output", "ffn_norm",
+                                 "ffn_gate", "ffn_up", "ffn_down"];
+            if sp.qk_norm { parts.extend(["attn_q_norm", "attn_k_norm"]); }
+            if sp.sandwich { parts.extend(["post_attention_norm", "post_ffw_norm"]); }
+            if sp.ple_width.is_some() { parts.extend(["inp_gate", "proj", "post_norm"]); }
+            names.extend(parts.into_iter().map(|t| format!("blk.{i}.{t}.weight")));
+        }
+        return names;
+    }
+    names.extend(["token_embd.weight".to_string(), "token_embd_norm.weight".into(), "output_norm.weight".into()]);
     for i in 0..te.layers {
         if g.tensors.contains_key(&format!("blk.{i}.attn_norm.weight")) {
             names.push(format!("blk.{i}.attn_norm.weight"));
@@ -590,8 +605,11 @@ impl<'a> DecoderGpu<'a> {
         let vision: Option<VisionConfig> = if has_vision { Some(VisionConfig::from_gguf(g)?) } else { None };
         // Text encoder: LayerNorm and the QKV preparation (split, rotation, half K/V)
         // come from the same encoder family as the ViT tower.
+        // A file that declares non-causal attention is an encoder, whatever its block
+        // layout; ModernBERT files predate the key in some conversions.
+        let non_causal = g.meta_bool(&format!("{arch}.attention.causal")) == Some(false);
         let text_encoder: Option<TextEncoderConfig> =
-            if arch == "modern-bert" { Some(TextEncoderConfig::from_gguf(g)?) } else { None };
+            if arch == "modern-bert" || non_causal { Some(TextEncoderConfig::from_gguf(g)?) } else { None };
         if text_encoder.is_some() && !has_vision { fams.push("vision"); }
         if let Some(v) = &vision {
             tracing::info!(target: "vision", "vit d={} L={} heads={} hd={} ffn={} patch={} c={} \
@@ -657,11 +675,22 @@ impl<'a> DecoderGpu<'a> {
         if let Some(te) = &text_encoder {
             let name = ojas_metal::kernels::attn::ATTN_BIDIR_SPAN;
             p.insert(name.to_string(), gpu.pipeline(&ojas_metal::kernels::attn::attn_bidir_span_src(), name)?);
-            // The tiled twin needs simdgroup matrices; without them the text encoder
-            // runs the per-query kernel above.
+            // The tiled twins need simdgroup matrices; without them the encoder runs the
+            // per-query kernel above. The fused layout stages Q in threadgroup memory
+            // (heads up to 256 wide); the split layout writes Q as half and reads it
+            // from device, which holds heads up to 512 wide.
             if gpu.native_reduce {
-                let name = ojas_metal::kernels::attn::attn_mma_span_name(te.hd);
-                p.insert(name.clone(), gpu.pipeline(&ojas_metal::kernels::attn::attn_mma_span_src(te.hd), &name)?);
+                use ojas_metal::kernels::attn::{attn_mma_dq_span_name, attn_mma_dq_span_src, attn_mma_span_name, attn_mma_span_src};
+                let split = matches!(te.layout, ojas_arch::text_encoder::Layout::Split(_));
+                for hd in te.head_dims() {
+                    if split && hd % 64 == 0 && hd <= 512 {
+                        let name = attn_mma_dq_span_name(hd);
+                        p.insert(name.clone(), gpu.pipeline(&attn_mma_dq_span_src(hd), &name)?);
+                    } else if !split && hd <= 256 {
+                        let name = attn_mma_span_name(hd);
+                        p.insert(name.clone(), gpu.pipeline(&attn_mma_span_src(hd), &name)?);
+                    }
+                }
             }
         }
 

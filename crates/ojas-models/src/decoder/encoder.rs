@@ -102,6 +102,16 @@ pub(crate) struct Block {
     pub(crate) rope: Option<Rope>,
 }
 
+/// Head geometry of one attention call: `n_head` query heads of width `hd` over
+/// `n_kv` K/V heads (grouped-query when fewer), logits multiplied by `scale`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Heads {
+    pub(crate) n_head: usize,
+    pub(crate) n_kv: usize,
+    pub(crate) hd: usize,
+    pub(crate) scale: f32,
+}
+
 /// Shape shared by every block of one stack.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Geom {
@@ -237,17 +247,49 @@ impl<'a> DecoderGpu<'a> {
     /// Bidirectional attention of `s.q` over `s.kh`/`s.vh` into `s.h`.
     pub(crate) fn encode_attention(&self, enc: &metal::ComputeCommandEncoderRef, g: &Geom, s: &Scratch,
                                    keys: Keys, m: usize) {
-        let (d, nh, hd) = (g.d as u32, g.n_head as u32, g.hd as u32);
+        let heads = Heads { n_head: g.n_head, n_kv: g.n_head, hd: g.hd, scale: 1.0 / (g.hd as f32).sqrt() };
+        self.encode_attention_heads(enc, heads, s.q, s.kh, s.vh, s.h, keys, m);
+    }
+
+    /// The span-tiled attention of half `qh` (`[m + 32, n_head*hd]`) over `kh`/`vh`
+    /// into `out`, with `attn_mma_dq_span_src`'s kernel for heads up to 512 wide.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_attention_dq_span(&self, enc: &metal::ComputeCommandEncoderRef, h: Heads,
+                                           qh: &metal::Buffer, kh: &metal::Buffer, vh: &metal::Buffer,
+                                           out: &metal::Buffer, span: &metal::Buffer, tiles: &metal::Buffer,
+                                           n_tiles: u32, m: usize) {
+        let (nh, hd) = (h.n_head as u32, h.hd as u32);
+        let (kvdim, group) = ((h.n_kv * h.hd) as u32, (h.n_head / h.n_kv) as u32);
+        enc.set_compute_pipeline_state(&self.p[&ojas_metal::kernels::attn::attn_mma_dq_span_name(hd)]);
+        for (i, b) in [(0u64, qh), (1, kh), (2, vh), (3, out), (11, tiles), (12, span)] {
+            enc.set_buffer(i, Some(b), 0);
+        }
+        for (i, val) in [(4u64, hd), (5, kvdim), (6, 0u32), (7, group), (9, nh), (10, m as u32)] {
+            enc.set_bytes(i, 4, &val as *const u32 as *const c_void);
+        }
+        enc.set_bytes(8, 4, &h.scale as *const f32 as *const c_void);
+        enc.dispatch_thread_groups(MTLSize::new(nh as u64, n_tiles as u64, 1), MTLSize::new(256, 1, 1));
+    }
+
+    /// Bidirectional attention of `q` (`[m, n_head*hd]`, f32) over `kh`/`vh`
+    /// (`[m, n_kv*hd]`, half) into `out` (`[m, n_head*hd]`). Query head `h` reads K/V
+    /// head `h / (n_head / n_kv)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_attention_heads(&self, enc: &metal::ComputeCommandEncoderRef, h: Heads,
+                                         q: &metal::Buffer, kh: &metal::Buffer, vh: &metal::Buffer,
+                                         out: &metal::Buffer, keys: Keys, m: usize) {
+        let (nh, hd) = (h.n_head as u32, h.hd as u32);
+        let (kvdim, group) = ((h.n_kv * h.hd) as u32, (h.n_head / h.n_kv) as u32);
         let m32 = m as u32;
-        let scale = 1.0 / (hd as f32).sqrt();
+        let scale = h.scale;
         match keys {
             Keys::All { mma: true } => {
                 enc.set_compute_pipeline_state(&self.p[&format!("attention_m_mma_bidir_{hd}")]);
-                enc.set_buffer(0, Some(s.q), 0);
-                enc.set_buffer(1, Some(s.kh), 0);
-                enc.set_buffer(2, Some(s.vh), 0);
-                enc.set_buffer(3, Some(s.h), 0);
-                for (i, val) in [(4u32, hd), (5, d), (6, m32), (7, 1u32), (9, nh), (10, m32)] {
+                enc.set_buffer(0, Some(q), 0);
+                enc.set_buffer(1, Some(kh), 0);
+                enc.set_buffer(2, Some(vh), 0);
+                enc.set_buffer(3, Some(out), 0);
+                for (i, val) in [(4u32, hd), (5, kvdim), (6, m32), (7, group), (9, nh), (10, m32)] {
                     enc.set_bytes(i as u64, 4, &val as *const u32 as *const c_void);
                 }
                 enc.set_bytes(8, 4, &scale as *const f32 as *const c_void);
@@ -255,15 +297,15 @@ impl<'a> DecoderGpu<'a> {
                                            MTLSize::new(256, 1, 1));
             }
             Keys::All { mma: false } => {
-                self.enc_reduce(enc, "attention_m_bidir", &[(s.q, 0), (s.kh, 1), (s.vh, 2), (s.h, 3)],
-                    &[(4, hd), (5, d), (6, m32), (7, 1), (9, nh)], &[(8, scale)], (m32 * nh) as u64, 256);
+                self.enc_reduce(enc, "attention_m_bidir", &[(q, 0), (kh, 1), (vh, 2), (out, 3)],
+                    &[(4, hd), (5, kvdim), (6, m32), (7, group), (9, nh)], &[(8, scale)], (m32 * nh) as u64, 256);
             }
             Keys::Spans { span, tiles: Some((tiles, n_tiles)) } => {
                 enc.set_compute_pipeline_state(&self.p[&ojas_metal::kernels::attn::attn_mma_span_name(hd)]);
-                for (i, b) in [(0u64, s.q), (1, s.kh), (2, s.vh), (3, s.h), (11, tiles), (12, span)] {
+                for (i, b) in [(0u64, q), (1, kh), (2, vh), (3, out), (11, tiles), (12, span)] {
                     enc.set_buffer(i, Some(b), 0);
                 }
-                for (i, val) in [(4u64, hd), (5, d), (6, 0u32), (7, 1u32), (9, nh), (10, m32)] {
+                for (i, val) in [(4u64, hd), (5, kvdim), (6, 0u32), (7, group), (9, nh), (10, m32)] {
                     enc.set_bytes(i, 4, &val as *const u32 as *const c_void);
                 }
                 enc.set_bytes(8, 4, &scale as *const f32 as *const c_void);
@@ -271,8 +313,8 @@ impl<'a> DecoderGpu<'a> {
             }
             Keys::Spans { span, tiles: None } => {
                 self.enc_reduce(enc, ojas_metal::kernels::attn::ATTN_BIDIR_SPAN,
-                    &[(s.q, 0), (s.kh, 1), (s.vh, 2), (s.h, 3), (span, 10)],
-                    &[(4, hd), (5, d), (6, m32), (7, 1), (9, nh)], &[(8, scale)], (m32 * nh) as u64, 256);
+                    &[(q, 0), (kh, 1), (vh, 2), (out, 3), (span, 10)],
+                    &[(4, hd), (5, kvdim), (6, m32), (7, group), (9, nh)], &[(8, scale)], (m32 * nh) as u64, 256);
             }
         }
     }

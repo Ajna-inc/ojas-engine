@@ -462,3 +462,91 @@ fn streaming_bidir_matches_f64_reference_for_any_head_width() {
         assert!(worst < 1e-4, "hd={hd}: worst absolute error {worst:.3e}");
     }
 }
+
+/// The wide-head span kernel (`attn_mma_dq_span_src`) on packed sequences with
+/// grouped-query heads: 512-wide heads, four query heads over one K/V head, the shape
+/// of a Gemma-4 style global layer, and 256-wide heads over two K/V heads with a
+/// window. Q is half, with 32 rows of slack past the last row, as the kernel requires.
+/// Same f64 oracle as `bidir_span_matches_per_sequence_oracle`, with K/V head
+/// `h / group`.
+#[test]
+fn dq_span_matches_per_sequence_oracle_for_wide_grouped_heads() {
+    let gpu = match MetalGpu::new() {
+        Ok(g) => g,
+        Err(e) => { eprintln!("attn_bidir: no Metal device ({e}); skipping"); return; }
+    };
+    if !gpu.native_reduce { return; }
+    let lens = [115usize, 1, 33, 200, 129, 64, 31, 32];
+    let total: usize = lens.iter().sum();
+    for (hd, nh, group, window) in [(512usize, 4usize, 4usize, None), (512, 4, 4, Some(64usize)), (256, 4, 2, Some(64))] {
+        let kvdim = (nh / group) * hd;
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let mut seed = 0xD05Eu32 ^ hd as u32 ^ window.unwrap_or(0) as u32;
+        let q: Vec<f32> = (0..(total + 32) * nh * hd).map(|_| lcg(&mut seed) * QAMP).collect();
+        let kv = |seed: &mut u32, amp: f32| -> Vec<f32> {
+            (0..(total + KV_PAD) * kvdim).map(|i| if i < total * kvdim { lcg(seed) * amp } else { 0.0 }).collect()
+        };
+        let (k, v) = (kv(&mut seed, KAMP), kv(&mut seed, VAMP));
+        let round = |x: &[f32]| -> Vec<f64> { x.iter().map(|&a| half::f16::from_f32(a).to_f64()).collect() };
+        let (qr, kr, vr) = (round(&q), round(&k), round(&v));
+        let mut spans: Vec<[u32; 2]> = Vec::with_capacity(total);
+        let mut tiles: Vec<u32> = Vec::new();
+        let mut start = 0usize;
+        for &len in &lens {
+            for i in start..start + len {
+                let (lo, hi) = match window {
+                    None => (start, start + len),
+                    Some(w) => (i.saturating_sub(w).max(start), (i + w + 1).min(start + len)),
+                };
+                spans.push([lo as u32, hi as u32]);
+            }
+            for q0 in (start..start + len).step_by(32) {
+                let nq = 32.min(start + len - q0);
+                tiles.extend_from_slice(&[q0 as u32, nq as u32, spans[q0][0], spans[q0 + nq - 1][1]]);
+            }
+            start += len;
+        }
+        let mut want = vec![0f32; total * nh * hd];
+        for (i, &[lo, hi]) in spans.iter().enumerate() {
+            for h in 0..nh {
+                let qi = &qr[(i * nh + h) * hd..(i * nh + h + 1) * hd];
+                let kvh = h / group;
+                let logits: Vec<f64> = (lo as usize..hi as usize).map(|j| {
+                    let kj = &kr[j * kvdim + kvh * hd..j * kvdim + (kvh + 1) * hd];
+                    qi.iter().zip(kj).map(|(a, b)| a * b).sum::<f64>() * scale as f64
+                }).collect();
+                let mx = logits.iter().cloned().fold(f64::MIN, f64::max);
+                let w: Vec<f64> = logits.iter().map(|&l| (l - mx).exp()).collect();
+                let z: f64 = w.iter().sum();
+                for c in 0..hd {
+                    let acc: f64 = (lo as usize..hi as usize).zip(&w).map(|(j, &p)| p * vr[j * kvdim + kvh * hd + c]).sum();
+                    want[(i * nh + h) * hd + c] = (acc / z) as f32;
+                }
+            }
+        }
+        let name = ojas_metal::kernels::attn::attn_mma_dq_span_name(hd as u32);
+        let pipe = gpu.pipeline(&ojas_metal::kernels::attn::attn_mma_dq_span_src(hd as u32), &name).expect("dq span pipeline");
+        let up_u32 = |v: &[u32]| gpu.device.new_buffer_with_data(v.as_ptr() as *const c_void, (v.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared);
+        let (tb, sb) = (up_u32(&tiles), up_u32(&spans.iter().flatten().copied().collect::<Vec<u32>>()));
+        let n = total * nh * hd;
+        let ob = upload_f32(&gpu, &vec![GUARD_FILL; GUARD * 2 + n]);
+        let (qb, kb, vb) = (upload_f16(&gpu, &q), upload_f16(&gpu, &k), upload_f16(&gpu, &v));
+        let cb = gpu.command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe);
+        for (i, b) in [(0u64, &qb), (1, &kb), (2, &vb), (11, &tb), (12, &sb)] { enc.set_buffer(i, Some(b), 0); }
+        enc.set_buffer(3, Some(&ob), (GUARD * 4) as u64);
+        for (i, x) in [(4u64, hd as u32), (5, kvdim as u32), (6, 0), (7, group as u32), (9, nh as u32), (10, total as u32)] {
+            enc.set_bytes(i, 4, &x as *const u32 as *const c_void);
+        }
+        enc.set_bytes(8, 4, &scale as *const f32 as *const c_void);
+        enc.dispatch_thread_groups(MTLSize::new(nh as u64, (tiles.len() / 4) as u64, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let label = format!("{name} nh={nh} group={group} window={window:?}");
+        compare(&label, &want, &host(&ob, GUARD + n)[GUARD..], total * nh, hd);
+        assert_guards(&label, &ob, n);
+    }
+}

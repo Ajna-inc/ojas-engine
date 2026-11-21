@@ -1,8 +1,13 @@
-//! The ModernBERT text encoder and a decision head read at marker tokens, on Metal.
+//! Bidirectional text encoders and a decision head read at marker tokens, on Metal.
 //!
 //! A request is a batch of independent token sequences packed into one row buffer
-//! with no padding between them. Every block is the shared encoder block
-//! (`encoder.rs`); what is specific to this model is expressed as data:
+//! with no padding between them; one command buffer runs the whole stack over every
+//! sequence. This file holds that request machinery (packing, key spans, positions,
+//! pooling) and the fused (ModernBERT) layout; the split layout (separate Q/K/V
+//! projections, RMSNorm, per-layer inputs) runs in `text_split.rs` over the same rows.
+//!
+//! Every fused block is the shared encoder block (`encoder.rs`); what is specific to
+//! the model is expressed as data:
 //!
 //! * per-row key spans restrict attention to the row's own sequence, and on the
 //!   sliding-window layers to `|i - j| <= window` inside it;
@@ -21,7 +26,8 @@
 
 use super::encoder::{Act, Block, Geom, Keys, Mlp, Norm, Rope, Scratch};
 use super::*;
-use anyhow::{ensure, Result};
+use anyhow::{bail, ensure, Result};
+use ojas_arch::text_encoder::{Layout, Pooling};
 use objc::{msg_send, sel, sel_impl};
 
 pub use ojas_decision::MarkerHeadOut;
@@ -32,32 +38,50 @@ pub use ojas_decision::MarkerHeadOut;
 pub(crate) struct TextBuffers {
     /// Rows every buffer holds (a multiple of 32).
     cap: usize,
-    x: metal::Buffer,
-    h: metal::Buffer,
+    pub(crate) x: metal::Buffer,
+    pub(crate) h: metal::Buffer,
     qkv: metal::Buffer,
-    q: metal::Buffer,
-    kh: metal::Buffer,
-    vh: metal::Buffer,
-    ffn: metal::Buffer,
+    pub(crate) q: metal::Buffer,
+    pub(crate) kh: metal::Buffer,
+    pub(crate) vh: metal::Buffer,
+    pub(crate) ffn: metal::Buffer,
     ffn_wide: metal::Buffer,
-    pos: metal::Buffer,
+    pub(crate) pos: metal::Buffer,
     span_global: metal::Buffer,
     span_local: metal::Buffer,
     /// MMA query-tile descriptors for the global and local spans and how many the
     /// current request uses; `None` where the tiled kernel is not available.
     tiles_global: Option<metal::Buffer>,
     tiles_local: Option<metal::Buffer>,
-    n_tiles: u32,
+    pub(crate) n_tiles: u32,
     tokens: metal::Buffer,
     /// Rows the marker head's last block keeps (`int`), in compact order.
     keep: metal::Buffer,
+    /// First row of each sequence, then the total row count (`uint`, one more than the
+    /// sequence count).
+    starts: metal::Buffer,
+    /// Pooled vectors and the dense maps after them, ping-ponged (`[rows, widest]`).
+    pooled: [metal::Buffer; 2],
+    /// The split layout's working rows; `None` for the fused layout.
+    pub(crate) split: Option<super::text_split::SplitRows>,
 }
 
 impl TextBuffers {
     /// The key spans for a global (`local == false`) or sliding-window layer.
     fn keys(&self, local: bool) -> Keys<'_> {
+        self.keys_tiled(local, true)
+    }
+
+    /// The key spans of a global or sliding-window layer and their tile descriptors.
+    pub(crate) fn span_and_tiles(&self, local: bool) -> (&metal::Buffer, Option<&metal::Buffer>) {
+        if local { (&self.span_local, self.tiles_local.as_ref()) } else { (&self.span_global, self.tiles_global.as_ref()) }
+    }
+
+    /// As [`TextBuffers::keys`], with the tiled kernel only when `tiled` (the caller
+    /// has the pipeline for the layer's head width).
+    pub(crate) fn keys_tiled(&self, local: bool, tiled: bool) -> Keys<'_> {
         let (span, tiles) = if local { (&self.span_local, &self.tiles_local) } else { (&self.span_global, &self.tiles_global) };
-        Keys::Spans { span, tiles: tiles.as_ref().map(|b| (b, self.n_tiles)) }
+        Keys::Spans { span, tiles: tiles.as_ref().filter(|_| tiled).map(|b| (b, self.n_tiles)) }
     }
 
     fn scratch(&self) -> Scratch<'_> {
@@ -110,7 +134,7 @@ impl<'a> DecoderGpu<'a> {
         let te = self.text_config()?;
         let d = te.d as usize;
         let b = self.text_buffers(te, seqs)?;
-        let gpu_s = self.run_text(te, &b, seqs, |_, _| Ok(()))?;
+        let gpu_s = self.run_encoder(te, &b, seqs, |_, _| Ok(()))?;
         self.gpu_s.set(self.gpu_s.get() + gpu_s);
         let mut out = Vec::with_capacity(seqs.len());
         let mut start = 0usize;
@@ -123,12 +147,47 @@ impl<'a> DecoderGpu<'a> {
         Ok(out)
     }
 
+    /// Width of the vectors [`DecoderGpu::embed_text`] returns.
+    pub fn text_embedding_width(&self) -> Option<usize> {
+        self.arch.text_encoder.as_ref().map(|t| t.output_width() as usize)
+    }
+
+    /// One vector per sequence: the final hidden states pooled as the file declares
+    /// (`pooling_type`: mean over every token, the first or the last), then through its
+    /// dense maps, all in the same pass on the GPU. Not normalized; a sentence
+    /// embedding is this divided by its length.
+    pub fn embed_text(&self, seqs: &[Vec<u32>]) -> Result<Vec<Vec<f32>>> {
+        let te = self.text_config()?;
+        let mode = match te.pooling {
+            Pooling::Mean => 0u32,
+            Pooling::Cls => 1,
+            Pooling::Last => 2,
+            Pooling::None => bail!("this encoder declares no pooling (pooling_type); use encode_text"),
+        };
+        let b = self.text_buffers(te, seqs)?;
+        let n = seqs.len() as u32;
+        let mut cur = 0usize;
+        let gpu_s = self.run_encoder(te, &b, seqs, |enc, _| {
+            self.enc_reduce(enc, "enc_pool_rows", &[(&b.x, 0), (&b.starts, 1), (&b.pooled[0], 2)],
+                &[(3, te.d), (4, mode)], &[], n as u64, 256);
+            for map in &te.dense {
+                self.projm(enc, &b.pooled[cur], 0, &map.tensor, &b.pooled[1 - cur], map.n_in, map.n_out, n, false);
+                cur = 1 - cur;
+            }
+            Ok(())
+        })?;
+        self.gpu_s.set(self.gpu_s.get() + gpu_s);
+        let w = te.output_width() as usize;
+        Ok((0..seqs.len()).map(|i| row(&b.pooled[cur], i, w)).collect())
+    }
+
     /// The encoder, then the marker head, over `seqs`. `qtypes[i]` selects the row of
     /// `token_types` added to sequence `i`; `markers[i]` lists the positions in
     /// sequence `i` whose scorer hidden vector is returned.
     pub fn marker_head_forward(&self, seqs: &[Vec<u32>], qtypes: &[u32], markers: &[Vec<usize>]) -> Result<MarkerHeadOut> {
         let te = self.text_config()?;
         let head = te.marker_head.as_ref().ok_or_else(|| anyhow::anyhow!("this text encoder has no marker head"))?;
+        ensure!(matches!(te.layout, Layout::Fused), "a marker head runs on the fused layout only");
         ensure!(qtypes.len() == seqs.len() && markers.len() == seqs.len(),
             "marker_head_forward: {} sequences, {} question types, {} marker lists", seqs.len(), qtypes.len(), markers.len());
         let n_types = self.wt.wshape.get("token_types.weight").map(|&(_, n)| n).unwrap_or(0);
@@ -168,6 +227,7 @@ impl<'a> DecoderGpu<'a> {
     /// pass's compute floor, then the marker head's cost measured against a whole pass.
     pub fn profile_text(&self, seqs: &[Vec<u32>]) -> Result<Vec<(String, f64)>> {
         let te = self.text_config()?;
+        ensure!(matches!(te.layout, Layout::Fused), "profile_text covers the fused layout");
         let b = self.text_buffers(te, seqs)?;
         let m: usize = seqs.iter().map(Vec::len).sum();
         let (d, ffn, m32, nl) = (te.d, te.ffn, m as u32, te.layers as usize);
@@ -277,6 +337,8 @@ impl<'a> DecoderGpu<'a> {
             }
             start = end;
         }
+        let starts: Vec<u32> = std::iter::once(0).chain(seqs.iter().scan(0u32, |at, s| { *at += s.len() as u32; Some(*at) })).collect();
+        write_u32(&b.starts, &starts);
         write_u32(&b.pos, &pos);
         write_u32(&b.span_global, &global);
         write_u32(&b.span_local, &local);
@@ -307,24 +369,52 @@ impl<'a> DecoderGpu<'a> {
 
     fn alloc_text_buffers(&self, te: &TextEncoderConfig, cap: usize) -> TextBuffers {
         let d = te.d as usize;
-        let ffn = te.marker_head.as_ref().map_or(te.ffn, |h| h.ffn.max(te.ffn)).max(te.d) as usize;
-        let mma = self.p.contains_key(&ojas_metal::kernels::attn::attn_mma_span_name(te.hd));
         let gpu = self.gpu;
+        let mma = te.head_dims().iter().any(|&hd| self.p.contains_key(&ojas_metal::kernels::attn::attn_mma_span_name(hd))
+            || self.p.contains_key(&ojas_metal::kernels::attn::attn_mma_dq_span_name(hd)));
         // Tiles: at most one per 32 rows of each sequence, so cap/32 + one per sequence.
         let max_tiles = cap / 32 + cap;
+        let widest = te.dense.iter().map(|m| m.n_out as usize).chain([d]).max().unwrap_or(d);
+        // Per-row widths: Q (and the attention output), K/V, and the MLP. The split
+        // layout keeps K and V in their own rows (`SplitRows`), so its fused-QKV and
+        // gated-MLP staging rows are never read and stay one element.
+        let (q_w, kv_w, ffn_w, qkv_w, wide_w, split) = match &te.layout {
+            Layout::Fused => {
+                let ffn = te.marker_head.as_ref().map_or(te.ffn, |h| h.ffn.max(te.ffn)).max(te.d) as usize;
+                (d, d, ffn, 3 * d, 2 * te.ffn as usize, None)
+            }
+            Layout::Split(sp) => {
+                let q_w = sp.layers.iter().map(|l| (te.n_head * l.hd) as usize).max().unwrap_or(d);
+                let kv_w = sp.layers.iter().map(|l| (l.n_kv * l.hd) as usize).max().unwrap_or(d);
+                let rows = super::text_split::SplitRows::alloc(gpu, te, sp, cap, q_w, kv_w);
+                (q_w, kv_w, te.ffn as usize, 0, 0, Some(rows))
+            }
+        };
+        let rows_of = |w: usize| buf(gpu, (cap * w).max(1));
         TextBuffers {
             cap,
-            x: buf(gpu, cap * d), h: buf(gpu, cap * d), qkv: buf(gpu, cap * 3 * d),
-            q: buf(gpu, cap * d),
+            x: buf(gpu, cap * d), h: buf(gpu, cap * d), qkv: rows_of(qkv_w),
+            q: buf(gpu, cap * q_w),
             // Zeroed with 64 spare rows: the tiled attention reads 8-row K/V blocks past
             // a tile's key range and masks them, which needs finite values there. Rows
             // a later, shorter request leaves behind hold finite K/V, which is as good.
-            kh: buf_zeroed(gpu, ((cap + 64) * d).div_ceil(2)), vh: buf_zeroed(gpu, ((cap + 64) * d).div_ceil(2)),
-            ffn: buf(gpu, cap * ffn), ffn_wide: buf(gpu, cap * 2 * te.ffn as usize),
+            kh: buf_zeroed(gpu, ((cap + 64) * kv_w).div_ceil(2)), vh: buf_zeroed(gpu, ((cap + 64) * kv_w).div_ceil(2)),
+            ffn: buf(gpu, cap * ffn_w), ffn_wide: rows_of(wide_w),
             pos: buf(gpu, 4 + 4 * cap), span_global: buf(gpu, 2 * cap), span_local: buf(gpu, 2 * cap),
-            tokens: buf(gpu, cap), keep: buf(gpu, cap),
+            tokens: buf(gpu, cap), keep: buf(gpu, cap), starts: buf(gpu, cap + 1),
+            pooled: [buf(gpu, cap * widest), buf(gpu, cap * widest)],
             tiles_global: mma.then(|| buf(gpu, 4 * max_tiles)), tiles_local: mma.then(|| buf(gpu, 4 * max_tiles)),
-            n_tiles: 0,
+            n_tiles: 0, split,
+        }
+    }
+
+    /// The whole stack over `seqs` for either layout, then `tail`; see
+    /// [`DecoderGpu::run_text`].
+    fn run_encoder(&self, te: &TextEncoderConfig, b: &TextBuffers, seqs: &[Vec<u32>],
+                   tail: impl FnOnce(&metal::ComputeCommandEncoderRef, usize) -> Result<()>) -> Result<f64> {
+        match &te.layout {
+            Layout::Fused => self.run_text(te, b, seqs, tail),
+            Layout::Split(sp) => self.run_split(te, sp, b, seqs, tail),
         }
     }
 
@@ -339,16 +429,7 @@ impl<'a> DecoderGpu<'a> {
         let cb = self.gpu.command_buffer();
         let enc = cb.new_compute_command_encoder();
 
-        let emb = "token_embd.weight";
-        match self.wt.repr(emb) {
-            Repr::F16 => self.enc_reduce(enc, "embed_m_f16",
-                &[(&self.wt.w16[emb], 0), (&b.x, 1), (&b.tokens, 3)],
-                &[(2, d), (5, m32)], &[], (m32 * d).div_ceil(64) as u64, 64),
-            Repr::Q8 => self.enc_reduce(enc, "embed_m_q8",
-                &[(&self.wt.w8[emb], 0), (&b.x, 1), (&b.tokens, 3), (&self.wt.scale8[emb], 4)],
-                &[(2, d), (5, m32)], &[], (m32 * d).div_ceil(64) as u64, 64),
-            r => anyhow::bail!("{emb} resolved to {r:?}; the text encoder embeds from f16 or q8 only"),
-        }
+        self.encode_text_embed(enc, b, d, m32)?;
         let no_bias = |w: String| Norm { weight: w, bias: None };
         self.enc_layernorm(enc, &b.x, &b.x, &no_bias("token_embd_norm.weight".into()), d, te.eps, m32);
 
@@ -375,6 +456,22 @@ impl<'a> DecoderGpu<'a> {
         ojas_metal::commit_and_wait_checked(cb, "text encode").map_err(|e| anyhow::anyhow!("text encode: {e}"))?;
         let (gs, ge): (f64, f64) = unsafe { (msg_send![cb, GPUStartTime], msg_send![cb, GPUEndTime]) };
         Ok((ge - gs).max(0.0))
+    }
+
+    /// Gather the token embeddings of the request's `m` rows into `b.x`.
+    pub(crate) fn encode_text_embed(&self, enc: &metal::ComputeCommandEncoderRef, b: &TextBuffers,
+                                    d: u32, m32: u32) -> Result<()> {
+        let emb = "token_embd.weight";
+        match self.wt.repr(emb) {
+            Repr::F16 => self.enc_reduce(enc, "embed_m_f16",
+                &[(&self.wt.w16[emb], 0), (&b.x, 1), (&b.tokens, 3)],
+                &[(2, d), (5, m32)], &[], (m32 * d).div_ceil(64) as u64, 64),
+            Repr::Q8 => self.enc_reduce(enc, "embed_m_q8",
+                &[(&self.wt.w8[emb], 0), (&b.x, 1), (&b.tokens, 3), (&self.wt.scale8[emb], 4)],
+                &[(2, d), (5, m32)], &[], (m32 * d).div_ceil(64) as u64, 64),
+            r => anyhow::bail!("{emb} resolved to {r:?}; the text encoder embeds from f16 or q8 only"),
+        }
+        Ok(())
     }
 
     /// The marker head on the encoder output in `b.x`: the question-type embedding, the

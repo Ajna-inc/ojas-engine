@@ -131,10 +131,12 @@ extern "C" {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ojas_arch::text_encoder::{Layout, Pooling};
 
     fn spec() -> TextEncoderSpec {
         TextEncoderSpec { d: 1024, layers: 28, n_head: 16, hd: 64, ffn: 2624, eps: 1e-5, rope_base: 160000.0, rope_base_local: 10000.0,
-                          window: 64, swa_pattern: 3, max_positions: 8192, marker_head: None }
+                          window: 64, swa_pattern: 3, max_positions: 8192, marker_head: None,
+                          pooling: Pooling::None, dense: Vec::new(), layout: Layout::Fused }
     }
 
     #[test]
