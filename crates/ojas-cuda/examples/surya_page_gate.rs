@@ -334,7 +334,7 @@ fn main() -> Result<()> {
     cuda.attach_vit_gguf(&mut Gguf::open(mmproj.to_str().unwrap())?)?;
     let cpu = if a.cpu_max > 0 && a.cpu_from.is_none() {
         let mut g = Gguf::open(model.to_str().unwrap())?;
-        let mut c = CpuSsm::load_with(&mut g, CpuSsmOpts { exact: true })?;
+        let mut c = CpuSsm::load_with(&mut g, CpuSsmOpts { exact: true, layers: None })?;
         c.attach_vit(ojas_cpu::CpuVit::load(&mut Gguf::open(mmproj.to_str().unwrap())?)?)?;
         Some(c)
     } else {

@@ -64,7 +64,7 @@ fn surya() -> Option<(PathBuf, PathBuf)> {
 
 fn load_cpu(path: &Path) -> CpuSsm {
     let mut g = Gguf::open(path.to_str().unwrap()).unwrap();
-    CpuSsm::load_with(&mut g, CpuSsmOpts { exact: true }).unwrap()
+    CpuSsm::load_with(&mut g, CpuSsmOpts { exact: true, layers: None }).unwrap()
 }
 
 fn load_cuda(path: &Path, mmproj: Option<&Path>, gemm: GemmMode, context: usize, chunk: usize) -> CudaSsm {
