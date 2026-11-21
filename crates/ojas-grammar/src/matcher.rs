@@ -11,6 +11,7 @@
 //! would decode to it.
 
 use crate::gbnf::{Elem, Grammar};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -24,7 +25,7 @@ type Stack = Vec<Pos>;
 
 /// Where a grammar is after some text: the open parse stacks and any partial
 /// UTF-8 sequence.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct State {
     stacks: Vec<Stack>,
     cp: u32,
@@ -39,6 +40,13 @@ impl State {
 
     /// The text so far must end here: no character can follow.
     pub fn finished(&self) -> bool { self.need == 0 && self.stacks.iter().all(|s| s.is_empty()) }
+
+    /// This state without what a finished code point leaves behind, so two states
+    /// that accept the same continuations compare equal.
+    fn canonical(mut self) -> State {
+        if self.need == 0 { (self.cp, self.min) = (0, 0); }
+        self
+    }
 }
 
 impl Grammar {
@@ -192,12 +200,77 @@ pub struct GrammarProcessor {
     /// The state after the last token `allows` checked, reused by `accept`.
     checked: Option<(u32, State)>,
     ended: bool,
+    /// `allowed_tokens` for states already asked about.
+    masks: HashMap<State, Arc<[bool]>>,
 }
+
+/// States whose token masks a processor keeps; text inside one string or one
+/// repetition returns to the same state token after token.
+const MASKS: usize = 64;
+
+/// States one pass over the vocabulary tabulates byte transitions for.
+const TABULATED: usize = 4096;
 
 impl GrammarProcessor {
     pub fn new(grammar: Arc<Grammar>, vocab: Arc<TokenVocab>) -> Self {
         let state = grammar.start();
-        GrammarProcessor { grammar, vocab, state, checked: None, ended: false }
+        GrammarProcessor { grammar, vocab, state, checked: None, ended: false, masks: HashMap::new() }
+    }
+
+    /// Whether each token id may come next: what [`allows`](ojas_infer::LogitProcessor::allows)
+    /// answers, for the whole vocabulary at once. Generation checks only the few
+    /// candidates it ranks first; this is for a caller that needs the full set, such
+    /// as one normalising probabilities over the allowed tokens.
+    pub fn allowed_tokens(&mut self) -> Arc<[bool]> {
+        let state = self.state.clone().canonical();
+        if let Some(mask) = self.masks.get(&state) { return mask.clone(); }
+        let mask: Arc<[bool]> = self.sweep(&state).into();
+        if self.masks.len() >= MASKS { self.masks.clear(); }
+        self.masks.insert(state, mask.clone());
+        mask
+    }
+
+    /// `allowed_tokens` computed from `start`. Tokens share prefixes and most bytes
+    /// lead back to a state already seen, so each (state, byte) step is taken
+    /// through the grammar once and every token then walks a table.
+    fn sweep(&self, start: &State) -> Vec<bool> {
+        const UNKNOWN: u32 = u32::MAX;
+        const REJECTED: u32 = u32::MAX - 1;
+        let (grammar, vocab) = (&*self.grammar, &*self.vocab);
+        let mut states = vec![start.clone()];
+        let mut ids: HashMap<State, u32> = HashMap::from([(start.clone(), 0)]);
+        let mut next: Vec<[u32; 256]> = vec![[UNKNOWN; 256]];
+        let can_end = start.accepting();
+        (0..vocab.len()).map(|t| {
+            if vocab.eog[t] { return can_end; }
+            if vocab.special[t] || vocab.bytes[t].is_empty() { return false; }
+            let bytes = &vocab.bytes[t];
+            let mut at = 0usize;
+            for (i, &b) in bytes.iter().enumerate() {
+                let mut to = next[at][b as usize];
+                if to == UNKNOWN {
+                    to = match grammar.feed(&states[at], &[b]).map(State::canonical) {
+                        None => REJECTED,
+                        Some(s) => match ids.get(&s) {
+                            Some(&id) => id,
+                            None if states.len() < TABULATED => {
+                                let id = states.len() as u32;
+                                ids.insert(s.clone(), id);
+                                states.push(s);
+                                next.push([UNKNOWN; 256]);
+                                id
+                            }
+                            // Too many states to tabulate: finish this token directly.
+                            None => return grammar.feed(&s, &bytes[i + 1..]).is_some(),
+                        },
+                    };
+                    next[at][b as usize] = to;
+                }
+                if to == REJECTED { return false; }
+                at = to as usize;
+            }
+            true
+        }).collect()
     }
 
     fn next_state(&self, token: u32) -> Option<State> {
@@ -317,5 +390,57 @@ mod tests {
         assert!(!p.finished(), "a trailing space may still follow");
         p.accept(4);
         assert!(p.finished());
+    }
+
+    /// `allowed_tokens` against `allows` on every id, at every state along `path`.
+    fn masks_agree(grammar: &str, pieces: &[&[u8]], path: &[u32]) {
+        let mut bytes: Vec<Vec<u8>> = pieces.iter().map(|p| p.to_vec()).collect();
+        let n = bytes.len() as u32;
+        // Two specials after the text tokens: end of generation, and a control token.
+        bytes.extend([b"<|end|>".to_vec(), b"<|c|>".to_vec(), Vec::new()]);
+        let special = (0..n + 3).map(|t| t == n || t == n + 1).collect();
+        let vocab = Arc::new(TokenVocab::new(bytes, special, &[n]));
+        let mut p = GrammarProcessor::new(Arc::new(g(grammar)), vocab.clone());
+        for step in 0..=path.len() {
+            let mask = p.allowed_tokens();
+            assert_eq!(mask.len(), vocab.len());
+            for t in 0..vocab.len() as u32 {
+                assert_eq!(mask[t as usize], p.allows(t), "{grammar}: token {t} after {:?}", &path[..step]);
+            }
+            assert!(Arc::ptr_eq(&mask, &p.allowed_tokens()), "a state asked about twice is not recomputed");
+            if let Some(&t) = path.get(step) {
+                assert!(mask[t as usize], "{grammar}: the path must be valid");
+                p.accept(t);
+            }
+        }
+    }
+
+    #[test]
+    fn the_token_mask_is_what_allows_answers() {
+        let e = "é".as_bytes();
+        let zh = "世".as_bytes();
+        let pieces: Vec<&[u8]> = vec![
+            b"{", b"}", b"{\"", b"\"", b"\":", b"a", b"ab", b"abc", b" ", b"1", b"12", b"yes", b"no", b"y", b"es", b"x\"y",
+            e, &e[..1], &e[1..], zh, &zh[..1], &zh[..2], &zh[1..], &zh[2..], &[0xFF], b"a\xC3", "é世".as_bytes(),
+        ];
+        // A string of anything, entered and left; ids 2 `{"`, 6 `ab`, 17/18 the halves of é, 20/23 a split 世.
+        masks_agree("root ::= \"{\" \"\\\"\" [^\"]* \"\\\"\" \":\" [0-9]+ \"}\"", &pieces, &[2, 6, 17, 18, 20, 22, 4, 10, 9, 1]);
+        masks_agree("root ::= (\"yes\" | \"no\") \" \"?", &pieces, &[13, 14, 8]);
+        masks_agree("root ::= [a-c]{2,5} \"é\"", &pieces, &[7, 6, 17, 18]);
+        masks_agree("root ::= item\nitem ::= \"{\" item* \"}\"", &pieces, &[0, 0, 1, 0, 1, 1]);
+    }
+
+    #[test]
+    fn the_token_mask_survives_more_states_than_it_tabulates() {
+        // Every `a` consumed is a new state, more of them than one pass tabulates.
+        let vocab = Arc::new(TokenVocab::new(vec![vec![b'a'; 3 * TABULATED], b"a".to_vec(), b"b".to_vec()], vec![false; 3], &[]));
+        let grammar = format!("root ::= \"a\"{{{}}} \"b\"", 2 * TABULATED);
+        let mut p = GrammarProcessor::new(Arc::new(g(&grammar)), vocab);
+        assert_eq!(&*p.allowed_tokens(), [false, true, false]);
+        let exact = Arc::new(TokenVocab::new(vec![vec![b'a'; 2 * TABULATED], b"b".to_vec()], vec![false; 2], &[]));
+        let mut p = GrammarProcessor::new(Arc::new(g(&grammar)), exact);
+        assert_eq!(&*p.allowed_tokens(), [true, false]);
+        p.accept(0);
+        assert_eq!(&*p.allowed_tokens(), [false, true]);
     }
 }

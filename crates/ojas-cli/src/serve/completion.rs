@@ -10,6 +10,7 @@
 //! everyone.
 
 use super::anthropic;
+use super::logprobs::{self, Logprobs};
 use super::{error_response, json_response, now, output_format, prompt_docs, prompt_ids, prompt_marks, restore_json,
             sampling_from, send_err, sse_event, stop_strings, SSE_HEAD};
 use crate::backend::ModelInfo;
@@ -174,6 +175,8 @@ pub(crate) struct Reply {
     text_stream: TextStream,
     text: String,
     out_ids: Vec<u32>,
+    /// Token log-probabilities, when the request asked for them.
+    logprobs: Option<Logprobs>,
     alive: bool,
     /// Set for a Messages API request: how to turn the text into content blocks.
     anth: Option<anthropic::Shape>,
@@ -209,6 +212,10 @@ pub(crate) fn start(stream: TcpStream, ctx: &Ctx, body: &Value, chat: bool, oai:
         Err(e) => return refuse(stream, &format!("{e:#}")),
     };
     let sampling = sampling_from(body, opts, constraint.is_some());
+    let (logprobs, constraint) = match logprobs::attach(body, chat, constraint) {
+        Ok(v) => v,
+        Err(e) => return refuse(stream, &format!("{e:#}")),
+    };
     let want = body.get("n_predict").or_else(|| body.get("max_tokens")).and_then(Value::as_u64)
         .map(|v| v as usize).unwrap_or(opts.n_predict).min(info.context - ids.len());
     // `ignore_eos` makes a fixed-length benchmark possible: both engines must emit
@@ -223,7 +230,7 @@ pub(crate) fn start(stream: TcpStream, ctx: &Ctx, body: &Value, chat: bool, oai:
         docs: if ctx.prefix_cache { prompt_docs(body, bpe, info, opts) } else { Vec::new() },
         want,
         sampling: (sampling.temperature > 0.0).then_some(sampling),
-        constraint: constraint.map(|p| Box::new(p) as Box<dyn LogitProcessor + Send>),
+        constraint,
         reuse: body.get("cache_prompt").and_then(Value::as_bool).unwrap_or(ctx.prefix_cache),
         eog: if ignore_eos { Vec::new() } else { info.eog.clone() },
         eos: if ignore_eos { None } else { ctx.primary },
@@ -243,7 +250,7 @@ pub(crate) fn start(stream: TcpStream, ctx: &Ctx, body: &Value, chat: bool, oai:
         id: format!("cmpl-{:x}", now()), created: now(), model_name: info.arch.clone(),
         prompt_tokens: job.ids.len(), end_of_turn: if ignore_eos { None } else { ctx.secondary },
         text_stream: TextStream::new(&stops), text: String::new(), out_ids: Vec::with_capacity(want), alive: true,
-        out, anth, began: std::time::Instant::now(),
+        logprobs, out, anth, began: std::time::Instant::now(),
     };
     Some((job, reply))
 }
@@ -289,6 +296,7 @@ impl Reply {
         let (piece, stopped) = self.text_stream.push(bpe, t);
         self.out_ids.push(t);
         self.text.push_str(&piece);
+        let logprobs = self.logprobs.as_mut().map(|l| l.token(|id| bpe.decode_bytes(id as usize), t));
         if self.anth.is_some() {
             // Buffered: blocks are cut from the whole text. A ping keeps a long reply's connection warm.
             if self.streaming && self.out_ids.len().is_multiple_of(ALIVE_EVERY) {
@@ -306,7 +314,7 @@ impl Reply {
         // because the detokenizer is still holding a multi-byte character. Skipping
         // those hides tokens from the client: counts come out short and the first
         // and last arrival timestamps used for throughput span the wrong window.
-        let ev = if !self.oai {
+        let mut ev = if !self.oai {
             let mut e = json!({"content": piece, "stop": false});
             if self.return_tokens { e["tokens"] = json!([t]); }
             e
@@ -321,6 +329,7 @@ impl Reply {
                 "choices": [{"index": 0, "text": piece, "finish_reason": null}]
             })
         };
+        if let Some(l) = logprobs { logprobs::put(&mut ev, self.oai, l); }
         self.alive = self.out.send(sse_event(&ev));
         // A disconnected client must stop the decode, not keep it generating into a
         // closed socket.
@@ -409,7 +418,7 @@ impl Reply {
             if self.oai { self.out.send(b"data: [DONE]\n\n".to_vec()); }
             return;
         }
-        let out = if !self.oai {
+        let mut out = if !self.oai {
             let mut e = json!({"content": self.text, "stop": true, "model": model, "tokens_predicted": n_out,
                 "tokens_evaluated": self.prompt_tokens, "tokens_cached": gen.cached_tokens});
             for (k, v) in stopped.as_object().unwrap() { e[k] = v.clone(); }
@@ -428,6 +437,7 @@ impl Reply {
                 "usage": usage
             })
         };
+        if let Some(l) = &self.logprobs { logprobs::put(&mut out, self.oai, l.whole()); }
         self.out.send(json_response("200 OK", &out));
     }
 
@@ -511,6 +521,26 @@ mod tests {
         assert_eq!(text.matches(r#""finish_reason":null"#).count(), 3, "the role chunk and one per token");
         assert!(text.contains(r#""finish_reason":"length""#) && text.contains(r#""completion_tokens":2"#));
         assert!(text.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn requested_log_probabilities_ride_each_chunk_and_the_whole_response() {
+        for stream in [true, false] {
+            let body = json!({"prompt": [1, 3], "stream": stream, "logprobs": true, "top_logprobs": 2});
+            let (mut job, mut reply, client) = started(body, true);
+            reply.begin();
+            // The engine shows the request's processor each step's logits, then the token.
+            let mut observer = job.constraint.take().expect("log-probabilities are observed from the logit hook");
+            observer.process(&mut [0.0, 0.0, 0.0, 0.0, 1.0, 3.0]);
+            observer.accept(5);
+            assert!(reply.token(&Bpe::default(), 5));
+            reply.finish(&generation(vec![5], FinishReason::Length));
+            let text = received(client);
+            assert_eq!(text.matches(r#""logprobs":{"content":[{"#).count(), 1, "{text}");
+            assert_eq!(text.matches(r#"{"token":"","logprob":-"#).count(), 3, "the token and two alternatives: {text}");
+        }
+        let (job, _, _) = started(json!({"prompt": [1, 3]}), true);
+        assert!(job.constraint.is_none(), "nothing observes a request that did not ask");
     }
 
     #[test]

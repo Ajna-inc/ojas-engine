@@ -28,6 +28,7 @@ use std::time::Instant;
 
 mod anthropic;
 mod completion;
+mod logprobs;
 /// Marks a request body that arrived on the Messages API route.
 const MESSAGES_MARK: &str = "__messages_api";
 use completion::Ctx;
