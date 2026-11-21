@@ -21,7 +21,7 @@
 //! in f32 in every mode. Prefill differs:
 //!
 //! * `fast`  — `gemm_mm_f16` once: activations rounded to f16 on their way into the tensor
-//!   core tile, as Metal and llama.cpp's cuBLAS path do.
+//!   core tile, as Metal and the reference's GPU path do.
 //! * `split` (default) — `gemm_mm_f16(x) + gemm_mm_f16(x - f16(x))`: two tensor-core passes
 //!   carrying ~22 bits of every activation — the oracle's f32 activations to within f32
 //!   rounding — at twice the (small) GEMM cost.
