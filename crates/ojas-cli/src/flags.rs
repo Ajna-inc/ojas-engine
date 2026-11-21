@@ -36,6 +36,8 @@ pub struct RunOpts {
     pub format: Option<ojas_grammar::OutputFormat>,
     pub host: String,
     pub port: u16,
+    /// `serve`: most tokens one image of a request may take (`--image-max-tokens`).
+    pub image_max_tokens: Option<usize>,
     /// Repetitions for `bench`.
     pub reps: usize,
     /// Vision (`detect`): score threshold; None = the command's default.
@@ -103,6 +105,7 @@ impl Default for RunOpts {
             sample: SampleOpts { temperature: 0.8, top_p: 0.95, top_k: 40, repeat_penalty: 1.1, repeat_window: 64, seed: 42 },
             host: "127.0.0.1".into(),
             port: 8080,
+            image_max_tokens: None,
             reps: 3,
             conf: None,
             iou: None,
@@ -372,6 +375,7 @@ pub fn take_run_flags(args: &mut Vec<String>) -> Result<RunOpts> {
                 o.port = num!(&mut i);
                 o.port_set = true;
             }
+            "--image-max-tokens" => o.image_max_tokens = Some(num!(&mut i)),
             "-r" | "--reps" => o.reps = num!(&mut i),
             "--conf" => o.conf = Some(num!(&mut i)),
             "--iou" => o.iou = Some(num!(&mut i)),

@@ -679,6 +679,9 @@ pub(crate) struct SeqState {
     pub(crate) cache_reuse: std::cell::Cell<bool>,
     /// Token positions of boundaries in the next prompt, kept as snapshot points.
     pub(crate) cache_marks: std::cell::RefCell<Vec<usize>>,
+    /// What each row of the next prompt holds where its token id does not say
+    /// (`Model::set_prefix_keys`); empty for a prompt of text.
+    pub(crate) cache_keys: std::cell::RefCell<Vec<u32>>,
     /// Token ranges of the next prompt for the document cache, and whether it may
     /// serve them.
     pub(crate) cache_docs: std::cell::RefCell<Vec<(usize, usize)>>,
@@ -692,7 +695,7 @@ impl Default for SeqState {
         SeqState {
             session_tokens: Default::default(), last_prefill_reused: Default::default(), snap_pos: Default::default(),
             snap_buf: Default::default(), cache_plan: Default::default(), cache_reuse: std::cell::Cell::new(true),
-            cache_marks: Default::default(), cache_docs: Default::default(),
+            cache_marks: Default::default(), cache_keys: Default::default(), cache_docs: Default::default(),
             docs_serve: Default::default(), docs_pending: Default::default(),
         }
     }

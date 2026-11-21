@@ -44,6 +44,8 @@ pub(crate) struct Ctx<'a> {
     pub(crate) secondary: Option<u32>,
     /// Whether the model keeps a prompt-prefix cache.
     pub(crate) prefix_cache: bool,
+    /// What the server needs to take images, or why it takes none.
+    pub(crate) images: &'a Result<super::images::Vision, String>,
 }
 
 /// What a request asks the model to generate.
@@ -51,6 +53,8 @@ pub(crate) struct Job {
     pub(crate) ids: Vec<u32>,
     pub(crate) marks: Vec<usize>,
     pub(crate) docs: Vec<(usize, usize)>,
+    /// The prompt's images, when it has any.
+    pub(crate) images: Option<ojas_infer::image::PromptImages>,
     pub(crate) want: usize,
     pub(crate) sampling: Option<SampleOpts>,
     pub(crate) constraint: Option<Box<dyn LogitProcessor + Send>>,
@@ -75,7 +79,7 @@ impl Job {
         batch::Request {
             prompt: self.ids, max_tokens: self.want, opts: self.sampling,
             processor: self.constraint.map(|p| p as Box<dyn LogitProcessor>), stop,
-            banned: self.banned, marks: self.marks, docs: self.docs, reuse: self.reuse,
+            banned: self.banned, marks: self.marks, docs: self.docs, reuse: self.reuse, images: self.images,
         }
     }
 }
@@ -195,7 +199,16 @@ pub(crate) fn start(stream: TcpStream, ctx: &Ctx, body: &Value, chat: bool, oai:
             Err(e) => return refuse(stream, &e),
         }
     } else { (body, None) };
-    let ids = match prompt_ids(body, bpe, info, opts) {
+    // A request with image parts brings its own prompt, boundaries and image rows.
+    let built = match super::images::build(ctx, body) {
+        Ok(b) => b,
+        Err(e) => return refuse(stream, &format!("{e:#}")),
+    };
+    let (built_ids, built_marks, images) = match built {
+        Some(b) => (Some(b.ids), Some(b.marks), Some(b.images)),
+        None => (None, None, None),
+    };
+    let ids = match built_ids.map_or_else(|| prompt_ids(body, bpe, info, opts), Ok) {
         Ok(v) if !v.is_empty() => v,
         Ok(_) => return refuse(stream, "empty prompt"),
         Err(e) => return refuse(stream, &format!("{e:#}")),
@@ -226,8 +239,9 @@ pub(crate) fn start(stream: TcpStream, ctx: &Ctx, body: &Value, chat: bool, oai:
     // like-for-like.
     let ignore_eos = body.get("ignore_eos").and_then(Value::as_bool).unwrap_or(false);
     let job = Job {
-        marks: if ctx.prefix_cache { prompt_marks(body, bpe, info, opts) } else { Vec::new() },
-        docs: if ctx.prefix_cache { prompt_docs(body, bpe, info, opts) } else { Vec::new() },
+        marks: built_marks.unwrap_or_else(|| if ctx.prefix_cache { prompt_marks(body, bpe, info, opts) } else { Vec::new() }),
+        docs: if ctx.prefix_cache && images.is_none() { prompt_docs(body, bpe, info, opts) } else { Vec::new() },
+        images,
         want,
         sampling: (sampling.temperature > 0.0).then_some(sampling),
         constraint,
@@ -500,8 +514,9 @@ mod tests {
     fn started(body: Value, chat: bool) -> (Job, Reply, TcpStream) {
         let (bpe, info, opts) = (Bpe::default(), info(), RunOpts::default());
         let vocab = Arc::new(TokenVocab::new(Vec::new(), Vec::new(), &[]));
+        let no_images = Err("no projector".to_string());
         let ctx = Ctx { bpe: &bpe, info: &info, opts: &opts, vocab: &vocab, primary: Some(2), secondary: Some(7),
-                        prefix_cache: false };
+                        prefix_cache: false, images: &no_images };
         let (server, client) = connection();
         let (job, reply) = start(server, &ctx, &body, chat, true).expect("a valid request");
         (job, reply, client)

@@ -39,6 +39,18 @@ impl<'a> DecoderGpu<'a> {
         // 256-token chunks. Decide recurrent reuse now; a chunk alone is too short
         // to discover the useful shared prefix and would reset the state.
         self.sess.cache_last.set(ojas_core::PrefixRestore::default());
+        let keys = self.seq().cache_keys.take();
+        if !keys.is_empty() {
+            // Some rows are not what their ids say (an image behind a placeholder),
+            // so the prompt is looked up under its keys or not reused at all. The
+            // document cache reads ids, and is not offered such a prompt.
+            self.seq().cache_docs.take();
+            let n = full.len().saturating_sub(1);
+            if self.uses_prefix_cache() && n > 0 && keys.len() >= n { return self.cache_resume(&keys[..n]); }
+            self.seq().cache_marks.take();
+            self.reset_session();
+            return 0;
+        }
         if self.arch.ssm.is_some() && full.len() > 1 {
             if self.uses_prefix_cache() { return self.cache_resume(&full[..full.len() - 1]); }
             let n = self.reuse_prefix(&full[..full.len()-1]);
@@ -450,6 +462,91 @@ impl<'a> DecoderGpu<'a> {
         true
     }
 
+    /// Prefill rows of which some are given as embeddings and the rest gathered from
+    /// their ids: [`ojas_core::Model::prefill_rows`], on the qwen35 chunk graph. A text
+    /// row and an image row share a chunk, so a prompt with images is processed in
+    /// the chunks a prompt of text is, and its blocks tile the prefix cache the same
+    /// way.
+    ///
+    /// The rows continue the cache plan `reuse_prefix_len` made under the prompt's
+    /// keys when `keys` are the plan's own for these positions, and are then added to
+    /// the cache under them. Otherwise nothing of the sequence is reusable, as after
+    /// [`DecoderGpu::prefill_embeds`]: ids alone cannot tell one image from another.
+    pub fn prefill_rows(&self, tokens: &[u32], keys: &[u32], base_pos: usize, given: &[(usize, &[f32])],
+                        pos3: Option<&[[u32; 4]]>) -> bool {
+        let d = self.d;
+        assert!(keys.len() == tokens.len() && pos3.is_none_or(|p| p.len() == tokens.len()),
+            "prefill_rows: one key and one (t,h,w,e) per row");
+        assert!(given.iter().all(|&(at, x)| x.len().is_multiple_of(d) && at + x.len() / d <= tokens.len()),
+            "prefill_rows: given rows must be whole and inside the span");
+        assert!(base_pos.checked_add(tokens.len()).is_some_and(|n| n <= self.st.max_seq)
+            && tokens.iter().all(|&t| (t as usize) < self.arch.vocab), "prefill_rows exceeds model bounds");
+        // Only the chunk graph gathers some rows and takes others as given.
+        let chunked = self.arch.ssm.is_some() && self.arch.qwen4exp.is_none()
+            && !(self.arch.moe.is_some() && !self.wt.q4) && !self.cfg.no_prefill;
+        if !chunked || (self.strm.stream && self.arch.moe.is_some()) { return false; }
+        if tokens.is_empty() { return true; }
+
+        let mut cached = false;
+        if self.uses_prefix_cache() {
+            if base_pos == 0 {
+                // Only a plan `reuse_prefix_len` made for these keys, which restored
+                // nothing: its lookup already reset the sequence.
+                cached = self.seq().cache_plan.borrow_mut().as_mut().is_some_and(|p| {
+                    let k = p.tokens.len().min(keys.len());
+                    let ok = !p.started && p.resume == 0 && p.tokens[..k] == keys[..k];
+                    p.started |= ok;
+                    ok
+                });
+            } else {
+                self.cache_continue(base_pos, keys);
+                cached = self.seq().cache_plan.borrow().is_some();
+            }
+        }
+        if !cached {
+            if base_pos == 0 { self.reset_session(); }
+            self.mark_span_unreusable();
+        }
+
+        let chunk_sz = self.cfg.prefill_m.clamp(1, MAXM);
+        let mut pos = base_pos;
+        for (ci, chunk) in tokens.chunks(chunk_sz).enumerate() {
+            let (lo, hi) = (ci * chunk_sz, ci * chunk_sz + chunk.len());
+            // Given rows inside this chunk go straight into st.x.
+            let mut rows = Vec::new();
+            for &(at, x) in given {
+                let (from, to) = (at.max(lo), (at + x.len() / d).min(hi));
+                if from >= to { continue; }
+                let src = &x[(from - at) * d..(to - at) * d];
+                unsafe {
+                    let dst = (self.st.x.contents() as *mut f32).add((from - lo) * d);
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+                }
+                rows.push(from - lo..to - lo);
+            }
+            let one = [super::graph_chunk::ChunkSegment { rows: 0..chunk.len(), slot: self.cur_slot.get(), base_pos: pos }];
+            self.forward_segments_enc(None, chunk, &one, false, false, &rows, pos3.map(|p| &p[lo..hi]));
+            if ojas_core::device_fault::is_faulted() {
+                self.mark_span_unreusable();
+                return true;
+            }
+            // The draft block conditions on the placeholder ids of given rows, so its
+            // drafts over them are poor; they are verified, which costs speed only.
+            self.qwen35_mtp_catchup(chunk, pos);
+            self.sp.hrow.set(chunk.len() - 1);
+            pos += chunk.len();
+            if cached { self.cache_capture(pos); }
+        }
+        if cached {
+            self.sess.cache.borrow_mut().sync();
+            // The log holds keys for these rows, so nothing matches them by id.
+            self.record_prefilled(base_pos, keys);
+        } else {
+            self.mark_span_unreusable();
+        }
+        true
+    }
+
     /// Whether prefill goes through the prompt-prefix cache: the qwen35 chunk graph,
     /// whose chunks tile a cache block exactly, with a cache budget set.
     pub(crate) fn uses_prefix_cache(&self) -> bool {
@@ -686,6 +783,7 @@ impl<'a> DecoderGpu<'a> {
         let prompt = &tokens[..tokens.len() / BLOCK * BLOCK];
         self.seq().cache_marks.take();
         self.seq().cache_docs.take();
+        self.seq().cache_keys.take();
         if prompt.is_empty() || !self.uses_prefix_cache() { return 0; }
         let reuse = self.seq().cache_reuse.replace(true);
         let start = self.cache_resume(prompt);

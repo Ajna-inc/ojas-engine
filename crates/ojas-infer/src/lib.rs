@@ -3,6 +3,7 @@
 //! remain on the concrete model types.
 
 pub mod batch;
+pub mod image;
 mod stop;
 pub use stop::StopMatcher;
 
@@ -253,6 +254,8 @@ pub struct EngineCore<M: Model> {
     /// terminator and everything after it. Non-empty forces the logits path,
     /// because an on-device argmax cannot exclude an id.
     pub banned: Vec<u32>,
+    /// The images of the next prompt, when it has any ([`image::PromptImages`]).
+    pub images: Option<image::PromptImages>,
     /// Token Recycling adjacency (Luo et al., ACL 2025): token -> the model's top-8
     /// next-token guesses, harvested from logits every forward already computes.
     /// Drafts drawn from here fire on novel text, where prompt-lookup cannot (it
@@ -320,7 +323,7 @@ const SPEC_NGRAM: usize = 4;
 
 impl<M: Model> EngineCore<M> {
     pub fn new(model: M) -> Self {
-        EngineCore { model, eos: None, eog: Vec::new(), banned: Vec::new(), adj: Default::default() }
+        EngineCore { model, eos: None, eog: Vec::new(), banned: Vec::new(), images: None, adj: Default::default() }
     }
 
     pub fn model(&self) -> &M { &self.model }
@@ -415,7 +418,8 @@ impl<M: Model> EngineCore<M> {
         // diverged sequence, and when reuse is disabled, giving a full prefill. The
         // model guarantees the reused rows are bit-identical to a fresh prefill.
         let pre = &prompt_ids[..prompt_ids.len() - 1];
-        let start = self.model.reuse_prefix_len(pre).min(pre.len());
+        let images = self.images.as_ref();
+        let start = image::reuse_start(&self.model, images, pre);
         let prompt_cache = self.model.prefix_cache_stats().map(|s| s.last);
         let cached_tokens = prompt_cache.map_or(start, |r| r.reused_tokens);
 
@@ -434,7 +438,9 @@ impl<M: Model> EngineCore<M> {
                     return ended(out, FinishReason::Cancelled, cached_tokens, prompt_cache);
                 }
                 let end = (done + PREFILL_STEP).min(total);
-                self.model.prefill(&pre[done..end], done);
+                if !image::prefill_chunk(&self.model, images, &pre[done..end], done) {
+                    return ended(out, FinishReason::Refused, cached_tokens, prompt_cache);
+                }
                 done = end;
                 on_prefill(done, total);
             }

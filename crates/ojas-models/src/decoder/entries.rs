@@ -404,6 +404,14 @@ impl<'a> ojas_core::Model for DecoderGpu<'a> {
         *self.seq().cache_docs.borrow_mut() = spans.to_vec();
         self.seq().docs_serve.set(serve);
     }
+    fn set_prefix_keys(&self, keys: &[u32]) -> bool {
+        *self.seq().cache_keys.borrow_mut() = keys.to_vec();
+        keys.is_empty() || self.uses_prefix_cache()
+    }
+    fn prefill_rows(&self, tokens: &[u32], keys: &[u32], base_pos: usize, given: &[(usize, &[f32])],
+                    pos3: Option<&[[u32; 4]]>) -> bool {
+        DecoderGpu::prefill_rows(self, tokens, keys, base_pos, given, pos3)
+    }
     fn prefix_cache_stats(&self) -> Option<ojas_core::PrefixCacheStats> {
         self.uses_prefix_cache().then(|| DecoderGpu::prefix_cache_stats(self))
     }

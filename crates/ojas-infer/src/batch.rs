@@ -41,6 +41,13 @@ pub struct Request {
     pub docs: Vec<(usize, usize)>,
     /// Whether the prompt may be restored from the prefix cache.
     pub reuse: bool,
+    /// The prompt's images, when it has any.
+    pub images: Option<crate::image::PromptImages>,
+}
+
+impl Request {
+    /// The prompt as the prefix cache knows it: by key where it holds images.
+    fn cache_ids(&self) -> &[u32] { self.images.as_ref().map_or(&self.prompt, |i| &i.keys) }
 }
 
 /// What happens to a request, reported as it happens.
@@ -140,7 +147,10 @@ impl<'m, M: Model + ?Sized> Batch<'m, M> {
     fn next_waiting(&self) -> Option<usize> {
         let now = Instant::now();
         if let Some(i) = self.waiting.iter().position(|w| now - w.arrived >= self.max_wait) { return Some(i); }
-        let cached = |w: &Waiting| self.model.cached_prefix_len(&w.req.prompt[..w.req.prompt.len().saturating_sub(1)]);
+        let cached = |w: &Waiting| {
+            let ids = w.req.cache_ids();
+            self.model.cached_prefix_len(&ids[..ids.len().min(w.req.prompt.len()).saturating_sub(1)])
+        };
         (0..self.waiting.len()).rev().max_by_key(|&i| cached(&self.waiting[i]))
     }
 
@@ -161,7 +171,7 @@ impl<'m, M: Model + ?Sized> Batch<'m, M> {
             if !req.reuse { model.reset_session(); }
             model.set_prefix_marks(&req.marks);
             model.set_prefix_docs(&req.docs, req.reuse);
-            start = model.reuse_prefix_len(pre).min(pre.len());
+            start = crate::image::reuse_start(model, req.images.as_ref(), pre);
             prompt_cache = model.prefix_cache_stats().map(|s| s.last);
             if pre.is_empty() { model.prefill(&[], 0); }
         });
@@ -193,11 +203,14 @@ impl<'m, M: Model + ?Sized> Batch<'m, M> {
         let total = r.req.prompt.len() - 1;
         let end = (done + PREFILL_CHUNK).min(total);
         let chunk = &r.req.prompt[done..end];
-        model.with_slot(slot, &mut || model.prefill(chunk, done));
+        let mut taken = true;
+        model.with_slot(slot, &mut || taken = crate::image::prefill_chunk(model, r.req.images.as_ref(), chunk, done));
         r.phase = if end == total { Phase::Decode } else { Phase::Prompt(end) };
         let id = r.id;
         if ojas_core::device_fault::is_faulted() {
             self.finish(slot, FinishReason::Fault, sink);
+        } else if !taken {
+            self.finish(slot, FinishReason::Refused, sink);
         } else if !sink(id, Event::Prefill(end, total)) {
             self.finish(slot, FinishReason::Caller, sink);
         }
@@ -335,7 +348,7 @@ mod tests {
 
     fn request(prompt: Vec<u32>, max_tokens: usize) -> Request {
         Request { prompt, max_tokens, opts: None, processor: None, stop: vec![STOP], banned: Vec::new(),
-                  marks: Vec::new(), docs: Vec::new(), reuse: true }
+                  marks: Vec::new(), docs: Vec::new(), reuse: true, images: None }
     }
 
     /// Run `reqs` to completion and return each one's generation by id.

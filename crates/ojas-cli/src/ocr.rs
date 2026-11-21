@@ -362,7 +362,7 @@ impl VisionTokens {
     /// Each marker must be exactly one token. `Bpe::encode` is expensive per
     /// call, but these are 15-byte strings, so its special-token scan is
     /// negligible here.
-    fn resolve(bpe: &Bpe) -> Result<VisionTokens> {
+    pub(crate) fn resolve(bpe: &Bpe) -> Result<VisionTokens> {
         let one = |s: &str| -> Result<u32> {
             match bpe.encode(s).as_slice() {
                 [id] => Ok(*id as u32),
@@ -973,7 +973,7 @@ pub(crate) fn loop_period(gen: &[u32], max_period: usize, min_run: usize) -> Opt
 /// var rather than a CLI flag because `flags.rs` is shared surface and only OCR needs
 /// this knob. It is also the second half of the "prompt does not fit" remedy: halving
 /// the budget quarters the ViT's attention cost as well as shortening the prompt.
-fn token_budget() -> (i32, i32) {
+pub(crate) fn token_budget() -> (i32, i32) {
     let get = |k: &str, d: i32| -> i32 {
         std::env::var(k).ok().and_then(|v| v.parse().ok()).filter(|&v| v > 0).unwrap_or(d)
     };
@@ -991,7 +991,7 @@ fn instruction_for(opts: &RunOpts) -> Result<String> {
 /// sidecar rules (one file beside the model, ambiguity refused).
 /// [`ojas_formats::mmproj::validate`] catches a projector from a different
 /// checkpoint, which would otherwise surface as fluent wrong text.
-fn resolve_mmproj(model: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_mmproj(model: &str) -> Result<PathBuf> {
     let explicit = ojas_core::config::EngineConfig::current().mmproj;
     let found = ojas_formats::mmproj::discover(Path::new(model), explicit.as_deref())?.context(
         "no vision projector: put a *mmproj*.gguf next to the model, or pass \

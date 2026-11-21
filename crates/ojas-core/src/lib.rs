@@ -202,6 +202,24 @@ pub trait Model {
     /// from it at their new position when `serve` is set and it holds them (opt-in,
     /// approximate), otherwise added to it once processed.
     fn set_prefix_docs(&self, _spans: &[(usize, usize)], _serve: bool) {}
+    /// What each row of the next prompt holds, for prefix reuse, where the token ids
+    /// do not say: `keys[i]` is the token id of an ordinary text row, and for a row
+    /// given as an embedding or placed at an explicit rotary coordinate a value that
+    /// names its content and placement, outside the vocabulary. Reuse then compares
+    /// keys in place of ids, so two images behind the same placeholder id never share
+    /// a prefix and the same image is found again. Empty for a prompt of text.
+    ///
+    /// False (the default) when this model cannot reuse by key: the caller then
+    /// starts the prompt as an unrelated sequence and processes all of it.
+    fn set_prefix_keys(&self, _keys: &[u32]) -> bool { false }
+    /// Prefill rows of which some are given as embeddings and the rest gathered from
+    /// their token ids, each at a rotary coordinate when `pos3` is set
+    /// ([`Model::prefill_embeds`] has the convention). `given` is `(first row, rows)`
+    /// within this call, each `rows` a whole number of `hidden_dim()` f32 rows; `keys`
+    /// are these rows' entries of [`Model::set_prefix_keys`], under which they may be
+    /// added to the prefix cache. False when this model has no such path.
+    fn prefill_rows(&self, _tokens: &[u32], _keys: &[u32], _base_pos: usize, _given: &[(usize, &[f32])],
+                    _pos3: Option<&[[u32; 4]]>) -> bool { false }
     /// Occupancy and hit counts of the prompt-prefix cache, when the model keeps one.
     fn prefix_cache_stats(&self) -> Option<PrefixCacheStats> { None }
     /// Finish writing the prompt-prefix cache's directory, when it has one.
@@ -357,6 +375,11 @@ impl<T: Model + ?Sized> Model for Box<T> {
     fn set_prefix_reuse(&self, on: bool) { (**self).set_prefix_reuse(on) }
     fn set_prefix_marks(&self, positions: &[usize]) { (**self).set_prefix_marks(positions) }
     fn set_prefix_docs(&self, spans: &[(usize, usize)], serve: bool) { (**self).set_prefix_docs(spans, serve) }
+    fn set_prefix_keys(&self, keys: &[u32]) -> bool { (**self).set_prefix_keys(keys) }
+    fn prefill_rows(&self, tokens: &[u32], keys: &[u32], base_pos: usize, given: &[(usize, &[f32])],
+                    pos3: Option<&[[u32; 4]]>) -> bool {
+        (**self).prefill_rows(tokens, keys, base_pos, given, pos3)
+    }
     fn prefix_cache_stats(&self) -> Option<PrefixCacheStats> { (**self).prefix_cache_stats() }
     fn save_prefix_cache(&self) { (**self).save_prefix_cache() }
     fn warm_prefix(&self, tokens: &[u32], pin: bool) -> Option<usize> { (**self).warm_prefix(tokens, pin) }
@@ -417,6 +440,11 @@ impl<T: Model + ?Sized> Model for &T {
     fn set_prefix_reuse(&self, on: bool) { (**self).set_prefix_reuse(on) }
     fn set_prefix_marks(&self, positions: &[usize]) { (**self).set_prefix_marks(positions) }
     fn set_prefix_docs(&self, spans: &[(usize, usize)], serve: bool) { (**self).set_prefix_docs(spans, serve) }
+    fn set_prefix_keys(&self, keys: &[u32]) -> bool { (**self).set_prefix_keys(keys) }
+    fn prefill_rows(&self, tokens: &[u32], keys: &[u32], base_pos: usize, given: &[(usize, &[f32])],
+                    pos3: Option<&[[u32; 4]]>) -> bool {
+        (**self).prefill_rows(tokens, keys, base_pos, given, pos3)
+    }
     fn prefix_cache_stats(&self) -> Option<PrefixCacheStats> { (**self).prefix_cache_stats() }
     fn save_prefix_cache(&self) { (**self).save_prefix_cache() }
     fn warm_prefix(&self, tokens: &[u32], pin: bool) -> Option<usize> { (**self).warm_prefix(tokens, pin) }
@@ -767,6 +795,13 @@ mod tests {
                 assert_eq!((img.len(), w, h), (12, 4, 3), "encode_image args must arrive verbatim");
                 Some(Ok(vec![0.25; w * h / 4 * 1024]))
             }
+            // Both default to `false`, which reads as "no reuse by key" and "no path
+            // for image rows": a missed forward refuses every image request.
+            fn set_prefix_keys(&self, keys: &[u32]) -> bool { keys == [3, 0x8000_0001] }
+            fn prefill_rows(&self, t: &[u32], keys: &[u32], p: usize, given: &[(usize, &[f32])],
+                            p3: Option<&[[u32; 4]]>) -> bool {
+                (t, keys, p, given, p3) == (&[5, 6], &[5, 0x8000_0002], 9, &[(1, &[0.5; 8][..])], Some(&[[0, 1, 2, 3], [4, 5, 6, 7]]))
+            }
             // Everything below has a default that would mask a missing forward.
             fn context_capacity(&self) -> usize { 128 }
             fn mtp_verify_width(&self) -> usize { 4 }
@@ -842,6 +877,9 @@ mod tests {
             // `ojas ocr` branches on `vision_width()` to pick the model's own
             // encoder over the CPU oracle, so the default `None` runs the slow path
             // rather than failing.
+            assert!(m.set_prefix_keys(&[3, 0x8000_0001]), "{what}: the keys must arrive verbatim");
+            assert!(m.prefill_rows(&[5, 6], &[5, 0x8000_0002], 9, &[(1, &[0.5; 8])], Some(&[[0, 1, 2, 3], [4, 5, 6, 7]])),
+                "{what}: prefill_rows' ids, keys, base_pos, given rows and pos3 must arrive verbatim");
             assert_eq!(m.vision_width(), Some(1024), "{what}: must report its tower, not the default None");
             assert_eq!(m.vision_tokens(64, 64), Some(1024), "{what}");
             // `anyhow::Error` is not `PartialEq`, so unwrap both layers rather than

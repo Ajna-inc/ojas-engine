@@ -72,7 +72,7 @@ engine flags (llama.cpp names where one exists):
          --prefix-cache-disk-int8  store KV in PATH as int8: half the size, restores no longer exact
          --prefix-cache-pin FILE  serve: process and pin the system prompt in FILE at startup
   -md,   --spec-draft-model FNAME  MTP draft head
-         --mmproj FNAME   vision projector GGUF (ocr; defaults to *mmproj*.gguf beside the model)
+         --mmproj FNAME   vision projector GGUF (ocr, and images on serve; defaults to *mmproj*.gguf beside the model)
          --top-k-experts N  MoE experts per token (NOT sampling top-k)
          --mmap/--no-mmap     zero-copy weight mapping
          --mlock/--no-mlock   pin the resident skeleton
@@ -105,6 +105,8 @@ runtime flags:
          --precision N    Metal decoder precision tier (default: 3 for dense models,
                           4 for models with experts)
          --host H --port P   serve address (default 127.0.0.1:8080)
+         --image-max-tokens N  serve: most tokens one image may take (default 4096 or OJAS_IMAGE_MAX_TOKENS,
+                          at most half the context); a request lowers it with image_max_tokens
   -r,    --reps N         bench repetitions (default 3)
          --conf N --iou N  vision thresholds (detect/plate)
          --json           detect/plate/decide: JSON output

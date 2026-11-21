@@ -28,6 +28,7 @@ use std::time::Instant;
 
 mod anthropic;
 mod completion;
+mod images;
 mod logprobs;
 /// Marks a request body that arrived on the Messages API route.
 const MESSAGES_MARK: &str = "__messages_api";
@@ -301,7 +302,7 @@ fn chat_turns(msgs: &[Value], opts: &RunOpts) -> (String, Vec<(String, String)>)
     let mut turns = Vec::new();
     for m in msgs {
         let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
-        let content = m.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+        let content = images::content_text(m.get("content"));
         if role == "system" {
             system = content;
         } else {
@@ -362,7 +363,9 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
         // Token bytes for constrained requests, built once for the session.
         let vocab = crate::constrain::vocab(bpe, info);
         pin_startup_prompt(m, bpe, info, opts)?;
-        let ctx = Ctx { bpe, info, opts, vocab: &vocab, primary, secondary, prefix_cache: m.prefix_cache_stats().is_some() };
+        let vision = images::Vision::open(model, m, bpe, info, opts);
+        let ctx = Ctx { bpe, info, opts, vocab: &vocab, primary, secondary, prefix_cache: m.prefix_cache_stats().is_some(),
+                        images: &vision };
 
         let addr = format!("{}:{}", opts.host, opts.port);
         let listener = TcpListener::bind(&addr).with_context(|| format!("binding {addr}"))?;
@@ -379,6 +382,7 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
             1 => eprintln!("  listening on http://{addr}  (one request at a time)"),
             n => eprintln!("  listening on http://{addr}  ({n} requests at a time)"),
         }
+        if let Ok(v) = &vision { eprintln!("  images: data URLs in chat messages, up to {} tokens each", v.max_tokens); }
         eprintln!("  POST /v1/chat/completions  POST /v1/messages  POST /v1/completions  POST /completion  GET /health  GET /props  GET /cache  POST /cache/save|warm|unpin  GET /v1/models");
 
         let props = json!({
@@ -390,6 +394,7 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
             "vocab_size": info.vocab,
             "mtp": info.has_mtp,
             "concurrent_slots": slots,
+            "images": vision.as_ref().ok().map(|v| json!({"max_tokens": v.max_tokens})),
         });
         if slots > 1 { serve_batched(&listener, m, &ctx, &props) } else { serve_alone(&listener, m, &ctx, &props) }
     })
@@ -423,6 +428,7 @@ fn run_alone(core: &mut EngineCore<&dyn Model>, ctx: &Ctx, stream: TcpStream, bo
     model.set_prefix_marks(&job.marks);
     model.set_prefix_docs(&job.docs, job.reuse);
     (core.eog, core.eos, core.banned) = (job.eog.clone(), job.eos, job.banned.clone());
+    core.images = job.images.take();
     let mut constraint = job.constraint.take();
     let gen = core.generate_ex(&job.ids, job.want, job.sampling.as_ref(),
         constraint.as_deref_mut().map(|p| p as &mut dyn ojas_infer::LogitProcessor), &mut |_, _| {},
@@ -551,6 +557,10 @@ fn warm_request(stream: &mut TcpStream, req: &Request, ctx: &Ctx) -> Option<(Vec
             return None;
         }
     };
+    if images::has_images(&body) {
+        send_err(stream, "400 Bad Request", "a prefix is warmed from text; send the images in a completion request");
+        return None;
+    }
     match warm_ids(&body, ctx.bpe, ctx.info, ctx.opts).and_then(|ids| fits_context(ids, ctx.info)) {
         Ok(ids) => Some((ids, body.get("pin").and_then(Value::as_bool).unwrap_or(true))),
         Err(e) => {
