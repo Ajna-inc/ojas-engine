@@ -311,10 +311,21 @@ impl<G: GpuDev> PlatePipelineOf<G> {
     /// Stage 1 alone: vehicles on whole frames (frame pixels). With a tracker
     /// in between, follow with `read_plates` for the vehicles worth reading.
     pub fn detect_vehicles(&mut self, dev: &[DevFrame]) -> Result<Vec<Vec<Detection>>> {
+        let whole: Vec<Roi> = dev.iter().enumerate().map(|(i, f)| Roi::whole(i, f)).collect();
+        self.detect_vehicles_in(dev, &whole)
+    }
+
+    /// Stage 1 on regions of the frames: each ROI alone is letterboxed to the
+    /// detector input, so the detector sees only that part of the camera
+    /// frame. One list per ROI, boxes in frame pixels (clipped to the ROI) —
+    /// `read_plates` takes them as it takes whole-frame vehicles.
+    pub fn detect_vehicles_in(&mut self, dev: &[DevFrame], rois: &[Roi]) -> Result<Vec<Vec<Detection>>> {
         let t = Instant::now();
-        let whole: Vec<Roi> = dev.iter().enumerate().map(|(i, f)| Roi { frame: i, x0: 0, y0: 0, w: f.w, h: f.h }).collect();
         let vcfg = DecodeCfg { conf: self.cfg.vehicle_conf, iou: self.cfg.iou, classes: Some(self.cfg.vehicle_classes.clone()), ..Default::default() };
-        let vehicles = detect(&mut self.vehicle, dev, &whole, &vcfg)?;
+        let mut vehicles = detect(&mut self.vehicle, dev, rois, &vcfg)?;
+        for (r, dets) in rois.iter().zip(vehicles.iter_mut()) {
+            r.to_frame(dets);
+        }
         self.times.vehicle = t.elapsed().as_secs_f64() * 1e3;
         self.times.vehicles = vehicles.iter().map(|v| v.len()).sum();
         Ok(vehicles)

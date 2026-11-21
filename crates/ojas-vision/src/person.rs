@@ -188,12 +188,7 @@ impl<G: GpuDev> DetrHead<G> {
             for (i, r) in chunk.iter().enumerate() {
                 let (lg, bx) = (&logits[i * q * c..(i + 1) * q * c], &boxes[i * q * 4..(i + 1) * q * 4]);
                 let mut dets = crate::detr::decode(lg, bx, c, q, r.w, r.h, cfg);
-                for d in dets.iter_mut() {
-                    d.x0 += r.x0 as f32;
-                    d.x1 += r.x0 as f32;
-                    d.y0 += r.y0 as f32;
-                    d.y1 += r.y0 as f32;
-                }
+                r.to_frame(&mut dets);
                 all.push(dets);
             }
         }
@@ -282,11 +277,17 @@ impl<G: GpuDev> PersonPipelineOf<G> {
 
     /// Persons in each device frame (needs a detector).
     pub fn detect_device(&mut self, dev: &[DevFrame]) -> Result<Vec<Vec<Detection>>> {
+        let rois: Vec<Roi> = dev.iter().enumerate().map(|(i, f)| Roi::whole(i, f)).collect();
+        self.detect_device_in(dev, &rois)
+    }
+
+    /// Persons in regions of the device frames: the detector sees each ROI alone (placed
+    /// into its input as a whole frame is). One list per ROI, boxes in frame pixels.
+    pub fn detect_device_in(&mut self, dev: &[DevFrame], rois: &[Roi]) -> Result<Vec<Vec<Detection>>> {
         let t = std::time::Instant::now();
         let det = self.detector.as_mut().ok_or_else(|| anyhow::anyhow!("person pipeline: no detector"))?;
-        let rois: Vec<Roi> = dev.iter().enumerate().map(|(i, f)| Roi { frame: i, x0: 0, y0: 0, w: f.w, h: f.h }).collect();
         let cfg = DecodeCfg { conf: self.cfg.conf, iou: 1.0, max_det: self.cfg.max_det, classes: Some(self.cfg.classes.clone()), class_agnostic_nms: false };
-        let out = det.detect(dev, &rois, &cfg)?;
+        let out = det.detect(dev, rois, &cfg)?;
         self.times.detect = t.elapsed().as_secs_f64() * 1e3;
         self.times.detections = out.iter().map(Vec::len).sum();
         Ok(out)

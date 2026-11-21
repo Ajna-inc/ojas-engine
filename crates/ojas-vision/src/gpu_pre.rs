@@ -10,6 +10,7 @@ use ojas_core::conv::Storage;
 use crate::gpu::GpuDev;
 
 use crate::pre::{letterbox_geom, ocr_affine, ocr_width, window_geom, ChanNorm, Letterbox, OcrNorm, Window};
+use crate::yolo::Detection;
 
 /// Pixel layout of a device frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,31 @@ pub struct Roi {
     pub h: usize,
 }
 
+impl Roi {
+    /// All of frame `frame`.
+    pub fn whole(frame: usize, f: &DevFrame) -> Roi {
+        Roi { frame, x0: 0, y0: 0, w: f.w, h: f.h }
+    }
+
+    /// Detections in this region's pixels (what a detector run on the region
+    /// returns once its letterbox is undone) to frame pixels.
+    pub fn to_frame(&self, dets: &mut [Detection]) {
+        let (ox, oy) = (self.x0 as f32, self.y0 as f32);
+        for d in dets.iter_mut() {
+            d.x0 += ox;
+            d.x1 += ox;
+            d.y0 += oy;
+            d.y1 += oy;
+            if let Some(kp) = &mut d.keypoints {
+                for p in kp.iter_mut() {
+                    p[0] += ox;
+                    p[1] += oy;
+                }
+            }
+        }
+    }
+}
+
 /// How crops are placed into the model input.
 #[derive(Debug, Clone, Copy)]
 pub enum Placement {
@@ -58,11 +84,16 @@ pub enum Placement {
 }
 
 /// Descriptors for `cnn_crop_resize_u8` (14 words per crop) and each crop's
-/// letterbox (for mapping detections back; `None` for OCR placement).
+/// letterbox (for mapping detections back; `None` for OCR placement). The
+/// letterbox is that of the region alone (`frame_w`/`frame_h` are the ROI's):
+/// `yolo::to_frame` with it gives region pixels, `Roi::to_frame` frame pixels.
+/// Taps are addressed in frame coordinates, so an NV12 region may start on
+/// any pixel (chroma is looked up as for the whole frame).
 pub fn descriptors(frames: &[DevFrame], rois: &[Roi], place: Placement) -> Result<(Vec<u32>, Vec<Option<Letterbox>>)> {
     let mut d = Vec::with_capacity(rois.len() * 10);
     let mut lbs = Vec::with_capacity(rois.len());
     for r in rois {
+        ensure!(r.frame < frames.len(), "roi {r:?}: {} frames", frames.len());
         let f = frames[r.frame];
         ensure!(r.w > 0 && r.h > 0 && r.x0 + r.w <= f.w && r.y0 + r.h <= f.h, "roi {r:?} outside frame {f:?}");
         let mut r = *r;
@@ -137,4 +168,219 @@ pub fn frame_to_rgb8<G: GpuDev>(g: &G, f: &DevFrame, step: usize, scratch: &mut 
     out.resize(need, 0);
     g.read_bytes(buf, 0, out)?;
     Ok((ow, oh))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pre::{letterbox_rgb8_into, nv12_to_rgb8};
+    use crate::yolo;
+
+    fn noise(n: usize, mut s: u32) -> Vec<u8> {
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 24) as u8
+            })
+            .collect()
+    }
+
+    /// One tap as the kernel's `cnn_tap_rgb`: frame coordinates, NV12 chroma at (y/2, x & !1).
+    fn tap(mem: &[u8], d: &[u32], x: usize, y: usize) -> [i32; 3] {
+        let (pitch, fmt, uv_off) = (d[2] as usize, d[3], d[4] as usize);
+        if fmt == 0 {
+            let p = y * pitch + x * 3;
+            return [mem[p] as i32, mem[p + 1] as i32, mem[p + 2] as i32];
+        }
+        let yy = mem[y * pitch + x] as i32;
+        let uvp = uv_off + (y / 2) * pitch + (x & !1);
+        let (u, v) = (mem[uvp] as i32 - 128, mem[uvp + 1] as i32 - 128);
+        let yv = (yy - 16).max(0) * 1_220_542;
+        [
+            ((yv + (1 << 19) + 1_673_527 * v) >> 20).clamp(0, 255),
+            ((yv + (1 << 19) - 852_492 * v - 409_993 * u) >> 20).clamp(0, 255),
+            ((yv + (1 << 19) + 2_116_026 * u) >> 20).clamp(0, 255),
+        ]
+    }
+
+    /// `cnn_crop_resize_u8` for the letterbox placement, transcribed: one 14-word descriptor
+    /// over the frame's bytes into planar CHW f32 (the kernel writes the same values as f16
+    /// into the padded input).
+    fn kernel_twin(mem: &[u8], d: &[u32], target: usize) -> Vec<f32> {
+        let [rx0, ry0, rw, rh, nw, nh, left, top] = [5, 6, 7, 8, 9, 10, 11, 12].map(|i| d[i] as i32);
+        let axis = |o: i32, r: i32, n: i32| -> (i32, i32, i32, i32) {
+            let f = (o as f32 + 0.5) * (r as f32 / n as f32) - 0.5;
+            let mut s = f.floor() as i32;
+            let mut f = f - s as f32;
+            if s < 0 {
+                (s, f) = (0, 0.0);
+            }
+            if s >= r - 1 {
+                (s, f) = (r - 2, 1.0);
+            }
+            let s = s.max(0);
+            let a1 = (f * 2048.0).round() as i32;
+            (s, (s + 1).min(r - 1), 2048 - a1, a1)
+        };
+        let plane = target * target;
+        let mut out = vec![0f32; 3 * plane];
+        for p in 0..plane {
+            let (ox, oy) = ((p % target) as i32 - left, (p / target) as i32 - top);
+            let u = if ox < 0 || ox >= nw || oy < 0 || oy >= nh {
+                [114; 3]
+            } else if rw == nw && rh == nh {
+                tap(mem, d, (rx0 + ox) as usize, (ry0 + oy) as usize)
+            } else {
+                let (sx, sx1, a0, a1) = axis(ox, rw, nw);
+                let (sy, sy1, b0, b1) = axis(oy, rh, nh);
+                let t = |x: i32, y: i32| tap(mem, d, (rx0 + x) as usize, (ry0 + y) as usize);
+                let (t00, t01, t10, t11) = (t(sx, sy), t(sx1, sy), t(sx, sy1), t(sx1, sy1));
+                [0, 1, 2].map(|c| {
+                    let h0 = a0 * t00[c] + a1 * t01[c];
+                    let h1 = a0 * t10[c] + a1 * t11[c];
+                    ((((b0 * (h0 >> 4)) >> 16) + ((b1 * (h1 >> 4)) >> 16) + 2) >> 2).clamp(0, 255)
+                })
+            };
+            for c in 0..3 {
+                out[c * plane + p] = u[c] as f32 / 255.0;
+            }
+        }
+        out
+    }
+
+    fn crop_rgb(rgb: &[u8], w: usize, r: &Roi) -> Vec<u8> {
+        (r.y0..r.y0 + r.h).flat_map(|y| rgb[(y * w + r.x0) * 3..(y * w + r.x0 + r.w) * 3].iter().copied()).collect()
+    }
+
+    /// The CPU path on the same region: crop, then the Ultralytics letterbox.
+    fn oracle(rgb: &[u8], w: usize, r: &Roi, target: usize) -> (Vec<f32>, Letterbox) {
+        let mut out = vec![0f32; 3 * target * target];
+        let lb = letterbox_rgb8_into(&crop_rgb(rgb, w, r), r.w, r.h, target, &mut out);
+        (out, lb)
+    }
+
+    fn same(a: &Letterbox, b: &Letterbox) -> bool {
+        (a.scale, a.pad_x, a.pad_y, a.frame_w, a.frame_h, a.target) == (b.scale, b.pad_x, b.pad_y, b.frame_w, b.frame_h, b.target)
+    }
+
+    #[test]
+    fn whole_frame_roi_is_the_frame_letterbox() {
+        let f = DevFrame { ptr: 0x1_2345_6780, pitch: 1920 * 3, w: 1920, h: 1080, fmt: PixFmt::Rgb8 };
+        let place = Placement::Letterbox { target: 640 };
+        let (d, lbs) = descriptors(&[f], &[Roi::whole(0, &f)], place).unwrap();
+        let (lb, nw, nh) = letterbox_geom(1920, 1080, 640);
+        assert_eq!(d, [0x2345_6780, 1, 1920 * 3, 0, 0, 0, 0, 1920, 1080, nw as u32, nh as u32, lb.pad_x as u32, lb.pad_y as u32, 0]);
+        assert!(same(&lbs[0].unwrap(), &lb));
+        // the literal whole-frame ROI callers wrote before `Roi::whole`
+        let (d2, _) = descriptors(&[f], &[Roi { frame: 0, x0: 0, y0: 0, w: 1920, h: 1080 }], place).unwrap();
+        assert_eq!(d, d2);
+        // and mapping back through it moves nothing
+        let det = Detection { class: 0, score: 0.9, x0: 10.0, y0: 20.0, x1: 30.0, y1: 40.0, keypoints: None };
+        let mut dets = vec![det];
+        Roi::whole(0, &f).to_frame(&mut dets);
+        assert_eq!(dets[0], det);
+    }
+
+    #[test]
+    fn roi_letterbox_matches_cpu_on_the_region() {
+        // odd frame size, row pitch wider than the pixels
+        let (w, h, pitch) = (61usize, 47usize, 61 * 3 + 5);
+        let rgb = noise(w * h * 3, 7);
+        let mut mem = vec![0u8; pitch * h];
+        for y in 0..h {
+            mem[y * pitch..y * pitch + w * 3].copy_from_slice(&rgb[y * w * 3..(y + 1) * w * 3]);
+        }
+        let f = DevFrame { ptr: 0, pitch, w, h, fmt: PixFmt::Rgb8 };
+        let rois = [
+            Roi::whole(0, &f),
+            Roi { frame: 0, x0: 13, y0: 5, w: 31, h: 17 },  // off-centre, odd origin and size
+            Roi { frame: 0, x0: 0, y0: 0, w: 20, h: 47 },   // left edge, full height (portrait)
+            Roi { frame: 0, x0: 40, y0: 30, w: 21, h: 17 }, // bottom-right corner
+            Roi { frame: 0, x0: 3, y0: 46, w: 58, h: 1 },   // one row, last row
+            Roi { frame: 0, x0: 60, y0: 2, w: 1, h: 40 },   // one column, last column
+            Roi { frame: 0, x0: 9, y0: 9, w: 32, h: 32 },   // exactly the input: no resize
+            Roi { frame: 0, x0: 30, y0: 20, w: 1, h: 1 },
+        ];
+        for target in [32usize, 33, 96] {
+            let (d, lbs) = descriptors(&[f], &rois, Placement::Letterbox { target }).unwrap();
+            for (i, r) in rois.iter().enumerate() {
+                let (want, lb) = oracle(&rgb, w, r, target);
+                assert!(same(&lbs[i].unwrap(), &lb), "{r:?} -> {target}");
+                assert!(kernel_twin(&mem, &d[i * 14..(i + 1) * 14], target) == want, "{r:?} -> {target}");
+            }
+        }
+    }
+
+    #[test]
+    fn nv12_roi_at_any_origin_matches_cpu() {
+        // decoder layout: Y rows, then interleaved UV rows, both `pitch` wide
+        let (w, h, pitch) = (64usize, 36usize, 80usize);
+        let nv = noise(pitch * h * 3 / 2, 11);
+        let uv_off = pitch * h;
+        let rgb = nv12_to_rgb8(&nv, w, h, pitch, uv_off);
+        let f = DevFrame { ptr: 0, pitch, w, h, fmt: PixFmt::Nv12 { uv_off } };
+        let rois = [
+            Roi::whole(0, &f),
+            Roi { frame: 0, x0: 8, y0: 4, w: 40, h: 20 },   // even origin
+            Roi { frame: 0, x0: 7, y0: 3, w: 41, h: 21 },   // odd origin, odd size
+            Roi { frame: 0, x0: 1, y0: 0, w: 63, h: 36 },   // odd x, touching three edges
+            Roi { frame: 0, x0: 33, y0: 17, w: 31, h: 19 }, // bottom-right corner
+            Roi { frame: 0, x0: 5, y0: 35, w: 9, h: 1 },    // last row
+        ];
+        for target in [48usize, 31] {
+            let (d, _) = descriptors(&[f], &rois, Placement::Letterbox { target }).unwrap();
+            for (i, r) in rois.iter().enumerate() {
+                assert_eq!(d[i * 14 + 3..i * 14 + 5], [1, uv_off as u32]);
+                assert!(kernel_twin(&nv, &d[i * 14..(i + 1) * 14], target) == oracle(&rgb, w, r, target).0, "{r:?} -> {target}");
+            }
+        }
+    }
+
+    #[test]
+    fn detections_map_back_through_letterbox_and_roi() {
+        let f = DevFrame { ptr: 0, pitch: 1920, w: 1920, h: 1080, fmt: PixFmt::Nv12 { uv_off: 1920 * 1080 } };
+        // 601x333 at an odd origin -> 640: scale 640/601, pads top and bottom
+        let r = Roi { frame: 0, x0: 1001, y0: 437, w: 601, h: 333 };
+        let (_, lbs) = descriptors(&[f], &[r], Placement::Letterbox { target: 640 }).unwrap();
+        let lb = lbs[0].unwrap();
+        assert_eq!((lb.frame_w, lb.frame_h), (601, 333));
+        assert!(lb.pad_x == 0 && lb.pad_y > 0);
+        // a box and its corners in frame pixels, as the model would report them in its input
+        let frame_box = [1100.5f32, 500.25, 1400.0, 700.75];
+        let to_model = |x: f32, y: f32| ((x - r.x0 as f32) * lb.scale + lb.pad_x as f32, (y - r.y0 as f32) * lb.scale + lb.pad_y as f32);
+        let (mx0, my0) = to_model(frame_box[0], frame_box[1]);
+        let (mx1, my1) = to_model(frame_box[2], frame_box[3]);
+        let kp = [[mx0, my0], [mx1, my0], [mx1, my1], [mx0, my1]];
+        // the second box runs past the region on every side
+        let mut dets = vec![
+            Detection { class: 2, score: 0.9, x0: mx0, y0: my0, x1: mx1, y1: my1, keypoints: Some(kp) },
+            Detection { class: 2, score: 0.8, x0: -50.0, y0: -50.0, x1: 700.0, y1: 700.0, keypoints: None },
+        ];
+        yolo::to_frame(&mut dets, &lb);
+        r.to_frame(&mut dets);
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-2;
+        let d = &dets[0];
+        assert!(near(d.x0, frame_box[0]) && near(d.y0, frame_box[1]) && near(d.x1, frame_box[2]) && near(d.y1, frame_box[3]), "{d:?}");
+        let k = d.keypoints.unwrap();
+        assert!(near(k[0][0], frame_box[0]) && near(k[0][1], frame_box[1]) && near(k[2][0], frame_box[2]) && near(k[2][1], frame_box[3]), "{k:?}");
+        // clipped to the region, in frame pixels
+        let d = &dets[1];
+        assert_eq!((d.x0, d.y0, d.x1, d.y1), (1001.0, 437.0, 1602.0, 770.0));
+    }
+
+    #[test]
+    fn rois_outside_the_frame_are_rejected() {
+        let f = DevFrame { ptr: 0, pitch: 300, w: 100, h: 50, fmt: PixFmt::Rgb8 };
+        let place = Placement::Letterbox { target: 64 };
+        for r in [
+            Roi { frame: 0, x0: 90, y0: 0, w: 11, h: 10 },
+            Roi { frame: 0, x0: 0, y0: 41, w: 10, h: 10 },
+            Roi { frame: 0, x0: 0, y0: 0, w: 0, h: 10 },
+            Roi { frame: 1, x0: 0, y0: 0, w: 10, h: 10 },
+        ] {
+            assert!(descriptors(&[f], &[r], place).is_err(), "{r:?}");
+        }
+        // touching the far edges is inside
+        assert!(descriptors(&[f], &[Roi { frame: 0, x0: 90, y0: 40, w: 10, h: 10 }], place).is_ok());
+    }
 }
