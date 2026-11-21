@@ -25,6 +25,17 @@
 //! 1/GOP of the decode work, for idle or low-tier cameras; switching back to
 //! `Mode::All` takes effect at the next intra picture (nothing may reference
 //! a skipped one).
+//!
+//! Threads: every `CudaGpu` of a device holds the device's primary context,
+//! bound to the calling thread (`bind_thread`), never floating — so driver
+//! calls made here need no `cuvidCtxLock` section (the SDK asks for one only
+//! around a floating context). Each decoder still owns a context lock and
+//! passes it as `vidLock`, as the SDK's own decoder class does: the codec
+//! library then enters the context itself for its internal driver calls
+//! rather than relying on the caller's thread state. The lock is per decoder,
+//! so it is never contended and decoders on different threads do not wait on
+//! each other through it. What decoders do share is the device's decode
+//! engine and, per `CudaGpu`, the stream their surface copies are queued on.
 
 use std::collections::VecDeque;
 use std::ffi::c_void;
@@ -178,6 +189,8 @@ struct Api {
     decode_picture: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32,
     map: unsafe extern "C" fn(*mut c_void, i32, *mut u64, *mut u32, *mut ProcParams) -> i32,
     unmap: unsafe extern "C" fn(*mut c_void, u64) -> i32,
+    ctx_lock_create: unsafe extern "C" fn(*mut *mut c_void, sys::CUcontext) -> i32,
+    ctx_lock_destroy: unsafe extern "C" fn(*mut c_void) -> i32,
 }
 
 impl Api {
@@ -200,6 +213,8 @@ impl Api {
                 decode_picture: sym!(b"cuvidDecodePicture\0"),
                 map: sym!(b"cuvidMapVideoFrame64\0"),
                 unmap: sym!(b"cuvidUnmapVideoFrame64\0"),
+                ctx_lock_create: sym!(b"cuvidCtxLockCreate\0"),
+                ctx_lock_destroy: sym!(b"cuvidCtxLockDestroy\0"),
                 _lib: lib,
             })
         }
@@ -227,6 +242,8 @@ pub struct DecodedFrame {
 struct Inner {
     api: Arc<Api>,
     stream: sys::CUstream,
+    /// context lock of this decoder (`vidLock`), destroyed after the decoder
+    lock: *mut c_void,
     decoder: *mut c_void,
     w: usize,
     h: usize,
@@ -295,7 +312,7 @@ unsafe extern "C" fn on_sequence(user: *mut c_void, fmt: *mut VideoFormat) -> i3
         target_width: w as u64,
         target_height: h as u64,
         num_output_surfaces: 2, // mapped at once per decoder (collect maps one at a time)
-        vid_lock: std::ptr::null_mut(),
+        vid_lock: me.lock,
         target_rect: [0; 4],
         enable_histogram: 0,
         enable_decode_features: 0,
@@ -449,9 +466,15 @@ impl NvDecoder {
     pub fn with_options(gpu: Arc<CudaGpu>, codec: Codec, slots: usize, keep_every: u32) -> Result<NvDecoder> {
         let api = Arc::new(Api::load()?);
         gpu.bind_thread()?;
+        let mut lock = std::ptr::null_mut();
+        let rc = unsafe { (api.ctx_lock_create)(&mut lock, gpu.cu_ctx()) };
+        if rc != 0 {
+            bail!("cuvidCtxLockCreate failed ({rc})");
+        }
         let mut inner = Box::new(Inner {
             api: api.clone(),
             stream: gpu.cu_stream(),
+            lock,
             decoder: std::ptr::null_mut(),
             w: 0,
             h: 0,
@@ -490,6 +513,7 @@ impl NvDecoder {
         let mut parser = std::ptr::null_mut();
         let rc = unsafe { (api.create_parser)(&mut parser, &mut pp) };
         if rc != 0 {
+            unsafe { (api.ctx_lock_destroy)(lock) };
             bail!("cuvidCreateVideoParser failed ({rc})");
         }
         Ok(NvDecoder { parser, inner, gpu })
@@ -616,6 +640,7 @@ impl Drop for NvDecoder {
             if self.inner.ring != 0 {
                 sys::cuMemFree_v2(self.inner.ring);
             }
+            (self.inner.api.ctx_lock_destroy)(self.inner.lock);
         }
     }
 }
