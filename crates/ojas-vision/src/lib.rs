@@ -33,6 +33,7 @@ pub mod gpu_pre;
 pub mod pipeline;
 #[cfg(any(feature = "cuda", feature = "vulkan"))]
 pub mod person;
+pub mod person_gate;
 pub mod import;
 pub mod ir;
 pub mod model;
