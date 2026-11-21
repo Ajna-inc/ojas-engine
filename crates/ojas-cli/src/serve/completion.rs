@@ -9,6 +9,7 @@
 //! or not at all holds up only its own request, never the thread decoding for
 //! everyone.
 
+use super::anthropic;
 use super::{error_response, json_response, now, output_format, prompt_docs, prompt_ids, prompt_marks, restore_json,
             sampling_from, send_err, sse_event, stop_strings, SSE_HEAD};
 use crate::backend::ModelInfo;
@@ -84,6 +85,13 @@ struct Outbox {
     gone: Arc<AtomicBool>,
     /// The connection itself, kept to notice a client that hung up.
     stream: TcpStream,
+    tx_ping: mpsc::SyncSender<Vec<u8>>,
+    /// Ends the keep-alive thread.
+    quiet: Arc<AtomicBool>,
+}
+
+impl Drop for Outbox {
+    fn drop(&mut self) { self.quiet.store(true, Ordering::Relaxed); }
 }
 
 impl Outbox {
@@ -100,7 +108,7 @@ impl Outbox {
                 }
             }
         })?;
-        Ok(Outbox { tx, gone, stream })
+        Ok(Outbox { tx_ping: tx.clone(), tx, gone, stream, quiet: Arc::new(AtomicBool::new(false)) })
     }
 
     /// Queue bytes for the client; false when it is gone or too far behind.
@@ -111,6 +119,23 @@ impl Outbox {
         }
         true
     }
+
+    /// Send an SSE ping every few seconds until `hush`: a client reads a long silent
+    /// prompt pass as a dead connection.
+    fn keep_alive(&self) {
+        let (tx, quiet, gone) = (self.tx_ping.clone(), Arc::clone(&self.quiet), Arc::clone(&self.gone));
+        let ping = anthropic::event("ping", &json!({"type": "ping"}));
+        let _ = std::thread::Builder::new().name("http-ping".into()).spawn(move || {
+            let mut waited = 0;
+            while !quiet.load(Ordering::Relaxed) && !gone.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                waited += 1;
+                if waited % 50 == 0 && !quiet.load(Ordering::Relaxed) && tx.try_send(ping.clone()).is_err() { return; }
+            }
+        });
+    }
+
+    fn hush(&self) { self.quiet.store(true, Ordering::Relaxed); }
 
     /// Whether the client is still connected, without waiting.
     fn connected(&self) -> bool {
@@ -150,12 +175,23 @@ pub(crate) struct Reply {
     text: String,
     out_ids: Vec<u32>,
     alive: bool,
+    /// Set for a Messages API request: how to turn the text into content blocks.
+    anth: Option<anthropic::Shape>,
+    began: std::time::Instant,
 }
 
 /// Parse a completion request, answering it at once with an error when it is
 /// malformed. Nothing is sent on success until `Reply::begin`.
 pub(crate) fn start(stream: TcpStream, ctx: &Ctx, body: &Value, chat: bool, oai: bool) -> Option<(Job, Reply)> {
     let (bpe, info, opts) = (ctx.bpe, ctx.info, ctx.opts);
+    let mut stream = stream;
+    let converted;
+    let (body, anth) = if body.get(super::MESSAGES_MARK).is_some() {
+        match anthropic::convert(body, &opts.system) {
+            Ok(c) => { converted = c.body; (&converted, Some(c.shape)) }
+            Err(e) => return refuse(stream, &e),
+        }
+    } else { (body, None) };
     let ids = match prompt_ids(body, bpe, info, opts) {
         Ok(v) if !v.is_empty() => v,
         Ok(_) => return refuse(stream, "empty prompt"),
@@ -194,7 +230,6 @@ pub(crate) fn start(stream: TcpStream, ctx: &Ctx, body: &Value, chat: bool, oai:
         banned: if ignore_eos { info.eog.clone() } else { Vec::new() },
         ids,
     };
-    let mut stream = stream;
     let out = match Outbox::new(&stream) {
         Ok(out) => out,
         Err(e) => {
@@ -208,7 +243,7 @@ pub(crate) fn start(stream: TcpStream, ctx: &Ctx, body: &Value, chat: bool, oai:
         id: format!("cmpl-{:x}", now()), created: now(), model_name: info.arch.clone(),
         prompt_tokens: job.ids.len(), end_of_turn: if ignore_eos { None } else { ctx.secondary },
         text_stream: TextStream::new(&stops), text: String::new(), out_ids: Vec::with_capacity(want), alive: true,
-        out,
+        out, anth, began: std::time::Instant::now(),
     };
     Some((job, reply))
 }
@@ -222,8 +257,15 @@ impl Reply {
     /// Commit to answering: a stream's header and first chunk go out now, a whole
     /// response only at `finish`.
     pub(crate) fn begin(&mut self) {
+        eprintln!("  request {}: {} prompt tokens", self.id, self.prompt_tokens);
         if !self.streaming { return; }
         self.alive = self.out.send(SSE_HEAD.as_bytes().to_vec());
+        if self.anth.is_some() {
+            let start = anthropic::message(&self.id, &self.model_name, Vec::new(), "", self.prompt_tokens, 0);
+            self.alive &= self.out.send(anthropic::event("message_start", &json!({"type": "message_start", "message": start})));
+            self.out.keep_alive();
+            return;
+        }
         // The first OpenAI chunk carries the role and no content.
         if self.oai && self.chat {
             let first = json!({
@@ -247,6 +289,15 @@ impl Reply {
         let (piece, stopped) = self.text_stream.push(bpe, t);
         self.out_ids.push(t);
         self.text.push_str(&piece);
+        if self.anth.is_some() {
+            // Buffered: blocks are cut from the whole text. A ping keeps a long reply's connection warm.
+            if self.streaming && self.out_ids.len().is_multiple_of(ALIVE_EVERY) {
+                self.alive = self.out.send(anthropic::event("ping", &json!({"type": "ping"})));
+            } else if self.out_ids.len().is_multiple_of(ALIVE_EVERY) {
+                self.alive = self.out.connected();
+            }
+            return self.alive && !stopped;
+        }
         if !self.streaming {
             if self.out_ids.len().is_multiple_of(ALIVE_EVERY) { self.alive = self.out.connected(); }
             return self.alive && !stopped;
@@ -299,6 +350,8 @@ impl Reply {
         let tail = self.text_stream.finish();
         self.text.push_str(&tail);
         let n_out = self.out_ids.len();
+        eprintln!("  request {}: {} tokens out, {} cached, {:.1}s total", self.id, n_out, gen.cached_tokens,
+                  self.began.elapsed().as_secs_f32());
         let reason = crate::constrain::finish_reason(gen.finish);
         // The /completion fields saying which way generation stopped.
         let stopped = json!({
@@ -314,6 +367,22 @@ impl Reply {
         });
         if let Some(r) = &gen.prompt_cache { usage["prompt_cache"] = restore_json(r); }
         let (id, created, model) = (&self.id, self.created, &self.model_name);
+
+        if let Some(shape) = &self.anth {
+            self.out.hush();
+            let parsed = shape.parse(&self.text);
+            let stop_reason = if !parsed.calls.is_empty() { "tool_use" }
+                else if gen.finish == FinishReason::Length { "max_tokens" }
+                else if self.text_stream.stopped() { "stop_sequence" } else { "end_turn" };
+            let content = anthropic::blocks(&parsed, &id.replace("cmpl-", ""));
+            if self.streaming {
+                if self.alive { self.out.send(anthropic::stream_events(&content, stop_reason, n_out)); }
+            } else {
+                let m = anthropic::message(id, model, content, stop_reason, self.prompt_tokens, n_out);
+                self.out.send(json_response("200 OK", &m));
+            }
+            return;
+        }
 
         if self.streaming {
             if !self.alive { return; }
@@ -368,6 +437,12 @@ impl Reply {
     fn fail(self, status: &str, kind: &str, msg: &str) {
         if !self.streaming { return self.refuse(status, msg); }
         if !self.alive { return; }
+        if self.anth.is_some() {
+            self.out.hush();
+            let ev = json!({"type": "error", "error": {"type": kind, "message": msg}});
+            self.out.send(anthropic::event("error", &ev));
+            return;
+        }
         let ev = if !self.oai {
             json!({"error": {"message": msg, "type": kind}, "stop": true, "truncated": true})
         } else {

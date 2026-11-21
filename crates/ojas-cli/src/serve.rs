@@ -26,7 +26,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+mod anthropic;
 mod completion;
+/// Marks a request body that arrived on the Messages API route.
+const MESSAGES_MARK: &str = "__messages_api";
 use completion::Ctx;
 
 const MAX_BODY: usize = 32 * 1024 * 1024;
@@ -375,7 +378,7 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
             1 => eprintln!("  listening on http://{addr}  (one request at a time)"),
             n => eprintln!("  listening on http://{addr}  ({n} requests at a time)"),
         }
-        eprintln!("  POST /v1/chat/completions  POST /v1/completions  POST /completion  GET /health  GET /props  GET /cache  POST /cache/save|warm|unpin  GET /v1/models");
+        eprintln!("  POST /v1/chat/completions  POST /v1/messages  POST /v1/completions  POST /completion  GET /health  GET /props  GET /cache  POST /cache/save|warm|unpin  GET /v1/models");
 
         let props = json!({
             "model": info.arch,
@@ -523,10 +526,13 @@ fn serve_batched(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &V
 /// The body and response format of a completion request, answering a malformed body
 /// itself; `None` for any other route.
 fn completion_route(stream: &mut TcpStream, req: &Request, path: &str) -> Option<(Value, bool, bool)> {
-    let ("POST", "/completion" | "/completions" | "/v1/completions" | "/v1/chat/completions") = (req.method.as_str(), path)
-    else { return None };
-    match serde_json::from_slice(&req.body) {
-        Ok(body) => Some((body, path == "/v1/chat/completions", path.starts_with("/v1/"))),
+    let ("POST", "/completion" | "/completions" | "/v1/completions" | "/v1/chat/completions" | "/v1/messages") =
+        (req.method.as_str(), path) else { return None };
+    match serde_json::from_slice::<Value>(&req.body) {
+        Ok(mut body) => {
+            if path == "/v1/messages" { body[MESSAGES_MARK] = Value::Bool(true); }
+            Some((body, path == "/v1/chat/completions" || path == "/v1/messages", path.starts_with("/v1/")))
+        }
         Err(e) => {
             send_err(stream, "400 Bad Request", &format!("invalid JSON: {e}"));
             None
@@ -594,6 +600,16 @@ fn serve_other(stream: &mut TcpStream, req: &Request, path: &str, model: &dyn Mo
             "object": "list",
             "data": [{"id": ctx.info.arch, "object": "model", "created": now(), "owned_by": "ojas"}]
         })),
+        ("POST", "/v1/messages/count_tokens") => match serde_json::from_slice::<Value>(&req.body) {
+            Ok(body) => match anthropic::convert(&body, &ctx.opts.system) {
+                Ok(c) => {
+                    let n = ctx.bpe.encode(c.body["prompt"].as_str().unwrap_or_default()).len();
+                    send_json(stream, "200 OK", &json!({"input_tokens": n}))
+                }
+                Err(e) => send_err(stream, "400 Bad Request", &e),
+            },
+            Err(e) => send_err(stream, "400 Bad Request", &format!("invalid JSON: {e}")),
+        },
         ("POST", "/v1/systemone" | "/v1/decide" | "/decide") =>
             send_err(stream, "501 Not Implemented", "this model is not a decision model"),
         _ => return false,
