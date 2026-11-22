@@ -419,7 +419,7 @@ impl CpuSsm {
         crate::cpu_math::prof_from_env();
         // OJAS_CPU_THREADS pins the worker count, as `cpu_qwen` and `cpu_vit` already allowed —
         // this model did not, and took `available_parallelism()` raw. Inside a container that is
-        // the CGROUP QUOTA, which on the Delhi node reports 25 however many cores the process is
+        // the CGROUP QUOTA, which can report fewer cores (25 on one host) than the process is
         // actually pinned to, so a 64-core taskset still ran 25 workers (9 Oct 2026).
         let threads = ojas_core::config::var("OJAS_CPU_THREADS").ok().and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
@@ -569,7 +569,7 @@ impl CpuSsm {
         crate::cpu_math::prof_from_env();
         // OJAS_CPU_THREADS pins the worker count, as `cpu_qwen` and `cpu_vit` already allowed —
         // this model did not, and took `available_parallelism()` raw. Inside a container that is
-        // the CGROUP QUOTA, which on the Delhi node reports 25 however many cores the process is
+        // the CGROUP QUOTA, which can report fewer cores (25 on one host) than the process is
         // actually pinned to, so a 64-core taskset still ran 25 workers (9 Oct 2026).
         let threads = ojas_core::config::var("OJAS_CPU_THREADS").ok().and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
@@ -758,7 +758,7 @@ impl CpuSsm {
     /// The handoff is `rope.len() * hidden_dim` f32: about **10 KB a token** at d = 2560. That is
     /// why splitting a model across two devices in ONE MACHINE is almost free (a PCIe copy of
     /// 10 KB is microseconds) and why splitting it across two machines is not (a round trip
-    /// between our Delhi and Chennai nodes is ~25 ms, which would set the token rate on its own).
+    /// between two data centres is tens of milliseconds, which would set the token rate on its own).
     pub fn forward_shard(&self, x: &[f32], rope: &[RopeAt], base_row: usize) -> Vec<f32> {
         assert_eq!(x.len(), rope.len() * self.d, "x must be rope.len() * hidden_dim");
         assert!(!rope.is_empty());
