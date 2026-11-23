@@ -35,6 +35,7 @@ mod logprobs;
 mod metrics;
 mod ocr_route;
 mod tools;
+mod transcribe;
 pub(crate) use conn::{drain_on_sigterm, Conn};
 /// Marks a request body that arrived on the Messages API route.
 const MESSAGES_MARK: &str = "__messages_api";
@@ -54,6 +55,8 @@ pub(crate) struct Request {
     request_id: Option<String>,
     /// `X-Priority: batch`: bulk work that yields to every other request.
     background: bool,
+    /// `Content-Type`, as sent.
+    pub(crate) content_type: Option<String>,
 }
 
 /// A request whose body is past `MAX_BODY`, answered 413.
@@ -81,7 +84,7 @@ fn read_request(stream: &mut impl BufRead) -> Result<Option<Request>> {
         _ => return Ok(None),
     };
 
-    let (mut len, mut bearer, mut request_id, mut background) = (0usize, None, None, false);
+    let (mut len, mut bearer, mut request_id, mut background, mut content_type) = (0usize, None, None, false, None);
     loop {
         let mut h = String::new();
         if stream.read_line(&mut h)? == 0 {
@@ -106,6 +109,8 @@ fn read_request(stream: &mut impl BufRead) -> Result<Option<Request>> {
                 request_id = plain.then(|| id.to_string());
             } else if v.0.eq_ignore_ascii_case("x-priority") {
                 background = v.1.trim().eq_ignore_ascii_case("batch");
+            } else if v.0.eq_ignore_ascii_case("content-type") {
+                content_type = Some(v.1.trim().to_string());
             }
         }
     }
@@ -114,7 +119,7 @@ fn read_request(stream: &mut impl BufRead) -> Result<Option<Request>> {
     }
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body)?;
-    Ok(Some(Request { method, path, body, bearer, request_id, background }))
+    Ok(Some(Request { method, path, body, bearer, request_id, background, content_type }))
 }
 
 /// Header lines every response of this process carries: the CORS origin, when one
@@ -475,6 +480,9 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
     }
     if embed::is_embedding_model(model) {
         return embed::serve(model, opts, context, front, loading, hashing);
+    }
+    if transcribe::is_speech_model(model) {
+        return transcribe::serve(model, opts, front, loading, hashing);
     }
     with_model(model, opts.device, context, opts.precision, |m, bpe, info| {
         let (primary, secondary) = stop_ids(bpe, info);

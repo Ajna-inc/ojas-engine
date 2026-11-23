@@ -398,6 +398,35 @@ impl CpuWhisper {
     /// One greedy decode step (suppresses timestamp tokens; v1 has
     /// <|notimestamps|> in the prefix anyway).
     pub fn decode_step(&self, tok: u32, pos: usize) -> u32 {
+        let mut logits = self.logits(&self.step_hidden(tok, pos));
+        // suppress timestamps + sot-class specials that derail greedy decode.
+        // Guard: a missing whisper.token.ts_begin resolves to 0 (meta unwrap_or(0)),
+        // which would mask the entire vocab → argmax collapses to token 0. Only
+        // suppress a valid timestamp range.
+        let ts0 = self.ts_begin as usize;
+        if ts0 > 0 && ts0 < self.vocab {
+            for t in ts0..self.vocab { logits[t] = f32::MIN; }
+        }
+        for t in [self.sot, self.lang_en, self.transcribe, self.no_timestamps] {
+            logits[t as usize] = f32::MIN;
+        }
+        crate::cpu_math::argmax(&logits) as u32
+    }
+
+    /// Forget the decoded tokens but keep the encoded audio, so the same
+    /// window can be decoded again.
+    pub fn reset_decoder(&self) {
+        let (kc, vc) = &mut *self.kv.borrow_mut();
+        for l in 0..self.n_dec { kc[l].clear(); vc[l].clear(); }
+    }
+
+    /// Unmasked vocabulary logits of a decoder state from `step_hidden`.
+    pub fn logits(&self, h: &[f32]) -> Vec<f32> {
+        mv(&self.tok_embd, self.vocab, self.d, h, None, self.threads, self.dotprod)
+    }
+
+    /// Feed one token at `pos`; returns the final-LN'd decoder state [d].
+    pub fn step_hidden(&self, tok: u32, pos: usize) -> Vec<f32> {
         let (d, hd, nh) = (self.d, self.hd, self.n_head);
         let frames = *self.enc_frames.borrow();
         let scale = 1.0 / (hd as f32).sqrt();
@@ -466,20 +495,7 @@ impl CpuWhisper {
             let f2 = mv(&ly.fc2.0, d, ffn, &a, Some(&ly.fc2.1), self.threads, self.dotprod);
             for i in 0..d { x[i] += f2[i]; }
         }
-        let xn = layernorm(&x, &self.dec_ln.0, &self.dec_ln.1, WHISPER_EPS);
-        let mut logits = mv(&self.tok_embd, self.vocab, d, &xn, None, self.threads, self.dotprod);
-        // suppress timestamps + sot-class specials that derail greedy decode.
-        // Guard: a missing whisper.token.ts_begin resolves to 0 (meta unwrap_or(0)),
-        // which would mask the entire vocab → argmax collapses to token 0. Only
-        // suppress a valid timestamp range.
-        let ts0 = self.ts_begin as usize;
-        if ts0 > 0 && ts0 < self.vocab {
-            for t in ts0..self.vocab { logits[t] = f32::MIN; }
-        }
-        for t in [self.sot, self.lang_en, self.transcribe, self.no_timestamps] {
-            logits[t as usize] = f32::MIN;
-        }
-        crate::cpu_math::argmax(&logits) as u32
+        layernorm(&x, &self.dec_ln.0, &self.dec_ln.1, WHISPER_EPS)
     }
 
     /// Full greedy transcription of 16 kHz mono PCM: standard chunked decode.

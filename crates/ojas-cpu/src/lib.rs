@@ -12,6 +12,7 @@ pub mod cpu_ssm;
 pub mod cpu_vit;
 pub mod cpu_whisper;
 pub mod vit_preprocess;
+pub mod whisper_decode;
 
 pub use cpu_deepseek::CpuDeepseek;
 pub use cpu_glm::CpuGlm;
