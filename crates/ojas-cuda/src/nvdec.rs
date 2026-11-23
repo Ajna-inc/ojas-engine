@@ -26,6 +26,12 @@
 //! `Mode::All` takes effect at the next intra picture (nothing may reference
 //! a skipped one).
 //!
+//! Output size: by default frames have the stream's displayed size. With
+//! `DecoderOptions::output` the engine scales each picture itself (the
+//! create-info's target size and rectangle), stretched or letterboxed as
+//! asked; frames, ring slots and copies then have that size, and
+//! `NvDecoder::geom` keeps the mapping back to stream pixels.
+//!
 //! Threads: every `CudaGpu` of a device holds the device's primary context,
 //! bound to the calling thread (`bind_thread`), never floating — so driver
 //! calls made here need no `cuvidCtxLock` section (the SDK asks for one only
@@ -66,6 +72,96 @@ impl Codec {
             Codec::H264 => 4, // cudaVideoCodec_H264
             Codec::Hevc => 8, // cudaVideoCodec_HEVC
         }
+    }
+}
+
+/// How the source picture is placed in a scaled output surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fit {
+    /// fills the whole surface; the aspect changes unless the sizes agree
+    Stretch,
+    /// aspect kept, centred; the rest of the surface is bars whose content is
+    /// the decoder's (read only `OutputGeom::rect`)
+    Letterbox,
+}
+
+/// Decoder output size: the decode engine scales each picture to `width` ×
+/// `height` (rounded down to even, NV12) instead of a resize kernel later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputSize {
+    pub width: usize,
+    pub height: usize,
+    pub fit: Fit,
+}
+
+/// Where the source picture is in the decoded surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputGeom {
+    /// the stream's displayed size
+    pub src_w: usize,
+    pub src_h: usize,
+    /// the decoded surface (`DecodedFrame::{w, h}`)
+    pub w: usize,
+    pub h: usize,
+    /// the picture inside the surface: x0, y0, x1, y1 (the whole surface
+    /// unless letterboxed)
+    pub rect: [usize; 4],
+}
+
+impl OutputGeom {
+    /// Surface pixels per source pixel, per axis.
+    pub fn scale(&self) -> (f32, f32) {
+        let [x0, y0, x1, y1] = self.rect;
+        ((x1 - x0) as f32 / self.src_w as f32, (y1 - y0) as f32 / self.src_h as f32)
+    }
+
+    /// Surface coordinates → source pixels (unclipped).
+    pub fn to_source(&self, x: f32, y: f32) -> (f32, f32) {
+        let (sx, sy) = self.scale();
+        ((x - self.rect[0] as f32) / sx, (y - self.rect[1] as f32) / sy)
+    }
+
+    /// Source pixels → surface coordinates.
+    pub fn to_surface(&self, x: f32, y: f32) -> (f32, f32) {
+        let (sx, sy) = self.scale();
+        (x * sx + self.rect[0] as f32, y * sy + self.rect[1] as f32)
+    }
+}
+
+/// The surface a `src_w` × `src_h` stream decodes to: its own size without
+/// `out`, else the asked size with the picture stretched or letterboxed
+/// (every edge even, so chroma samples stay aligned).
+pub fn output_geom(src_w: usize, src_h: usize, out: Option<OutputSize>) -> OutputGeom {
+    let Some(o) = out else { return OutputGeom { src_w, src_h, w: src_w, h: src_h, rect: [0, 0, src_w, src_h] } };
+    let (w, h) = ((o.width & !1).max(2), (o.height & !1).max(2));
+    let rect = match o.fit {
+        Fit::Stretch => [0, 0, w, h],
+        Fit::Letterbox => {
+            let r = (w as f32 / src_w as f32).min(h as f32 / src_h as f32);
+            let cw = (((src_w as f32 * r).round() as usize) & !1).clamp(2, w);
+            let ch = (((src_h as f32 * r).round() as usize) & !1).clamp(2, h);
+            let (x0, y0) = (((w - cw) / 2) & !1, ((h - ch) / 2) & !1);
+            [x0, y0, x0 + cw, y0 + ch]
+        }
+    };
+    OutputGeom { src_w, src_h, w, h, rect }
+}
+
+/// How a decoder is created; the default is `NvDecoder::new`'s behaviour
+/// with 8 ring slots.
+#[derive(Debug, Clone, Copy)]
+pub struct DecoderOptions {
+    /// decoded frames kept alive in the output ring
+    pub slots: usize,
+    /// hand out one displayed picture in `keep_every`
+    pub keep_every: u32,
+    /// scale in the decoder; `None`: frames at the stream's size
+    pub output: Option<OutputSize>,
+}
+
+impl Default for DecoderOptions {
+    fn default() -> Self {
+        DecoderOptions { slots: 8, keep_every: 1, output: None }
     }
 }
 
@@ -245,6 +341,11 @@ struct Inner {
     /// context lock of this decoder (`vidLock`), destroyed after the decoder
     lock: *mut c_void,
     decoder: *mut c_void,
+    /// asked output size (None: the stream's)
+    output: Option<OutputSize>,
+    /// stream size and where it is in the surface, once the decoder exists
+    geom: Option<OutputGeom>,
+    /// decoded surface size (the output size, not the stream's)
     w: usize,
     h: usize,
     ring: u64,
@@ -285,13 +386,20 @@ unsafe extern "C" fn on_sequence(user: *mut c_void, fmt: *mut VideoFormat) -> i3
         return me.fail(format!("NVDEC: only 8-bit 4:2:0 streams (chroma {}, depth-8 {})", f.chroma_format, f.bit_depth_luma_minus8));
     }
     let [l, t, r, b] = f.display_area;
-    let (w, h) = ((r - l) as usize, (b - t) as usize);
-    if !me.decoder.is_null() {
-        if (w, h) == (me.w, me.h) {
+    let (sw, sh) = ((r - l) as usize, (b - t) as usize);
+    if let Some(g) = me.geom.filter(|_| !me.decoder.is_null()) {
+        if (sw, sh) == (g.src_w, g.src_h) {
             return (f.min_num_decode_surfaces as usize + me.extra) as i32;
         }
-        return me.fail(format!("NVDEC: resolution change {}x{} -> {w}x{h} (recreate the decoder)", me.w, me.h));
+        return me.fail(format!("NVDEC: resolution change {}x{} -> {sw}x{sh} (recreate the decoder)", g.src_w, g.src_h));
     }
+    // the surface: the stream's size, or the asked one (scaled by the engine)
+    let geom = output_geom(sw, sh, me.output);
+    let (w, h) = (geom.w, geom.h);
+    let target_rect = match me.output {
+        Some(OutputSize { fit: Fit::Letterbox, .. }) => geom.rect.map(|v| v as i16),
+        _ => [0; 4], // null rectangle: the whole surface
+    };
     // queued pictures keep their surfaces: min + extra, and `pending <= extra`
     let surfaces = f.min_num_decode_surfaces as u64 + me.extra as u64;
     let mut ci = DecodeCreateInfo {
@@ -313,15 +421,16 @@ unsafe extern "C" fn on_sequence(user: *mut c_void, fmt: *mut VideoFormat) -> i3
         target_height: h as u64,
         num_output_surfaces: 2, // mapped at once per decoder (collect maps one at a time)
         vid_lock: me.lock,
-        target_rect: [0; 4],
+        target_rect,
         enable_histogram: 0,
         enable_decode_features: 0,
         reserved2: [0; 3],
     };
     let rc = (me.api.create_decoder)(&mut me.decoder, &mut ci);
     if rc != 0 {
-        return me.fail(format!("cuvidCreateDecoder failed ({rc}) for {w}x{h}"));
+        return me.fail(format!("cuvidCreateDecoder failed ({rc}) for {sw}x{sh} -> {w}x{h}"));
     }
+    me.geom = Some(geom);
     me.w = w;
     me.h = h;
     me.slot_bytes = w * h * 3 / 2;
@@ -411,6 +520,7 @@ impl Inner {
         }
         let dst = self.ring + (self.next * self.slot_bytes) as u64;
         self.next = (self.next + 1) % self.slots;
+        // the mapped surface has the output size (the create-info's target), whatever the stream's
         let (w, h) = (self.w, self.h);
         // luma, then chroma (source chroma plane follows the target height, even-aligned)
         let planes = [(0usize, 0usize, h), ((h + 1) & !1, h, h / 2)];
@@ -464,6 +574,17 @@ impl NvDecoder {
     /// `keep_every`: hand out one displayed picture in `keep_every` (the rest
     /// are dropped before the map/copy; the engine still decodes them).
     pub fn with_options(gpu: Arc<CudaGpu>, codec: Codec, slots: usize, keep_every: u32) -> Result<NvDecoder> {
+        Self::with(gpu, codec, DecoderOptions { slots, keep_every, output: None })
+    }
+
+    /// A decoder with every option. With `output`, frames come out at that
+    /// size (`DecodedFrame::{w, h, pitch, uv_off}` describe the scaled
+    /// surface); `geom()` maps their pixels back to the stream's.
+    pub fn with(gpu: Arc<CudaGpu>, codec: Codec, opts: DecoderOptions) -> Result<NvDecoder> {
+        let DecoderOptions { slots, keep_every, output } = opts;
+        if let Some(o) = output {
+            ensure!(o.width >= 2 && o.height >= 2 && o.width <= i16::MAX as usize && o.height <= i16::MAX as usize, "NVDEC output size {}x{}", o.width, o.height);
+        }
         let api = Arc::new(Api::load()?);
         gpu.bind_thread()?;
         let mut lock = std::ptr::null_mut();
@@ -476,6 +597,8 @@ impl NvDecoder {
             stream: gpu.cu_stream(),
             lock,
             decoder: std::ptr::null_mut(),
+            output,
+            geom: None,
             w: 0,
             h: 0,
             ring: 0,
@@ -574,9 +697,16 @@ impl NvDecoder {
         self.collect(usize::MAX)
     }
 
-    /// Decoded frame size (0 before the first sequence header).
+    /// Decoded frame size (0 before the first sequence header): the output
+    /// size when one was asked, else the stream's.
     pub fn size(&self) -> (usize, usize) {
         (self.inner.w, self.inner.h)
+    }
+
+    /// The stream's size and where its picture is in the decoded frames
+    /// (None before the first sequence header).
+    pub fn geom(&self) -> Option<OutputGeom> {
+        self.inner.geom
     }
 }
 
@@ -641,6 +771,51 @@ impl Drop for NvDecoder {
                 sys::cuMemFree_v2(self.inner.ring);
             }
             (self.inner.api.ctx_lock_destroy)(self.inner.lock);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_output_is_the_stream_size() {
+        // odd sizes pass through untouched: nothing is rounded without an output size
+        let g = output_geom(1919, 1081, None);
+        assert_eq!((g.w, g.h, g.rect), (1919, 1081, [0, 0, 1919, 1081]));
+        assert_eq!(g.scale(), (1.0, 1.0));
+        assert_eq!(g.to_source(100.0, 50.0), (100.0, 50.0));
+    }
+
+    #[test]
+    fn stretch_fills_the_surface() {
+        let g = output_geom(1920, 1080, Some(OutputSize { width: 641, height: 641, fit: Fit::Stretch }));
+        assert_eq!((g.w, g.h, g.rect), (640, 640, [0, 0, 640, 640]));
+        let (sx, sy) = g.scale();
+        assert!((sx - 1.0 / 3.0).abs() < 1e-6 && (sy - 640.0 / 1080.0).abs() < 1e-6);
+        let (x, y) = g.to_source(320.0, 320.0);
+        assert!((x - 960.0).abs() < 1e-2 && (y - 540.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn letterbox_keeps_aspect_on_even_edges() {
+        let g = output_geom(1920, 1080, Some(OutputSize { width: 640, height: 640, fit: Fit::Letterbox }));
+        assert_eq!((g.w, g.h, g.rect), (640, 640, [0, 140, 640, 500]));
+        // surface -> source -> surface round trip, and the picture's corners
+        assert_eq!(g.to_source(0.0, 140.0), (0.0, 0.0));
+        let (x, y) = g.to_source(640.0, 500.0);
+        assert!((x - 1920.0).abs() < 1e-2 && (y - 1080.0).abs() < 1e-2);
+        let (x, y) = g.to_surface(960.0, 540.0);
+        assert!((x - 320.0).abs() < 1e-3 && (y - 320.0).abs() < 1e-3);
+        // portrait and awkward sizes: rect inside the surface, every edge even, aspect within a pixel pair
+        for (sw, sh, w, h) in [(1080usize, 1920usize, 640usize, 640usize), (1280, 720, 416, 416), (704, 576, 320, 192), (3840, 2160, 2, 2), (100, 4000, 64, 64)] {
+            let g = output_geom(sw, sh, Some(OutputSize { width: w, height: h, fit: Fit::Letterbox }));
+            let [x0, y0, x1, y1] = g.rect;
+            assert!(x0 < x1 && y0 < y1 && x1 <= g.w && y1 <= g.h, "{g:?}");
+            assert!([x0, y0, x1, y1, g.w, g.h].iter().all(|v| v % 2 == 0), "{g:?}");
+            let r = (w as f32 / sw as f32).min(h as f32 / sh as f32);
+            assert!(((x1 - x0) as f32 - sw as f32 * r).abs() <= 2.0 && ((y1 - y0) as f32 - sh as f32 * r).abs() <= 2.0, "{g:?}");
         }
     }
 }

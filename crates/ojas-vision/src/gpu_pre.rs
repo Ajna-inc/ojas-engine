@@ -69,6 +69,38 @@ impl Roi {
     }
 }
 
+/// A decoder-scaled surface (`DecoderOptions::output`): the frame has the surface's size,
+/// not the stream's, so everything here works in surface pixels until `decoded_to_source`.
+#[cfg(feature = "cuda")]
+impl DevFrame {
+    /// A decoded frame as a device frame (its own size, pitch and chroma offset).
+    pub fn of_decoded(f: &ojas_cuda::nvdec::DecodedFrame) -> DevFrame {
+        DevFrame { ptr: f.ptr, pitch: f.pitch, w: f.w, h: f.h, fmt: PixFmt::Nv12 { uv_off: f.uv_off } }
+    }
+}
+
+/// The picture inside decoded frame `frame` (all of it unless letterboxed): the ROI a
+/// detector should see, so letterbox bars never reach it.
+#[cfg(feature = "cuda")]
+pub fn decoded_content(frame: usize, g: &ojas_cuda::nvdec::OutputGeom) -> Roi {
+    let [x0, y0, x1, y1] = g.rect;
+    Roi { frame, x0, y0, w: x1 - x0, h: y1 - y0 }
+}
+
+/// Detections in decoded-surface pixels to the stream's own pixels.
+#[cfg(feature = "cuda")]
+pub fn decoded_to_source(g: &ojas_cuda::nvdec::OutputGeom, dets: &mut [Detection]) {
+    for d in dets.iter_mut() {
+        (d.x0, d.y0) = g.to_source(d.x0, d.y0);
+        (d.x1, d.y1) = g.to_source(d.x1, d.y1);
+        if let Some(kp) = &mut d.keypoints {
+            for p in kp.iter_mut() {
+                (p[0], p[1]) = g.to_source(p[0], p[1]);
+            }
+        }
+    }
+}
+
 /// How crops are placed into the model input.
 #[derive(Debug, Clone, Copy)]
 pub enum Placement {
@@ -314,6 +346,29 @@ mod tests {
             }
         }
         out
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn decoder_scaled_detections_map_back_to_the_stream() {
+        use ojas_cuda::nvdec::{output_geom, DecodedFrame, Fit, OutputSize};
+        // 1920x1080 letterboxed by the decoder into 640x640: picture rows 140..500
+        let g = output_geom(1920, 1080, Some(OutputSize { width: 640, height: 640, fit: Fit::Letterbox }));
+        let f = DevFrame::of_decoded(&DecodedFrame { ptr: 64, pitch: 640, w: g.w, h: g.h, uv_off: 640 * 640, timestamp: 0 });
+        assert_eq!((f.w, f.h, f.pitch, f.fmt), (640, 640, 640, PixFmt::Nv12 { uv_off: 640 * 640 }));
+        let roi = decoded_content(0, &g);
+        assert_eq!((roi.x0, roi.y0, roi.w, roi.h), (0, 140, 640, 360));
+        assert!(descriptors(&[f], &[roi], Placement::Letterbox { target: 640 }).is_ok());
+        // a box the detector reports inside the ROI, moved to the surface, then to the stream
+        let kp = [[100.0, 30.0], [200.0, 30.0], [200.0, 90.0], [100.0, 90.0]];
+        let mut dets = vec![Detection { class: 0, score: 0.9, x0: 100.0, y0: 30.0, x1: 200.0, y1: 90.0, keypoints: Some(kp) }];
+        roi.to_frame(&mut dets);
+        decoded_to_source(&g, &mut dets);
+        let d = &dets[0];
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-2;
+        assert!(near(d.x0, 300.0) && near(d.y0, 90.0) && near(d.x1, 600.0) && near(d.y1, 270.0), "{d:?}");
+        let k = d.keypoints.unwrap();
+        assert!(near(k[2][0], 600.0) && near(k[2][1], 270.0), "{k:?}");
     }
 
     #[test]

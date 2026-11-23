@@ -577,6 +577,7 @@ dependencies = [
  "ojas-formats",
  "ojas-metal",
  "ojas-tokenize",
+ "ojas-vision",
  "serde_json",
  "tracing",
 ]
