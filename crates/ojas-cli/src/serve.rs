@@ -33,6 +33,7 @@ mod embed;
 mod images;
 mod logprobs;
 mod metrics;
+mod ocr_route;
 mod tools;
 pub(crate) use conn::{drain_on_sigterm, Conn};
 /// Marks a request body that arrived on the Messages API route.
@@ -53,6 +54,18 @@ pub(crate) struct Request {
     request_id: Option<String>,
     /// `X-Priority: batch`: bulk work that yields to every other request.
     background: bool,
+}
+
+/// A request whose body is past `MAX_BODY`, answered 413.
+#[derive(Debug)]
+struct TooLarge(usize);
+
+impl std::error::Error for TooLarge {}
+
+impl std::fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "request body of {} bytes exceeds the {MAX_BODY}-byte limit", self.0)
+    }
 }
 
 /// Read one HTTP/1.1 request. `None` on a closed or unusable connection.
@@ -97,7 +110,7 @@ fn read_request(stream: &mut impl BufRead) -> Result<Option<Request>> {
         }
     }
     if len > MAX_BODY {
-        anyhow::bail!("request body of {len} bytes exceeds the {MAX_BODY}-byte limit");
+        return Err(TooLarge(len).into());
     }
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body)?;
@@ -690,6 +703,9 @@ fn serve_batched(front: &Front, model: &dyn Model, ctx: &Ctx, props: &Value) -> 
 /// The body and response format of a completion request, answering a malformed body
 /// itself; `None` for any other route.
 fn completion_route(stream: &mut Conn, req: &Request, path: &str) -> Option<(Value, bool, bool)> {
+    if (req.method.as_str(), path) == ("POST", "/v1/ocr") {
+        return ocr_route::request(stream, &req.body).map(|body| (body, true, true));
+    }
     let ("POST", "/completion" | "/completions" | "/v1/completions" | "/v1/chat/completions" | "/v1/messages") =
         (req.method.as_str(), path) else { return None };
     match serde_json::from_slice::<Value>(&req.body) {
@@ -864,7 +880,8 @@ impl Front {
                 Err(e) => {
                     // A failed handshake or a dropped socket has no one to answer.
                     if e.downcast_ref::<std::io::Error>().is_none() {
-                        send_err(&mut conn, "400 Bad Request", &format!("{e:#}"));
+                        let status = if e.is::<TooLarge>() { "413 Payload Too Large" } else { "400 Bad Request" };
+                        send_err(&mut conn, status, &format!("{e:#}"));
                     }
                     return None;
                 }

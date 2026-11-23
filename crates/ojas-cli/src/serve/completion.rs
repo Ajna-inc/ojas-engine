@@ -182,6 +182,8 @@ pub(crate) struct Reply {
     anth: Option<anthropic::Shape>,
     /// Set for a chat request with tools: how to find the calls in the text.
     tools: Option<ToolReply>,
+    /// Set for an OCR request: how to turn the model's markup into a page.
+    ocr: Option<super::ocr_route::Shape>,
     began: std::time::Instant,
     /// How long the first token took, once there is one.
     first_token: Option<std::time::Duration>,
@@ -211,6 +213,14 @@ pub(crate) fn start(stream: Conn, ctx: &Ctx, body: &Value, chat: bool, oai: bool
             Err(e) => return refuse(stream, &e),
         }
     } else { (body, None, None) };
+    let ocr = match super::ocr_route::Shape::of(ctx, body) {
+        Ok(shape) => shape,
+        Err(why) => {
+            metrics::failed();
+            send_err(&mut stream, "501 Not Implemented", &why);
+            return None;
+        }
+    };
     // A request with image parts brings its own prompt, boundaries and image rows.
     let built = match super::images::build(ctx, body) {
         Ok(b) => b,
@@ -292,7 +302,7 @@ pub(crate) fn start(stream: Conn, ctx: &Ctx, body: &Value, chat: bool, oai: bool
         model_name: info.arch.clone(),
         prompt_tokens: job.ids.len(), end_of_turn: if ignore_eos { None } else { ctx.secondary },
         text_stream: TextStream::new(&stops), text: String::new(), out_ids: Vec::with_capacity(want), alive: true,
-        logprobs, out, anth, tools, began, first_token: None, deadline: timeout.map(|t| began + t),
+        logprobs, out, anth, tools, ocr, began, first_token: None, deadline: timeout.map(|t| began + t),
         timed_out: std::cell::Cell::new(false), request_id: stream.request_id.clone(),
     };
     Some((job, reply))
@@ -373,6 +383,7 @@ impl Reply {
         self.out_ids.push(t);
         self.text.push_str(&piece);
         let logprobs = self.logprobs.as_mut().map(|l| l.token(|id| bpe.decode_bytes(id as usize), t));
+        if self.ocr.as_mut().is_some_and(|page| !page.token(&self.out_ids)) { return false; }
         if self.anth.is_some() {
             // Buffered: blocks are cut from the whole text. A ping keeps a long reply's connection warm.
             if self.streaming && self.out_ids.len().is_multiple_of(ALIVE_EVERY) {
@@ -447,6 +458,11 @@ impl Reply {
         }
         let tail = self.text_stream.finish();
         self.text.push_str(&tail);
+        let steps = self.logprobs.as_ref().map(Logprobs::steps);
+        let page = match self.ocr.take().map(|o| o.page(&self.text, steps.as_deref(), gen.finish == FinishReason::Length)).transpose() {
+            Ok(page) => page,
+            Err(why) => return self.fail("501 Not Implemented", "not_supported_error", &why),
+        };
         let n_out = self.out_ids.len();
         eprintln!("  request {}{}: {} tokens out, {} cached, {:.1}s total", self.id, self.tag(), n_out, gen.cached_tokens,
                   self.began.elapsed().as_secs_f32());
@@ -470,6 +486,12 @@ impl Reply {
         });
         if let Some(r) = &gen.prompt_cache { usage["prompt_cache"] = restore_json(r); }
         let (id, created, model) = (&self.id, self.created, &self.model_name);
+
+        if let Some(mut page) = page {
+            page["usage"] = usage;
+            self.out.send(json_response("200 OK", &page, &headers));
+            return;
+        }
 
         if let Some(shape) = &self.anth {
             self.out.hush();

@@ -207,6 +207,11 @@ impl Logprobs {
         self.shaped(&self.entries[self.entries.len() - 1..])
     }
 
+    /// Each token's length in bytes and its log-probability, in order.
+    pub(crate) fn steps(&self) -> Vec<(usize, Option<f64>)> {
+        self.entries.iter().map(|e| (e.piece.bytes.len(), e.logprob)).collect()
+    }
+
     /// Every token's log-probabilities, for a whole response.
     pub(crate) fn whole(&self) -> Value { self.shaped(&self.entries) }
 
