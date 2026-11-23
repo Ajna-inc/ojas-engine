@@ -17,6 +17,7 @@ static REQUEST_US: AtomicU64 = AtomicU64::new(0);
 static RUNNING: AtomicU64 = AtomicU64::new(0);
 static WAITING: AtomicU64 = AtomicU64::new(0);
 static SLOTS: AtomicU64 = AtomicU64::new(1);
+static QUEUED: AtomicU64 = AtomicU64::new(0);
 
 /// What one answered request cost.
 pub(crate) struct Answered {
@@ -53,6 +54,13 @@ pub(crate) fn load(running: usize, waiting: usize) {
     WAITING.store(waiting as u64, Relaxed);
 }
 
+/// A request was parsed and handed to the engine thread (`true`), or the engine
+/// thread took it up (`false`). Counted apart from `load`'s waiting, which the
+/// engine thread can only update between its own steps.
+pub(crate) fn queued(arrived: bool) {
+    if arrived { QUEUED.fetch_add(1, Relaxed); } else { QUEUED.fetch_sub(1, Relaxed); }
+}
+
 pub(crate) fn slots(n: usize) { SLOTS.store(n as u64, Relaxed); }
 
 pub(crate) fn render() -> String {
@@ -70,7 +78,8 @@ pub(crate) fn render() -> String {
         ("generation_seconds_total", "counter", "Time from first token to last, summed; completion tokens over this is the decode rate.", secs(&GENERATION_US)),
         ("request_seconds_total", "counter", "Time from a request's arrival to its end, summed.", secs(&REQUEST_US)),
         ("requests_running", "gauge", "Requests holding a slot.", n(&RUNNING)),
-        ("requests_waiting", "gauge", "Requests waiting for a slot.", n(&WAITING)),
+        ("requests_waiting", "gauge", "Requests waiting for a slot.",
+         (WAITING.load(Relaxed) + QUEUED.load(Relaxed)).to_string()),
         ("slots", "gauge", "Requests the model decodes together.", n(&SLOTS)),
         ("connections_open", "gauge", "Requests read and not yet fully answered, on any route.", super::conn::active().to_string()),
         ("draining", "gauge", "1 once the server was asked to stop.", (super::conn::draining() as u8).to_string()),

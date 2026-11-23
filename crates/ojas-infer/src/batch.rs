@@ -15,6 +15,10 @@
 //! When every slot is busy, the waiting request whose prompt the prefix cache can
 //! restore furthest goes next; one that has waited `max_wait` goes first instead,
 //! oldest first, so none starves.
+//!
+//! A request marked `background` yields to the others: none is admitted while a
+//! foreground request waits, and with several slots the last free one is kept for
+//! foreground work, so bulk requests never fill the model.
 
 use crate::{FinishReason, Generation, LogitProcessor, Picker, SampleOpts};
 use ojas_core::Model;
@@ -43,6 +47,9 @@ pub struct Request {
     pub reuse: bool,
     /// The prompt's images, when it has any.
     pub images: Option<crate::image::PromptImages>,
+    /// Bulk work that someone is not waiting on: admitted after every foreground
+    /// request, and never into the last free slot of several.
+    pub background: bool,
 }
 
 impl Request {
@@ -137,21 +144,26 @@ impl<'m, M: Model + ?Sized> Batch<'m, M> {
     fn admit(&mut self, sink: &mut Sink<'_>) {
         while let Some(slot) = self.slots.iter().position(Option::is_none) {
             let Some(i) = self.next_waiting() else { return };
+            let free = self.slots.iter().filter(|s| s.is_none()).count();
+            if self.waiting[i].req.background && self.slots.len() > 1 && free == 1 { return; }
             let w = self.waiting.remove(i).unwrap();
             self.start(slot, w, sink);
         }
     }
 
-    /// The waiting request to admit next: the oldest one past `max_wait`, else the
-    /// one the prefix cache can restore furthest, earliest first among equals.
+    /// The waiting request to admit next, foreground requests before background
+    /// ones: within a class the oldest one past `max_wait`, else the one the prefix
+    /// cache can restore furthest, earliest first among equals.
     fn next_waiting(&self) -> Option<usize> {
         let now = Instant::now();
-        if let Some(i) = self.waiting.iter().position(|w| now - w.arrived >= self.max_wait) { return Some(i); }
+        let background = self.waiting.iter().all(|w| w.req.background);
+        let class = |w: &Waiting| w.req.background == background;
+        if let Some(i) = self.waiting.iter().position(|w| class(w) && now - w.arrived >= self.max_wait) { return Some(i); }
         let cached = |w: &Waiting| {
             let ids = w.req.cache_ids();
             self.model.cached_prefix_len(&ids[..ids.len().min(w.req.prompt.len()).saturating_sub(1)])
         };
-        (0..self.waiting.len()).rev().max_by_key(|&i| cached(&self.waiting[i]))
+        (0..self.waiting.len()).rev().filter(|&i| class(&self.waiting[i])).max_by_key(|&i| cached(&self.waiting[i]))
     }
 
     fn start(&mut self, slot: usize, w: Waiting, sink: &mut Sink<'_>) {
@@ -348,7 +360,36 @@ mod tests {
 
     fn request(prompt: Vec<u32>, max_tokens: usize) -> Request {
         Request { prompt, max_tokens, opts: None, processor: None, stop: vec![STOP], banned: Vec::new(),
-                  marks: Vec::new(), docs: Vec::new(), reuse: true, images: None }
+                  marks: Vec::new(), docs: Vec::new(), reuse: true, images: None, background: false }
+    }
+
+    #[test]
+    fn background_requests_wait_for_foreground_ones_and_leave_a_slot_free() {
+        // One slot: the foreground request goes first although it arrived last.
+        let model = Mock::new(1);
+        let mut batch = Batch::new(&model, Duration::ZERO);
+        batch.submit(0, Request { background: true, ..request(vec![5; 4], 1) });
+        batch.submit(1, Request { background: true, ..request(vec![6; 4], 1) });
+        batch.submit(2, request(vec![7; 4], 1));
+        let mut order = Vec::new();
+        while !batch.is_idle() {
+            batch.step(&mut |id, e| {
+                if matches!(e, Event::Prefill(..)) && !order.contains(&id) { order.push(id); }
+                true
+            });
+        }
+        assert_eq!(order, vec![2, 0, 1]);
+
+        // Two slots: background work takes one and never the other.
+        let model = Mock::new(2);
+        let mut batch = Batch::new(&model, Duration::ZERO);
+        batch.submit(0, Request { background: true, ..request(vec![5; 4], 50) });
+        batch.submit(1, Request { background: true, ..request(vec![6; 4], 50) });
+        batch.step(&mut |_, _| true);
+        assert_eq!(batch.load(), (1, 1), "the second background request waits though a slot is free");
+        batch.submit(2, request(vec![7; 4], 50));
+        batch.step(&mut |_, _| true);
+        assert_eq!(batch.load(), (2, 1), "a foreground request takes the slot kept for it");
     }
 
     /// Run `reqs` to completion and return each one's generation by id.

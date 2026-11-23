@@ -73,6 +73,8 @@ pub(crate) struct Job {
     pub(crate) eog: Vec<u32>,
     pub(crate) eos: Option<u32>,
     pub(crate) banned: Vec<u32>,
+    /// Bulk work nobody is waiting on: it runs after every other request.
+    pub(crate) background: bool,
 }
 
 impl Job {
@@ -87,6 +89,7 @@ impl Job {
             prompt: self.ids, max_tokens: self.want, opts: self.sampling,
             processor: self.constraint.map(|p| p as Box<dyn LogitProcessor>), stop,
             banned: self.banned, marks: self.marks, docs: self.docs, reuse: self.reuse, images: self.images,
+            background: self.background,
         }
     }
 }
@@ -247,6 +250,12 @@ pub(crate) fn start(stream: Conn, ctx: &Ctx, body: &Value, chat: bool, oai: bool
     // different text from that point, so a benchmark whose outputs diverge is not
     // like-for-like.
     let ignore_eos = body.get("ignore_eos").and_then(Value::as_bool).unwrap_or(false);
+    // `"priority": "batch"`, or the same in an `X-Priority` header a proxy can set.
+    let background = match body.get("priority").and_then(Value::as_str) {
+        None | Some("interactive") => stream.background,
+        Some("batch") => true,
+        Some(other) => return refuse(stream, &format!("unknown priority \"{other}\" (want \"interactive\" or \"batch\")")),
+    };
     // A request may ask for less time than the server allows, never more.
     let asked = body.get("timeout_ms").and_then(Value::as_f64).filter(|ms| *ms > 0.0)
         .map(|ms| std::time::Duration::from_secs_f64(ms / 1e3));
@@ -265,6 +274,7 @@ pub(crate) fn start(stream: Conn, ctx: &Ctx, body: &Value, chat: bool, oai: bool
         eog: if ignore_eos { Vec::new() } else { info.eog.clone() },
         eos: if ignore_eos { None } else { ctx.primary },
         banned: if ignore_eos { info.eog.clone() } else { Vec::new() },
+        background,
         ids,
     };
     let out = match Outbox::new(&stream) {
@@ -337,6 +347,14 @@ impl Reply {
 
     /// Whether to go on with the request: the client is still waiting and there is time left.
     pub(crate) fn connected(&self) -> bool { !self.expired() && self.alive && self.out.connected() }
+
+    /// End a request that never started: 504 when it ran out of time waiting,
+    /// nothing when its client left.
+    pub(crate) fn give_up(self) {
+        if self.timed_out.get() {
+            self.fail("504 Gateway Timeout", "timeout_error", "the request ran out of time before it was answered");
+        }
+    }
 
     /// One chunk of a streamed chat completion.
     fn chat_chunk(&self, delta: Value, finish: Value) -> Value {

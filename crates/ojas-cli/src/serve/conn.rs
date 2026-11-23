@@ -54,12 +54,14 @@ pub(crate) struct Conn {
     tls: Option<Arc<TlsIo>>,
     /// The caller's `X-Request-Id`, echoed on the response and in the log.
     pub(crate) request_id: Option<String>,
+    /// The request came marked as bulk work (`X-Priority: batch`).
+    pub(crate) background: bool,
     _busy: Arc<Busy>,
 }
 
 impl Conn {
     pub(crate) fn plain(stream: TcpStream) -> Conn {
-        Conn { raw: stream, tls: None, request_id: None, _busy: Busy::new() }
+        Conn { raw: stream, tls: None, request_id: None, background: false, _busy: Busy::new() }
     }
 
     /// A connection that speaks TLS; the handshake happens on its first read.
@@ -67,12 +69,12 @@ impl Conn {
         let session = rustls::ServerConnection::new(Arc::clone(config)).map_err(io::Error::other)?;
         let raw = stream.try_clone()?;
         let tls = Arc::new(TlsIo(Mutex::new(rustls::StreamOwned::new(session, stream))));
-        Ok(Conn { raw, tls: Some(tls), request_id: None, _busy: Busy::new() })
+        Ok(Conn { raw, tls: Some(tls), request_id: None, background: false, _busy: Busy::new() })
     }
 
     pub(crate) fn try_clone(&self) -> io::Result<Conn> {
         Ok(Conn { raw: self.raw.try_clone()?, tls: self.tls.clone(), request_id: self.request_id.clone(),
-                  _busy: Arc::clone(&self._busy) })
+                  background: self.background, _busy: Arc::clone(&self._busy) })
     }
 
     pub(crate) fn set_read_timeout(&self, d: Option<Duration>) -> io::Result<()> { self.raw.set_read_timeout(d) }

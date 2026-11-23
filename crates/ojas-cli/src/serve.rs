@@ -50,6 +50,8 @@ pub(crate) struct Request {
     bearer: Option<String>,
     /// The caller's `X-Request-Id`, when it is one a log line can hold.
     request_id: Option<String>,
+    /// `X-Priority: batch`: bulk work that yields to every other request.
+    background: bool,
 }
 
 /// Read one HTTP/1.1 request. `None` on a closed or unusable connection.
@@ -65,7 +67,7 @@ fn read_request(stream: &mut impl BufRead) -> Result<Option<Request>> {
         _ => return Ok(None),
     };
 
-    let (mut len, mut bearer, mut request_id) = (0usize, None, None);
+    let (mut len, mut bearer, mut request_id, mut background) = (0usize, None, None, false);
     loop {
         let mut h = String::new();
         if stream.read_line(&mut h)? == 0 {
@@ -88,6 +90,8 @@ fn read_request(stream: &mut impl BufRead) -> Result<Option<Request>> {
                 let id = v.1.trim();
                 let plain = !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_graphic());
                 request_id = plain.then(|| id.to_string());
+            } else if v.0.eq_ignore_ascii_case("x-priority") {
+                background = v.1.trim().eq_ignore_ascii_case("batch");
             }
         }
     }
@@ -96,7 +100,7 @@ fn read_request(stream: &mut impl BufRead) -> Result<Option<Request>> {
     }
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body)?;
-    Ok(Some(Request { method, path, body, bearer, request_id }))
+    Ok(Some(Request { method, path, body, bearer, request_id, background }))
 }
 
 /// Header lines every response of this process carries: the CORS origin, when one
@@ -506,27 +510,55 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
 }
 
 /// Serve one request at a time on the thread that owns the model, with speculative
-/// decoding available to every request.
+/// decoding available to every request. Requests are parsed on their connection's
+/// thread and wait here; the next to run is the oldest that is not bulk work, and
+/// bulk work only when nothing else waits.
 fn serve_alone(front: &Front, model: &dyn Model, ctx: &Ctx, props: &Value) -> Result<()> {
     let mut core = EngineCore::new(model);
-    serve_http(front, |stream, req, path| {
-        if let Some((body, chat, oai)) = completion_route(stream, req, path) {
-            match stream.try_clone() {
-                Ok(stream) => run_alone(&mut core, ctx, stream, &body, chat, oai),
-                Err(e) => send_err(stream, "500 Internal Server Error", &format!("cannot answer this connection: {e}")),
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(move || accept_each(front, scope, move |arrived| arrive(arrived, ctx), tx));
+        let mut waiting: VecDeque<(Box<(completion::Job, completion::Reply)>, Ticket)> = VecDeque::new();
+        loop {
+            let mut arrived: Vec<(Arrival, Ticket)> = Vec::new();
+            if waiting.is_empty() {
+                match rx.recv() {
+                    Ok(a) => arrived.push(a),
+                    Err(_) => return Ok(()),
+                }
             }
-        } else if (req.method.as_str(), path) == ("POST", "/cache/warm") {
-            if let Some((ids, pin)) = warm_request(stream, req, ctx) { warm(stream, model, 0, &ids, pin); }
-        } else if !serve_other(stream, req, path, model, ctx, props) {
-            send_err(stream, "404 Not Found", &format!("no route for {} {}", req.method, path));
+            arrived.extend(rx.try_iter());
+            for (a, ticket) in arrived {
+                match a {
+                    Arrival::Completion(request) if waiting.len() >= MAX_QUEUE => {
+                        metrics::queued(false);
+                        request.1.refuse("429 Too Many Requests", "the server is at capacity; retry shortly")
+                    }
+                    Arrival::Completion(request) => waiting.push_back((request, ticket)),
+                    Arrival::Warm(mut stream, ids, pin) => warm(&mut stream, model, 0, &ids, pin),
+                    Arrival::Other(mut stream, req, path) => {
+                        if !serve_other(&mut stream, &req, &path, model, ctx, props) {
+                            send_err(&mut stream, "404 Not Found", &format!("no route for {} {}", req.method, path));
+                        }
+                    }
+                }
+            }
+            let next = waiting.iter().position(|(request, _)| !request.0.background).unwrap_or(0);
+            if let Some((request, _ticket)) = waiting.remove(next) {
+                let (job, reply) = *request;
+                metrics::queued(false);
+                metrics::load(1, 0);
+                run_alone(&mut core, ctx, job, reply);
+                metrics::load(0, 0);
+            }
         }
     })
 }
 
-fn run_alone(core: &mut EngineCore<&dyn Model>, ctx: &Ctx, stream: Conn, body: &Value, chat: bool, oai: bool) {
-    let Some((mut job, mut reply)) = completion::start(stream, ctx, body, chat, oai) else { return };
+fn run_alone(core: &mut EngineCore<&dyn Model>, ctx: &Ctx, mut job: completion::Job, mut reply: completion::Reply) {
     if let Some(err) = ojas_core::device_fault::peek() { return reply.refuse("503 Service Unavailable", &fault_message(&err)); }
-    metrics::load(1, 0);
+    // Its client left, or its time ran out, while it waited.
+    if !reply.connected() { return reply.give_up(); }
     reply.begin();
     let model = core.model();
     model.set_prefix_reuse(job.reuse);
@@ -540,7 +572,6 @@ fn run_alone(core: &mut EngineCore<&dyn Model>, ctx: &Ctx, stream: Conn, body: &
         constraint.as_deref_mut().map(|p| p as &mut dyn ojas_infer::LogitProcessor), &mut |_, _| {},
         &mut |t| reply.token(ctx.bpe, t));
     reply.finish(&gen);
-    metrics::load(0, 0);
 }
 
 /// Why a session with a latched device fault refuses requests.
@@ -565,8 +596,21 @@ enum Arrival {
 /// Read and parse one connection: a completion is tokenized and checked here, off
 /// the engine thread, so a long transcript or a slow client never delays decoding.
 fn arrive((mut stream, req, path): Arrived, ctx: &Ctx) -> Option<Arrival> {
+    // Probes and counters need no model: answered here, they never wait behind a generation.
+    match (req.method.as_str(), path.as_str()) {
+        ("GET", "/health") => { health(&mut stream); return None; }
+        ("GET", "/ready") => { ready(&mut stream); return None; }
+        ("GET", "/metrics") => {
+            send(&mut stream, "200 OK", "text/plain; version=0.0.4", metrics::render().as_bytes());
+            return None;
+        }
+        _ => {}
+    }
     if let Some((body, chat, oai)) = completion_route(&mut stream, &req, &path) {
-        return completion::start(stream, ctx, &body, chat, oai).map(|r| Arrival::Completion(Box::new(r)));
+        return completion::start(stream, ctx, &body, chat, oai).map(|r| {
+            metrics::queued(true);
+            Arrival::Completion(Box::new(r))
+        });
     }
     if (req.method.as_str(), path.as_str()) == ("POST", "/cache/warm") {
         let (ids, pin) = warm_request(&mut stream, &req, ctx)?;
@@ -601,6 +645,7 @@ fn serve_batched(front: &Front, model: &dyn Model, ctx: &Ctx, props: &Value) -> 
             for (a, ticket) in arrived {
                 match a {
                     Arrival::Completion(request) => {
+                        metrics::queued(false);
                         let (job, mut reply) = *request;
                         if let Some(err) = ojas_core::device_fault::peek() {
                             reply.refuse("503 Service Unavailable", &fault_message(&err));
@@ -822,6 +867,7 @@ impl Front {
             }
         };
         conn.request_id = req.request_id.clone();
+        conn.background = req.background;
         if req.method == "OPTIONS" {
             // Without an allowed origin the preflight carries no grant, and the browser refuses.
             let head = format!("HTTP/1.1 204 No Content\r\n{}Access-Control-Allow-Headers: *\r\n\
