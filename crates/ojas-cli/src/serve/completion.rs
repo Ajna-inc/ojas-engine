@@ -11,8 +11,9 @@
 
 use super::anthropic;
 use super::logprobs::{self, Logprobs};
-use super::{error_response, json_response, now, output_format, prompt_docs, prompt_ids, prompt_marks, restore_json,
-            sampling_from, send_err, sse_event, stop_strings, SSE_HEAD};
+use super::tools::{self, ToolReply};
+use super::{error_response, json_response, metrics, now, output_format, prompt_docs, prompt_ids, prompt_marks,
+            request_id_header, restore_json, sampling_from, send_err, sse_event, sse_head, stop_strings, Conn};
 use crate::backend::ModelInfo;
 use crate::detok::TextStream;
 use crate::flags::RunOpts;
@@ -21,7 +22,6 @@ use ojas_infer::{batch, FinishReason, Generation, LogitProcessor, SampleOpts};
 use ojas_tokenize::Bpe;
 use serde_json::{json, Value};
 use std::io::Write;
-use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
@@ -31,6 +31,9 @@ const OUTBOX: usize = 4096;
 
 /// Tokens between checks that a client still waiting for a whole response is there.
 const ALIVE_EVERY: usize = 32;
+
+/// Tells apart requests that arrive within one second, in their ids.
+static SERIAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// What every request on this server shares.
 pub(crate) struct Ctx<'a> {
@@ -46,6 +49,10 @@ pub(crate) struct Ctx<'a> {
     pub(crate) prefix_cache: bool,
     /// What the server needs to take images, or why it takes none.
     pub(crate) images: &'a Result<super::images::Vision, String>,
+    /// The model file this server answers from.
+    pub(crate) identity: &'a super::Identity,
+    /// Longest a request may take from its arrival, when the server sets one.
+    pub(crate) timeout: Option<std::time::Duration>,
 }
 
 /// What a request asks the model to generate.
@@ -89,7 +96,7 @@ struct Outbox {
     tx: mpsc::SyncSender<Vec<u8>>,
     gone: Arc<AtomicBool>,
     /// The connection itself, kept to notice a client that hung up.
-    stream: TcpStream,
+    stream: Conn,
     tx_ping: mpsc::SyncSender<Vec<u8>>,
     /// Ends the keep-alive thread.
     quiet: Arc<AtomicBool>,
@@ -100,7 +107,7 @@ impl Drop for Outbox {
 }
 
 impl Outbox {
-    fn new(stream: &TcpStream) -> std::io::Result<Self> {
+    fn new(stream: &Conn) -> std::io::Result<Self> {
         let (mut writer, stream) = (stream.try_clone()?, stream.try_clone()?);
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(OUTBOX);
         let gone = Arc::new(AtomicBool::new(false));
@@ -144,23 +151,9 @@ impl Outbox {
 
     /// Whether the client is still connected, without waiting.
     fn connected(&self) -> bool {
-        !self.gone.load(Ordering::Relaxed) && !peer_closed(&self.stream)
+        !self.gone.load(Ordering::Relaxed) && !self.stream.closed()
     }
 }
-
-/// Whether the peer closed the connection: a non-blocking peek reads end of stream.
-#[cfg(unix)]
-fn peer_closed(stream: &TcpStream) -> bool {
-    use std::os::fd::AsRawFd;
-    let mut byte = 0u8;
-    let n = unsafe {
-        libc::recv(stream.as_raw_fd(), (&mut byte as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT)
-    };
-    n == 0
-}
-
-#[cfg(not(unix))]
-fn peer_closed(_stream: &TcpStream) -> bool { false }
 
 /// How a request is answered: the connection, the response format, and the text so
 /// far.
@@ -184,21 +177,37 @@ pub(crate) struct Reply {
     alive: bool,
     /// Set for a Messages API request: how to turn the text into content blocks.
     anth: Option<anthropic::Shape>,
+    /// Set for a chat request with tools: how to find the calls in the text.
+    tools: Option<ToolReply>,
     began: std::time::Instant,
+    /// How long the first token took, once there is one.
+    first_token: Option<std::time::Duration>,
+    /// When the request runs out of time, and whether it did.
+    deadline: Option<std::time::Instant>,
+    timed_out: std::cell::Cell<bool>,
+    /// The caller's request id, for the log and as a response header line.
+    request_id: Option<String>,
 }
 
 /// Parse a completion request, answering it at once with an error when it is
 /// malformed. Nothing is sent on success until `Reply::begin`.
-pub(crate) fn start(stream: TcpStream, ctx: &Ctx, body: &Value, chat: bool, oai: bool) -> Option<(Job, Reply)> {
+pub(crate) fn start(stream: Conn, ctx: &Ctx, body: &Value, chat: bool, oai: bool) -> Option<(Job, Reply)> {
     let (bpe, info, opts) = (ctx.bpe, ctx.info, ctx.opts);
     let mut stream = stream;
+    let began = std::time::Instant::now();
     let converted;
-    let (body, anth) = if body.get(super::MESSAGES_MARK).is_some() {
+    let (body, anth, tools) = if body.get(super::MESSAGES_MARK).is_some() {
         match anthropic::convert(body, &opts.system) {
-            Ok(c) => { converted = c.body; (&converted, Some(c.shape)) }
+            Ok(c) => { converted = c.body; (&converted, Some(c.shape), None) }
             Err(e) => return refuse(stream, &e),
         }
-    } else { (body, None) };
+    } else if chat && oai {
+        match tools::convert(body, &info.arch, &opts.system) {
+            Ok(Some((internal, reply))) => { converted = internal; (&converted, None, Some(reply)) }
+            Ok(None) => (body, None, None),
+            Err(e) => return refuse(stream, &e),
+        }
+    } else { (body, None, None) };
     // A request with image parts brings its own prompt, boundaries and image rows.
     let built = match super::images::build(ctx, body) {
         Ok(b) => b,
@@ -238,6 +247,13 @@ pub(crate) fn start(stream: TcpStream, ctx: &Ctx, body: &Value, chat: bool, oai:
     // different text from that point, so a benchmark whose outputs diverge is not
     // like-for-like.
     let ignore_eos = body.get("ignore_eos").and_then(Value::as_bool).unwrap_or(false);
+    // A request may ask for less time than the server allows, never more.
+    let asked = body.get("timeout_ms").and_then(Value::as_f64).filter(|ms| *ms > 0.0)
+        .map(|ms| std::time::Duration::from_secs_f64(ms / 1e3));
+    let timeout = match (ctx.timeout, asked) {
+        (Some(most), Some(asked)) => Some(most.min(asked)),
+        (most, asked) => most.or(asked),
+    };
     let job = Job {
         marks: built_marks.unwrap_or_else(|| if ctx.prefix_cache { prompt_marks(body, bpe, info, opts) } else { Vec::new() }),
         docs: if ctx.prefix_cache && images.is_none() { prompt_docs(body, bpe, info, opts) } else { Vec::new() },
@@ -254,6 +270,7 @@ pub(crate) fn start(stream: TcpStream, ctx: &Ctx, body: &Value, chat: bool, oai:
     let out = match Outbox::new(&stream) {
         Ok(out) => out,
         Err(e) => {
+            metrics::failed();
             send_err(&mut stream, "500 Internal Server Error", &format!("cannot answer this connection: {e}"));
             return None;
         }
@@ -261,15 +278,18 @@ pub(crate) fn start(stream: TcpStream, ctx: &Ctx, body: &Value, chat: bool, oai:
     let reply = Reply {
         streaming: body.get("stream").and_then(Value::as_bool).unwrap_or(false), oai, chat,
         return_tokens: body.get("return_tokens").and_then(Value::as_bool).unwrap_or(false),
-        id: format!("cmpl-{:x}", now()), created: now(), model_name: info.arch.clone(),
+        id: format!("cmpl-{:x}{:04x}", now(), SERIAL.fetch_add(1, Ordering::Relaxed) & 0xffff), created: now(),
+        model_name: info.arch.clone(),
         prompt_tokens: job.ids.len(), end_of_turn: if ignore_eos { None } else { ctx.secondary },
         text_stream: TextStream::new(&stops), text: String::new(), out_ids: Vec::with_capacity(want), alive: true,
-        logprobs, out, anth, began: std::time::Instant::now(),
+        logprobs, out, anth, tools, began, first_token: None, deadline: timeout.map(|t| began + t),
+        timed_out: std::cell::Cell::new(false), request_id: stream.request_id.clone(),
     };
     Some((job, reply))
 }
 
-fn refuse(mut stream: TcpStream, msg: &str) -> Option<(Job, Reply)> {
+fn refuse(mut stream: Conn, msg: &str) -> Option<(Job, Reply)> {
+    metrics::failed();
     send_err(&mut stream, "400 Bad Request", msg);
     None
 }
@@ -278,9 +298,9 @@ impl Reply {
     /// Commit to answering: a stream's header and first chunk go out now, a whole
     /// response only at `finish`.
     pub(crate) fn begin(&mut self) {
-        eprintln!("  request {}: {} prompt tokens", self.id, self.prompt_tokens);
+        eprintln!("  request {}{}: {} prompt tokens", self.id, self.tag(), self.prompt_tokens);
         if !self.streaming { return; }
-        self.alive = self.out.send(SSE_HEAD.as_bytes().to_vec());
+        self.alive = self.out.send(sse_head(&self.headers()));
         if self.anth.is_some() {
             let start = anthropic::message(&self.id, &self.model_name, Vec::new(), "", self.prompt_tokens, 0);
             self.alive &= self.out.send(anthropic::event("message_start", &json!({"type": "message_start", "message": start})));
@@ -297,16 +317,40 @@ impl Reply {
         }
     }
 
-    /// Answer with an error instead, before `begin`.
-    pub(crate) fn refuse(self, status: &str, msg: &str) { self.out.send(error_response(status, msg)); }
+    /// The caller's request id as a response header line, or nothing.
+    fn headers(&self) -> String { request_id_header(self.request_id.as_deref()) }
 
-    /// Whether the client is still waiting.
-    pub(crate) fn connected(&self) -> bool { self.alive && self.out.connected() }
+    /// The caller's request id as it is written in a log line.
+    fn tag(&self) -> String { self.request_id.as_ref().map(|id| format!(" [{id}]")).unwrap_or_default() }
+
+    /// Answer with an error instead, before `begin`.
+    pub(crate) fn refuse(self, status: &str, msg: &str) {
+        if status.starts_with("429") { metrics::refused() } else { metrics::failed() }
+        self.out.send(error_response(status, msg, &self.headers()));
+    }
+
+    /// Whether the request ran out of time; remembered, so the reply says so.
+    fn expired(&self) -> bool {
+        if self.deadline.is_some_and(|d| std::time::Instant::now() >= d) { self.timed_out.set(true); }
+        self.timed_out.get()
+    }
+
+    /// Whether to go on with the request: the client is still waiting and there is time left.
+    pub(crate) fn connected(&self) -> bool { !self.expired() && self.alive && self.out.connected() }
+
+    /// One chunk of a streamed chat completion.
+    fn chat_chunk(&self, delta: Value, finish: Value) -> Value {
+        json!({
+            "id": self.id, "object": "chat.completion.chunk", "created": self.created, "model": self.model_name,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]
+        })
+    }
 
     /// Take one generated token; false ends the request (end of turn, a stop
     /// string, or a client that went away).
     pub(crate) fn token(&mut self, bpe: &Bpe, t: u32) -> bool {
-        if Some(t) == self.end_of_turn { return false; }
+        if Some(t) == self.end_of_turn || self.expired() { return false; }
+        if self.first_token.is_none() { self.first_token = Some(self.began.elapsed()); }
         let (piece, stopped) = self.text_stream.push(bpe, t);
         self.out_ids.push(t);
         self.text.push_str(&piece);
@@ -315,6 +359,16 @@ impl Reply {
             // Buffered: blocks are cut from the whole text. A ping keeps a long reply's connection warm.
             if self.streaming && self.out_ids.len().is_multiple_of(ALIVE_EVERY) {
                 self.alive = self.out.send(anthropic::event("ping", &json!({"type": "ping"})));
+            } else if self.out_ids.len().is_multiple_of(ALIVE_EVERY) {
+                self.alive = self.out.connected();
+            }
+            return self.alive && !stopped;
+        }
+        if let Some(tools) = self.tools.as_mut() {
+            // Only text that cannot be part of a call is shown as it comes.
+            let shown = tools.delta(&self.text).to_string();
+            if self.streaming && !shown.is_empty() {
+                self.alive = self.out.send(sse_event(&self.chat_chunk(json!({"content": shown}), Value::Null)));
             } else if self.out_ids.len().is_multiple_of(ALIVE_EVERY) {
                 self.alive = self.out.connected();
             }
@@ -370,11 +424,19 @@ impl Reply {
                 "device fault during generation; no output is returned because the buffers it was read from are \
                  undefined: {err}"));
         }
+        if self.timed_out.get() {
+            return self.fail("504 Gateway Timeout", "timeout_error", "the request ran out of time before it was answered");
+        }
         let tail = self.text_stream.finish();
         self.text.push_str(&tail);
         let n_out = self.out_ids.len();
-        eprintln!("  request {}: {} tokens out, {} cached, {:.1}s total", self.id, n_out, gen.cached_tokens,
+        eprintln!("  request {}{}: {} tokens out, {} cached, {:.1}s total", self.id, self.tag(), n_out, gen.cached_tokens,
                   self.began.elapsed().as_secs_f32());
+        metrics::answered(&metrics::Answered {
+            prompt_tokens: self.prompt_tokens, cached_tokens: gen.cached_tokens, completion_tokens: n_out,
+            first_token: self.first_token, total: self.began.elapsed(),
+        });
+        let headers = self.headers();
         let reason = crate::constrain::finish_reason(gen.finish);
         // The /completion fields saying which way generation stopped.
         let stopped = json!({
@@ -402,8 +464,38 @@ impl Reply {
                 if self.alive { self.out.send(anthropic::stream_events(&content, stop_reason, n_out)); }
             } else {
                 let m = anthropic::message(id, model, content, stop_reason, self.prompt_tokens, n_out);
-                self.out.send(json_response("200 OK", &m));
+                self.out.send(json_response("200 OK", &m, &headers));
             }
+            return;
+        }
+
+        if let Some(tools) = &self.tools {
+            let (parsed, rest) = tools.finish(&self.text);
+            let call_id = id.trim_start_matches("cmpl-");
+            let reason = if parsed.calls.is_empty() { reason } else { "tool_calls" };
+            if self.streaming {
+                if !self.alive { return; }
+                if !rest.is_empty() { self.out.send(sse_event(&self.chat_chunk(json!({"content": rest}), Value::Null))); }
+                if !parsed.calls.is_empty() {
+                    let calls = tools::calls_json(&parsed.calls, call_id, true);
+                    self.out.send(sse_event(&self.chat_chunk(json!({"tool_calls": calls}), Value::Null)));
+                }
+                let mut done = self.chat_chunk(json!({}), json!(reason));
+                done["usage"] = usage;
+                self.out.send(sse_event(&done));
+                self.out.send(b"data: [DONE]\n\n".to_vec());
+                return;
+            }
+            // A reply that is only calls has no content, as the API has it.
+            let content = if parsed.text.is_empty() && !parsed.calls.is_empty() { Value::Null } else { json!(parsed.text) };
+            let mut message = json!({"role": "assistant", "content": content});
+            if !parsed.calls.is_empty() { message["tool_calls"] = json!(tools::calls_json(&parsed.calls, call_id, false)); }
+            let mut out = json!({
+                "id": id, "object": "chat.completion", "created": created, "model": model,
+                "choices": [{"index": 0, "message": message, "finish_reason": reason}], "usage": usage
+            });
+            if let Some(l) = &self.logprobs { logprobs::put(&mut out, self.oai, l.whole()); }
+            self.out.send(json_response("200 OK", &out, &headers));
             return;
         }
 
@@ -452,7 +544,7 @@ impl Reply {
             })
         };
         if let Some(l) = &self.logprobs { logprobs::put(&mut out, self.oai, l.whole()); }
-        self.out.send(json_response("200 OK", &out));
+        self.out.send(json_response("200 OK", &out, &headers));
     }
 
     /// End the request with an error: an HTTP error before any of a stream was
@@ -460,6 +552,7 @@ impl Reply {
     /// which both report success.
     fn fail(self, status: &str, kind: &str, msg: &str) {
         if !self.streaming { return self.refuse(status, msg); }
+        metrics::failed();
         if !self.alive { return; }
         if self.anth.is_some() {
             self.out.hush();
@@ -483,7 +576,7 @@ impl Reply {
 mod tests {
     use super::*;
     use std::io::Read;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
 
     fn info() -> ModelInfo {
         ModelInfo {
@@ -493,10 +586,10 @@ mod tests {
     }
 
     /// The server's end of a loopback connection, and the client's.
-    fn connection() -> (TcpStream, TcpStream) {
+    fn connection() -> (Conn, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        (listener.accept().unwrap().0, client)
+        (Conn::plain(listener.accept().unwrap().0), client)
     }
 
     /// Everything the client receives until the reply's writer closes.
@@ -515,9 +608,11 @@ mod tests {
         let (bpe, info, opts) = (Bpe::default(), info(), RunOpts::default());
         let vocab = Arc::new(TokenVocab::new(Vec::new(), Vec::new(), &[]));
         let no_images = Err("no projector".to_string());
+        let identity = crate::serve::Identity { file: "m.gguf".into(), sha256: "00".into() };
         let ctx = Ctx { bpe: &bpe, info: &info, opts: &opts, vocab: &vocab, primary: Some(2), secondary: Some(7),
-                        prefix_cache: false, images: &no_images };
-        let (server, client) = connection();
+                        prefix_cache: false, images: &no_images, identity: &identity, timeout: None };
+        let (mut server, client) = connection();
+        server.request_id = Some("req-7".into());
         let (job, reply) = start(server, &ctx, &body, chat, true).expect("a valid request");
         (job, reply, client)
     }
@@ -556,6 +651,39 @@ mod tests {
         }
         let (job, _, _) = started(json!({"prompt": [1, 3]}), true);
         assert!(job.constraint.is_none(), "nothing observes a request that did not ask");
+    }
+
+    #[test]
+    fn a_request_out_of_time_is_answered_504_and_its_id_is_echoed() {
+        let (_, mut reply, client) = started(json!({"prompt": [1, 3], "timeout_ms": 1}), true);
+        reply.begin();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(!reply.connected() && !reply.token(&Bpe::default(), 5));
+        reply.finish(&generation(Vec::new(), FinishReason::Caller));
+        let text = received(client);
+        assert!(text.starts_with("HTTP/1.1 504") && text.contains("timeout_error"), "{text}");
+        assert!(text.contains("X-Request-Id: req-7\r\n"), "{text}");
+    }
+
+    #[test]
+    fn a_reply_with_tools_is_a_message_with_tool_calls() {
+        let tools = json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object",
+            "properties": {"n": {"type": "integer"}}}}}]);
+        for stream in [false, true] {
+            // The default tokenizer neither encodes nor decodes text, so the prompt is given
+            // as ids and the reply's text is set as generated.
+            let body = json!({"messages": [{"role": "user", "content": "x"}], "tools": tools});
+            let (_, mut reply, client) = started(json!({"prompt": [1, 3], "stream": stream}), true);
+            reply.tools = tools::convert(&body, "qwen3", "").unwrap().map(|(_, reply)| reply);
+            reply.begin();
+            reply.text = "On it.\n\n<tool_call>\n<function=f>\n<parameter=n>\n4\n</parameter>\n</function>\n</tool_call>".into();
+            reply.finish(&generation(vec![5], FinishReason::Stop));
+            let text = received(client);
+            assert!(text.contains(r#""finish_reason":"tool_calls""#), "{text}");
+            assert!(text.contains(r#""function":{"name":"f","arguments":"{\"n\":4}"}"#), "{text}");
+            assert!(text.contains(r#""content":"On it.""#), "{text}");
+            assert_eq!(text.contains("data: [DONE]"), stream);
+        }
     }
 
     #[test]

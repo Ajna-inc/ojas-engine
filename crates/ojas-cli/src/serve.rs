@@ -22,14 +22,18 @@ use ojas_tokenize::Bpe;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 mod anthropic;
 mod completion;
+mod conn;
 mod images;
 mod logprobs;
+mod metrics;
+mod tools;
+pub(crate) use conn::{drain_on_sigterm, Conn};
 /// Marks a request body that arrived on the Messages API route.
 const MESSAGES_MARK: &str = "__messages_api";
 use completion::Ctx;
@@ -42,6 +46,10 @@ pub(crate) struct Request {
     pub(crate) method: String,
     pub(crate) path: String,
     pub(crate) body: Vec<u8>,
+    /// The token of `Authorization: Bearer`.
+    bearer: Option<String>,
+    /// The caller's `X-Request-Id`, when it is one a log line can hold.
+    request_id: Option<String>,
 }
 
 /// Read one HTTP/1.1 request. `None` on a closed or unusable connection.
@@ -57,7 +65,7 @@ fn read_request(stream: &mut impl BufRead) -> Result<Option<Request>> {
         _ => return Ok(None),
     };
 
-    let mut len = 0usize;
+    let (mut len, mut bearer, mut request_id) = (0usize, None, None);
     loop {
         let mut h = String::new();
         if stream.read_line(&mut h)? == 0 {
@@ -74,6 +82,12 @@ fn read_request(stream: &mut impl BufRead) -> Result<Option<Request>> {
         if let Some(v) = h.split_once(':') {
             if v.0.eq_ignore_ascii_case("content-length") {
                 len = v.1.trim().parse().unwrap_or(0);
+            } else if v.0.eq_ignore_ascii_case("authorization") {
+                bearer = v.1.trim().strip_prefix("Bearer ").map(|t| t.trim().to_string());
+            } else if v.0.eq_ignore_ascii_case("x-request-id") {
+                let id = v.1.trim();
+                let plain = !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_graphic());
+                request_id = plain.then(|| id.to_string());
             }
         }
     }
@@ -82,27 +96,96 @@ fn read_request(stream: &mut impl BufRead) -> Result<Option<Request>> {
     }
     let mut body = vec![0u8; len];
     stream.read_exact(&mut body)?;
-    Ok(Some(Request { method, path, body }))
+    Ok(Some(Request { method, path, body, bearer, request_id }))
 }
 
-/// A whole HTTP response.
-fn response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+/// Header lines every response of this process carries: the CORS origin, when one
+/// is allowed, and the model's identity.
+static HEADERS: OnceLock<String> = OnceLock::new();
+
+fn shared_headers() -> &'static str { HEADERS.get().map(String::as_str).unwrap_or("") }
+
+/// What a server says about the model it serves, so a caller can pin and log it.
+pub(crate) struct Identity {
+    /// The model file's name.
+    pub(crate) file: String,
+    pub(crate) sha256: String,
+}
+
+/// The source revision this binary was built from.
+pub(crate) const REVISION: &str = env!("OJAS_REVISION");
+
+impl Identity {
+    /// Hash the model file on another thread, beside the model's load.
+    pub(crate) fn start(path: &str) -> std::thread::JoinHandle<Result<Identity>> {
+        let path = path.to_string();
+        std::thread::spawn(move || {
+            use sha2::{Digest, Sha256};
+            let mut file = std::fs::File::open(&path).with_context(|| format!("opening {path}"))?;
+            let mut hash = Sha256::new();
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = file.read(&mut buf).with_context(|| format!("reading {path}"))?;
+                if n == 0 { break; }
+                hash.update(&buf[..n]);
+            }
+            let sha256 = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
+            let file = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or(path);
+            Ok(Identity { file, sha256 })
+        })
+    }
+
+    pub(crate) fn finish(handle: std::thread::JoinHandle<Result<Identity>>) -> Result<Identity> {
+        handle.join().map_err(|_| anyhow::anyhow!("hashing the model file failed"))?
+    }
+
+    /// The fields `/v1/models` adds to a model's entry.
+    pub(crate) fn describe(&self, entry: &mut Value) {
+        entry["file"] = json!(self.file);
+        entry["sha256"] = json!(self.sha256);
+        entry["revision"] = json!(REVISION);
+    }
+}
+
+/// Fix the headers every response carries. Called once, before requests are served.
+pub(crate) fn set_shared_headers(opts: &RunOpts, identity: &Identity) {
+    let mut h = String::new();
+    if let Some(origin) = opts.cors_origin.as_deref().filter(|o| o.bytes().all(|b| b.is_ascii_graphic())) {
+        h.push_str(&format!("Access-Control-Allow-Origin: {origin}\r\n"));
+        if origin != "*" { h.push_str("Vary: Origin\r\n"); }
+    }
+    let file: String = identity.file.chars().filter(|c| c.is_ascii_graphic()).collect();
+    h.push_str(&format!("X-Ojas-Model: {file}\r\nX-Ojas-Model-Sha256: {}\r\nX-Ojas-Revision: {REVISION}\r\n", identity.sha256));
+    let _ = HEADERS.set(h);
+}
+
+/// The header line echoing a caller's request id, or nothing.
+fn request_id_header(id: Option<&str>) -> String {
+    id.map(|id| format!("X-Request-Id: {id}\r\n")).unwrap_or_default()
+}
+
+/// A whole HTTP response. `extra` is header lines of this response alone. A
+/// status that tells the caller to come back says when.
+fn response(status: &str, content_type: &str, body: &[u8], extra: &str) -> Vec<u8> {
+    let retry = if status.starts_with("429") || status.starts_with("503") { "Retry-After: 1\r\n" } else { "" };
     let mut out = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
-         Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
-        body.len()
+         {retry}{extra}{}Connection: close\r\n\r\n",
+        body.len(), shared_headers()
     ).into_bytes();
     out.extend_from_slice(body);
     out
 }
 
-fn json_response(status: &str, v: &Value) -> Vec<u8> { response(status, "application/json", v.to_string().as_bytes()) }
+fn json_response(status: &str, v: &Value, extra: &str) -> Vec<u8> {
+    response(status, "application/json", v.to_string().as_bytes(), extra)
+}
 
 /// OpenAI's error envelope, so clients surface the text instead of a blank failure.
 /// An error body: `{"error": {"code", "message", "type"}}`, the type named for the
 /// status's class.
-fn error_response(status: &str, msg: &str) -> Vec<u8> {
-    json_response(status, &error_body(status, msg))
+fn error_response(status: &str, msg: &str, extra: &str) -> Vec<u8> {
+    json_response(status, &error_body(status, msg), extra)
 }
 
 fn error_body(status: &str, msg: &str) -> Value {
@@ -111,6 +194,8 @@ fn error_body(status: &str, msg: &str) -> Value {
         400 | 413 | 422 => "invalid_request_error",
         401 | 403 => "authentication_error",
         404 => "not_found_error",
+        429 => "rate_limit_error",
+        504 => "timeout_error",
         501 => "not_supported_error",
         503 => "unavailable_error",
         _ => "server_error",
@@ -119,21 +204,24 @@ fn error_body(status: &str, msg: &str) -> Value {
 }
 
 /// The head of a server-sent event stream.
-const SSE_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
-                        Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
+fn sse_head(extra: &str) -> Vec<u8> {
+    format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
+             {extra}{}Connection: close\r\n\r\n", shared_headers()).into_bytes()
+}
 
 fn sse_event(v: &Value) -> Vec<u8> { format!("data: {v}\n\n").into_bytes() }
 
-pub(crate) fn send(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]) {
-    let _ = stream.write_all(&response(status, content_type, body)).and_then(|_| stream.flush());
+pub(crate) fn send(stream: &mut Conn, status: &str, content_type: &str, body: &[u8]) {
+    let extra = request_id_header(stream.request_id.as_deref());
+    let _ = stream.write_all(&response(status, content_type, body, &extra)).and_then(|_| stream.flush());
 }
 
-pub(crate) fn send_json(stream: &mut TcpStream, status: &str, v: &Value) {
+pub(crate) fn send_json(stream: &mut Conn, status: &str, v: &Value) {
     send(stream, status, "application/json", v.to_string().as_bytes());
 }
 
-pub(crate) fn send_err(stream: &mut TcpStream, status: &str, msg: &str) {
-    let _ = stream.write_all(&error_response(status, msg)).and_then(|_| stream.flush());
+pub(crate) fn send_err(stream: &mut Conn, status: &str, msg: &str) {
+    send_json(stream, status, &error_body(status, msg));
 }
 
 fn now() -> u64 {
@@ -355,8 +443,17 @@ fn stop_ids(bpe: &Bpe, info: &ModelInfo) -> (Option<u32>, Option<u32>) {
 }
 
 pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
+    if opts.keep_nothing {
+        let cfg = ojas_core::config::EngineConfig::current();
+        anyhow::ensure!(cfg.prefix_cache_dir.is_none(),
+            "--keep-nothing and a prefix cache directory are alternatives: the directory holds processed prompts on disk");
+    }
+    // Listening starts before the model loads, so a probe gets an answer from the first moment.
+    let front = Front::bind(opts, "this model")?;
+    let loading = front.answer_while_loading()?;
+    let hashing = Identity::start(model);
     if crate::decide::is_decision_model(model) {
-        return crate::decide::serve(model, opts);
+        return crate::decide::serve(model, opts, front, loading, hashing);
     }
     with_model(model, opts.device, context, opts.precision, |m, bpe, info| {
         let (primary, secondary) = stop_ids(bpe, info);
@@ -364,12 +461,14 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
         let vocab = crate::constrain::vocab(bpe, info);
         pin_startup_prompt(m, bpe, info, opts)?;
         let vision = images::Vision::open(model, m, bpe, info, opts);
+        let identity = Identity::finish(hashing)?;
+        set_shared_headers(opts, &identity);
         let ctx = Ctx { bpe, info, opts, vocab: &vocab, primary, secondary, prefix_cache: m.prefix_cache_stats().is_some(),
-                        images: &vision };
+                        images: &vision, identity: &identity,
+                        timeout: opts.request_timeout.filter(|s| *s > 0.0).map(Duration::from_secs_f64) };
 
-        let addr = format!("{}:{}", opts.host, opts.port);
-        let listener = TcpListener::bind(&addr).with_context(|| format!("binding {addr}"))?;
         let slots = m.max_slots();
+        metrics::slots(slots);
         eprintln!(
             "  {} | {} | ctx {} | MTP {} | loaded in {:.1}s",
             info.arch,
@@ -378,12 +477,14 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
             if info.has_mtp { "yes" } else { "no" },
             info.load_secs
         );
+        eprintln!("  {} sha256 {} | engine {REVISION}", identity.file, identity.sha256);
         match slots {
-            1 => eprintln!("  listening on http://{addr}  (one request at a time)"),
-            n => eprintln!("  listening on http://{addr}  ({n} requests at a time)"),
+            1 => eprintln!("  listening on {}  (one request at a time; {})", front.url(), front.auth.describe()),
+            n => eprintln!("  listening on {}  ({n} requests at a time; {})", front.url(), front.auth.describe()),
         }
+        if opts.keep_nothing { eprintln!("  keeping nothing: no cache files, no request content in the log"); }
         if let Ok(v) = &vision { eprintln!("  images: data URLs in chat messages, up to {} tokens each", v.max_tokens); }
-        eprintln!("  POST /v1/chat/completions  POST /v1/messages  POST /v1/completions  POST /completion  GET /health  GET /props  GET /cache  POST /cache/save|warm|unpin  GET /v1/models");
+        eprintln!("  POST /v1/chat/completions  POST /v1/messages  POST /v1/completions  POST /completion  GET /health  GET /ready  GET /metrics  GET /props  GET /cache  POST /cache/save|warm|unpin  GET /v1/models");
 
         let props = json!({
             "model": info.arch,
@@ -395,16 +496,20 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
             "mtp": info.has_mtp,
             "concurrent_slots": slots,
             "images": vision.as_ref().ok().map(|v| json!({"max_tokens": v.max_tokens})),
+            "keep_nothing": opts.keep_nothing,
+            "load_seconds": info.load_secs,
         });
-        if slots > 1 { serve_batched(&listener, m, &ctx, &props) } else { serve_alone(&listener, m, &ctx, &props) }
+        loading.finish();
+        conn::drain_on_sigterm(Duration::from_secs_f64(opts.drain_secs.max(0.0)));
+        if slots > 1 { serve_batched(&front, m, &ctx, &props) } else { serve_alone(&front, m, &ctx, &props) }
     })
 }
 
 /// Serve one request at a time on the thread that owns the model, with speculative
 /// decoding available to every request.
-fn serve_alone(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &Value) -> Result<()> {
+fn serve_alone(front: &Front, model: &dyn Model, ctx: &Ctx, props: &Value) -> Result<()> {
     let mut core = EngineCore::new(model);
-    serve_http(listener, |stream, req, path| {
+    serve_http(front, |stream, req, path| {
         if let Some((body, chat, oai)) = completion_route(stream, req, path) {
             match stream.try_clone() {
                 Ok(stream) => run_alone(&mut core, ctx, stream, &body, chat, oai),
@@ -418,9 +523,10 @@ fn serve_alone(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &Val
     })
 }
 
-fn run_alone(core: &mut EngineCore<&dyn Model>, ctx: &Ctx, stream: TcpStream, body: &Value, chat: bool, oai: bool) {
+fn run_alone(core: &mut EngineCore<&dyn Model>, ctx: &Ctx, stream: Conn, body: &Value, chat: bool, oai: bool) {
     let Some((mut job, mut reply)) = completion::start(stream, ctx, body, chat, oai) else { return };
     if let Some(err) = ojas_core::device_fault::peek() { return reply.refuse("503 Service Unavailable", &fault_message(&err)); }
+    metrics::load(1, 0);
     reply.begin();
     let model = core.model();
     model.set_prefix_reuse(job.reuse);
@@ -434,6 +540,7 @@ fn run_alone(core: &mut EngineCore<&dyn Model>, ctx: &Ctx, stream: TcpStream, bo
         constraint.as_deref_mut().map(|p| p as &mut dyn ojas_infer::LogitProcessor), &mut |_, _| {},
         &mut |t| reply.token(ctx.bpe, t));
     reply.finish(&gen);
+    metrics::load(0, 0);
 }
 
 /// Why a session with a latched device fault refuses requests.
@@ -445,20 +552,19 @@ fn fault_message(err: &ojas_core::device_fault::DeviceError) -> String {
 /// covers further.
 const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Requests that may wait for a slot; beyond it the server answers 503.
+/// Requests that may wait for a slot; beyond it the server answers 429.
 const MAX_QUEUE: usize = 64;
 
 /// What a connection thread hands the engine thread.
 enum Arrival {
     Completion(Box<(completion::Job, completion::Reply)>),
-    Warm(TcpStream, Vec<u32>, bool),
-    Other(TcpStream, Request, String),
+    Warm(Conn, Vec<u32>, bool),
+    Other(Conn, Request, String),
 }
 
 /// Read and parse one connection: a completion is tokenized and checked here, off
 /// the engine thread, so a long transcript or a slow client never delays decoding.
-fn arrive(stream: TcpStream, ctx: &Ctx) -> Option<Arrival> {
-    let (mut stream, req, path) = accept(stream)?;
+fn arrive((mut stream, req, path): Arrived, ctx: &Ctx) -> Option<Arrival> {
     if let Some((body, chat, oai)) = completion_route(&mut stream, &req, &path) {
         return completion::start(stream, ctx, &body, chat, oai).map(|r| Arrival::Completion(Box::new(r)));
     }
@@ -473,15 +579,15 @@ fn arrive(stream: TcpStream, ctx: &Ctx) -> Option<Arrival> {
 /// thread; this thread owns the model and steps the batch: each step admits waiting
 /// requests, processes one prompt chunk, and decodes a token for every slot past its
 /// prompt, streaming each to its client.
-fn serve_batched(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &Value) -> Result<()> {
+fn serve_batched(front: &Front, model: &dyn Model, ctx: &Ctx, props: &Value) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
-        scope.spawn(move || accept_each(listener, scope, move |stream| arrive(stream, ctx), tx));
+        scope.spawn(move || accept_each(front, scope, move |arrived| arrive(arrived, ctx), tx));
         let mut batch = Batch::new(model, MAX_WAIT);
         let mut replies: HashMap<u64, completion::Reply> = HashMap::new();
         // `/cache/warm` needs a slot of its own outside the batch, and waits here
         // until one is free.
-        let mut warms: VecDeque<(TcpStream, Vec<u32>, bool, Ticket)> = VecDeque::new();
+        let mut warms: VecDeque<(Conn, Vec<u32>, bool, Ticket)> = VecDeque::new();
         let mut next_id = 0u64;
         loop {
             let mut arrived: Vec<(Arrival, Ticket)> = Vec::new();
@@ -499,7 +605,7 @@ fn serve_batched(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &V
                         if let Some(err) = ojas_core::device_fault::peek() {
                             reply.refuse("503 Service Unavailable", &fault_message(&err));
                         } else if batch.load().1 >= MAX_QUEUE {
-                            reply.refuse("503 Service Unavailable", "the server is at capacity; retry shortly");
+                            reply.refuse("429 Too Many Requests", "the server is at capacity; retry shortly");
                         } else {
                             reply.begin();
                             batch.submit(next_id, job.into_request());
@@ -518,6 +624,8 @@ fn serve_batched(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &V
             if let Some(slot) = batch.free_slot() {
                 if let Some((mut stream, ids, pin, _ticket)) = warms.pop_front() { warm(&mut stream, model, slot, &ids, pin); }
             }
+            let (running, waiting) = batch.load();
+            metrics::load(running, waiting);
             batch.step(&mut |id, event| match event {
                 Event::Token(t) => replies.get_mut(&id).is_some_and(|r| r.token(ctx.bpe, t)),
                 Event::Prefill(..) => replies.get(&id).is_some_and(completion::Reply::connected),
@@ -532,7 +640,7 @@ fn serve_batched(listener: &TcpListener, model: &dyn Model, ctx: &Ctx, props: &V
 
 /// The body and response format of a completion request, answering a malformed body
 /// itself; `None` for any other route.
-fn completion_route(stream: &mut TcpStream, req: &Request, path: &str) -> Option<(Value, bool, bool)> {
+fn completion_route(stream: &mut Conn, req: &Request, path: &str) -> Option<(Value, bool, bool)> {
     let ("POST", "/completion" | "/completions" | "/v1/completions" | "/v1/chat/completions" | "/v1/messages") =
         (req.method.as_str(), path) else { return None };
     match serde_json::from_slice::<Value>(&req.body) {
@@ -541,6 +649,7 @@ fn completion_route(stream: &mut TcpStream, req: &Request, path: &str) -> Option
             Some((body, path == "/v1/chat/completions" || path == "/v1/messages", path.starts_with("/v1/")))
         }
         Err(e) => {
+            metrics::failed();
             send_err(stream, "400 Bad Request", &format!("invalid JSON: {e}"));
             None
         }
@@ -549,7 +658,7 @@ fn completion_route(stream: &mut TcpStream, req: &Request, path: &str) -> Option
 
 /// The tokens and pin flag of a `/cache/warm` request, answering a malformed one
 /// itself.
-fn warm_request(stream: &mut TcpStream, req: &Request, ctx: &Ctx) -> Option<(Vec<u32>, bool)> {
+fn warm_request(stream: &mut Conn, req: &Request, ctx: &Ctx) -> Option<(Vec<u32>, bool)> {
     let body: Value = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
         Err(e) => {
@@ -571,7 +680,7 @@ fn warm_request(stream: &mut TcpStream, req: &Request, ctx: &Ctx) -> Option<(Vec
 }
 
 /// Process `ids` into the prefix cache in `slot`, which no request holds.
-fn warm(stream: &mut TcpStream, model: &dyn Model, slot: usize, ids: &[u32], pin: bool) {
+fn warm(stream: &mut Conn, model: &dyn Model, slot: usize, ids: &[u32], pin: bool) {
     let mut cached = None;
     if !model.with_slot(slot, &mut || cached = model.warm_prefix(ids, pin)) {
         return send_err(stream, "500 Internal Server Error", &format!("slot {slot} cannot be addressed"));
@@ -585,20 +694,19 @@ fn warm(stream: &mut TcpStream, model: &dyn Model, slot: usize, ids: &[u32], pin
 }
 
 /// Every route but completions and `/cache/warm`. False when the route is unknown.
-fn serve_other(stream: &mut TcpStream, req: &Request, path: &str, model: &dyn Model, ctx: &Ctx, props: &Value) -> bool {
+fn serve_other(stream: &mut Conn, req: &Request, path: &str, model: &dyn Model, ctx: &Ctx, props: &Value) -> bool {
     match (req.method.as_str(), path) {
-        ("GET", "/health") => match ojas_core::device_fault::peek() {
-            // A process that cannot serve must not report healthy; the recovery path
-            // is a restart by the orchestrator.
-            Some(err) => send_json(stream, "503 Service Unavailable", &json!({"status": "error", "error": err.to_string()})),
-            None => send_json(stream, "200 OK", &json!({"status": "ok"})),
-        },
+        ("GET", "/health") => health(stream),
+        ("GET", "/ready") => ready(stream),
+        ("GET", "/metrics") => send(stream, "200 OK", "text/plain; version=0.0.4", metrics::render().as_bytes()),
         ("GET", "/props") => {
             let mut p = props.clone();
             p["prefix_cache"] = cache_json(model.prefix_cache_stats());
             send_json(stream, "200 OK", &p)
         }
         ("GET", "/cache") => send_json(stream, "200 OK", &cache_json(model.prefix_cache_stats())),
+        ("POST", "/cache/save") if ctx.opts.keep_nothing =>
+            send_err(stream, "403 Forbidden", "this server keeps nothing: the cache is not written to disk"),
         ("POST", "/cache/save") => {
             model.save_prefix_cache();
             send_json(stream, "200 OK", &cache_json(model.prefix_cache_stats()))
@@ -607,10 +715,11 @@ fn serve_other(stream: &mut TcpStream, req: &Request, path: &str, model: &dyn Mo
             model.unpin_prefix_cache();
             send_json(stream, "200 OK", &cache_json(model.prefix_cache_stats()))
         }
-        ("GET", "/v1/models") => send_json(stream, "200 OK", &json!({
-            "object": "list",
-            "data": [{"id": ctx.info.arch, "object": "model", "created": now(), "owned_by": "ojas"}]
-        })),
+        ("GET", "/v1/models") => {
+            let mut entry = json!({"id": ctx.info.arch, "object": "model", "created": now(), "owned_by": "ojas"});
+            ctx.identity.describe(&mut entry);
+            send_json(stream, "200 OK", &json!({"object": "list", "data": [entry]}))
+        }
         ("POST", "/v1/messages/count_tokens") => match serde_json::from_slice::<Value>(&req.body) {
             Ok(body) => match anthropic::convert(&body, &ctx.opts.system) {
                 Ok(c) => {
@@ -628,26 +737,191 @@ fn serve_other(stream: &mut TcpStream, req: &Request, path: &str, model: &dyn Mo
     true
 }
 
+/// Liveness: the process is up and its device has not faulted. A process that
+/// cannot serve must not report healthy; the recovery path is a restart by the
+/// orchestrator.
+pub(crate) fn health(stream: &mut Conn) {
+    match ojas_core::device_fault::peek() {
+        Some(err) => send_json(stream, "503 Service Unavailable", &json!({"status": "error", "error": err.to_string()})),
+        None => send_json(stream, "200 OK", &json!({"status": "ok"})),
+    }
+}
+
+/// Readiness: whether to route requests here. Not while the model loads, not once
+/// the server is stopping, and not after a device fault.
+pub(crate) fn ready(stream: &mut Conn) {
+    if let Some(err) = ojas_core::device_fault::peek() {
+        send_json(stream, "503 Service Unavailable", &json!({"status": "error", "error": err.to_string()}))
+    } else if conn::draining() {
+        send_json(stream, "503 Service Unavailable", &json!({"status": "draining"}))
+    } else {
+        send_json(stream, "200 OK", &json!({"status": "ready"}))
+    }
+}
+
+/// Routes answered without credentials: they say nothing a port scan cannot see,
+/// and an orchestrator's probes carry none.
+fn is_probe(path: &str) -> bool { matches!(path, "/health" | "/ready") }
+
+/// The listening socket and what guards it: who may call, and TLS when the server
+/// was given a certificate.
+pub(crate) struct Front {
+    listener: TcpListener,
+    pub(crate) auth: Arc<crate::access::Auth>,
+    tls: Option<Arc<rustls::ServerConfig>>,
+    addr: String,
+}
+
+impl Front {
+    /// Bind `--host`/`--port` under the access rules of `opts`. `what` names what
+    /// is served, for the refusal to bind beyond loopback without a token.
+    pub(crate) fn bind(opts: &RunOpts, what: &str) -> Result<Front> {
+        let auth = Arc::new(crate::access::Auth::from_opts(opts, what)?);
+        let tls = match (&opts.tls_cert, &opts.tls_key) {
+            (Some(cert), Some(key)) => Some(conn::tls_config(cert, key)?),
+            (None, None) => None,
+            _ => anyhow::bail!("--tls-cert and --tls-key go together"),
+        };
+        let addr = format!("{}:{}", opts.host, opts.port);
+        let listener = TcpListener::bind(&addr).with_context(|| format!("binding {addr}"))?;
+        Ok(Front { listener, auth, tls, addr })
+    }
+
+    pub(crate) fn url(&self) -> String {
+        format!("{}://{}", if self.tls.is_some() { "https" } else { "http" }, self.addr)
+    }
+
+    fn try_clone(&self) -> Result<Front> {
+        Ok(Front { listener: self.listener.try_clone()?, auth: Arc::clone(&self.auth), tls: self.tls.clone(),
+                   addr: self.addr.clone() })
+    }
+
+    /// Read one request from a new connection, with its path (query string
+    /// removed), and decide whether it is let in. Answers by itself, and returns
+    /// `None`, for a CORS preflight, a request that cannot be parsed (400), a
+    /// caller without the right to call (401), and anything but a probe once the
+    /// server is stopping (503); `None` too for a connection closed before a request.
+    fn admit(&self, stream: TcpStream) -> Option<Arrived> {
+        let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
+        let mut conn = match &self.tls {
+            Some(config) => Conn::tls(stream, config).ok()?,
+            None => Conn::plain(stream),
+        };
+        let req = {
+            let mut reader = BufReader::new(Deadline { conn: &mut conn, until: Instant::now() + SOCKET_TIMEOUT });
+            match read_request(&mut reader) {
+                Ok(Some(r)) => r,
+                Ok(None) => return None,
+                Err(e) => {
+                    // A failed handshake or a dropped socket has no one to answer.
+                    if e.downcast_ref::<std::io::Error>().is_none() {
+                        send_err(&mut conn, "400 Bad Request", &format!("{e:#}"));
+                    }
+                    return None;
+                }
+            }
+        };
+        conn.request_id = req.request_id.clone();
+        if req.method == "OPTIONS" {
+            // Without an allowed origin the preflight carries no grant, and the browser refuses.
+            let head = format!("HTTP/1.1 204 No Content\r\n{}Access-Control-Allow-Headers: *\r\n\
+                                Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+                                Content-Length: 0\r\nConnection: close\r\n\r\n", shared_headers());
+            let _ = conn.write_all(head.as_bytes()).and_then(|_| conn.flush());
+            return None;
+        }
+        let _ = conn.set_read_timeout(Some(SOCKET_TIMEOUT));
+        let path = req.path.split('?').next().unwrap_or("").to_string();
+        if !is_probe(&path) {
+            if let Err(why) = self.auth.check(conn.peer_ip(), req.bearer.as_deref()) {
+                eprintln!("  refused {:?} {} {path}: {why}", conn.peer_ip(), req.method);
+                let body = error_body("401 Unauthorized", why).to_string();
+                let _ = conn.write_all(&response("401 Unauthorized", "application/json", body.as_bytes(),
+                    "WWW-Authenticate: Bearer\r\n")).and_then(|_| conn.flush());
+                return None;
+            }
+            if conn::draining() && path != "/metrics" {
+                metrics::refused();
+                send_err(&mut conn, "503 Service Unavailable", "the server is stopping; send this request elsewhere");
+                return None;
+            }
+        }
+        Some((conn, req, path))
+    }
+
+    /// Answer probes while the model loads: alive, not ready. Any other request
+    /// is told to come back. Ends at `Loading::finish`, after which the caller
+    /// accepts connections itself.
+    pub(crate) fn answer_while_loading(&self) -> Result<Loading> {
+        let front = Arc::new(self.try_clone()?);
+        front.listener.set_nonblocking(true)?;
+        let done = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&done);
+        let thread = std::thread::Builder::new().name("http-loading".into()).spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                let stream = match front.listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(_) => {
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                };
+                // An accepted socket may inherit the listener's non-blocking mode.
+                if stream.set_nonblocking(false).is_err() { continue; }
+                let front = Arc::clone(&front);
+                std::thread::spawn(move || {
+                    let Some((mut conn, req, path)) = front.admit(stream) else { return };
+                    match (req.method.as_str(), path.as_str()) {
+                        ("GET", "/health") => send_json(&mut conn, "200 OK", &json!({"status": "loading"})),
+                        _ => send_json(&mut conn, "503 Service Unavailable", &json!({"status": "loading"})),
+                    }
+                });
+            }
+        })?;
+        Ok(Loading { done, thread: Some(thread), listener: self.listener.try_clone()? })
+    }
+}
+
+/// The thread answering for a server whose model is still loading.
+pub(crate) struct Loading {
+    done: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    listener: TcpListener,
+}
+
+impl Loading {
+    /// The model is loaded: hand the listening socket back, blocking again.
+    pub(crate) fn finish(mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(t) = self.thread.take() { let _ = t.join(); }
+        let _ = self.listener.set_nonblocking(false);
+    }
+}
+
+impl Drop for Loading {
+    fn drop(&mut self) { self.done.store(true, Ordering::Release); }
+}
+
 /// Hand each request to `handle` with its path (query string removed), one at a
 /// time on the calling thread, in the order they arrive. Each connection is read on
 /// its own thread, so a client slow to send its request delays no one else's.
-pub(crate) fn serve_http(listener: &TcpListener, mut handle: impl FnMut(&mut TcpStream, &Request, &str)) -> Result<()> {
-    serve_http_batches(listener, 1, |batch| {
+pub(crate) fn serve_http(front: &Front, mut handle: impl FnMut(&mut Conn, &Request, &str)) -> Result<()> {
+    serve_http_batches(front, 1, |batch| {
         for (mut stream, req, path) in batch { handle(&mut stream, &req, &path); }
     })
 }
 
-/// A request read from its connection: the stream to answer on, the request, and
-/// its path (query string removed).
-pub(crate) type Arrived = (TcpStream, Request, String);
+/// A request read from its connection: the connection to answer on, the request,
+/// and its path (query string removed).
+pub(crate) type Arrived = (Conn, Request, String);
 
 /// Hand requests to `handle` on the calling thread, in arrival order, in batches:
 /// it waits for one, then takes every request already waiting, up to `most`.
 /// Connections are read as in [`serve_http`].
-pub(crate) fn serve_http_batches(listener: &TcpListener, most: usize, mut handle: impl FnMut(Vec<Arrived>)) -> Result<()> {
+pub(crate) fn serve_http_batches(front: &Front, most: usize, mut handle: impl FnMut(Vec<Arrived>)) -> Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
-        scope.spawn(move || accept_each(listener, scope, accept, tx));
+        scope.spawn(move || accept_each(front, scope, Some, tx));
         while let Ok(first) = rx.recv() {
             let mut batch = vec![first];
             while batch.len() < most.max(1) {
@@ -664,7 +938,7 @@ pub(crate) fn serve_http_batches(listener: &TcpListener, most: usize, mut handle
 }
 
 /// Connections being read, or holding a request not yet answered, at once. A
-/// connection past it is answered 503 straight away, so neither threads nor
+/// connection past it is answered 429 straight away, so neither threads nor
 /// queued request bodies grow without bound.
 const MAX_CONNECTIONS: usize = 128;
 
@@ -675,30 +949,34 @@ impl Drop for Ticket {
     fn drop(&mut self) { self.0.fetch_sub(1, Ordering::AcqRel); }
 }
 
-/// Read every new connection on its own thread with `read`, and send what it
-/// returns to `tx` with the connection's ticket, which the receiver holds until the
-/// request is answered.
-fn accept_each<'scope, T: Send + 'scope>(listener: &'scope TcpListener, scope: &'scope std::thread::Scope<'scope, '_>,
-                                         read: impl Fn(TcpStream) -> Option<T> + Copy + Send + 'scope,
+/// Read and admit every new connection on its own thread, pass what arrived
+/// through `read`, and send the result to `tx` with the connection's ticket, which
+/// the receiver holds until the request is answered.
+fn accept_each<'scope, T: Send + 'scope>(front: &'scope Front, scope: &'scope std::thread::Scope<'scope, '_>,
+                                         read: impl Fn(Arrived) -> Option<T> + Copy + Send + 'scope,
                                          tx: std::sync::mpsc::Sender<(T, Ticket)>) {
     let open = Arc::new(AtomicUsize::new(0));
-    for conn in listener.incoming() {
+    for conn in front.listener.incoming() {
         match conn {
-            Ok(mut stream) => {
+            Ok(stream) => {
                 if open.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
                     open.fetch_sub(1, Ordering::AcqRel);
-                    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(1)));
-                    send_err(&mut stream, "503 Service Unavailable", "too many connections; retry shortly");
+                    metrics::refused();
+                    // Over TLS the answer would cost a handshake on this thread; the connection is closed instead.
+                    if front.tls.is_none() {
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                        send_err(&mut Conn::plain(stream), "429 Too Many Requests", "too many connections; retry shortly");
+                    }
                     continue;
                 }
                 let (tx, ticket) = (tx.clone(), Ticket(open.clone()));
                 scope.spawn(move || {
-                    if let Some(item) = read(stream) { let _ = tx.send((item, ticket)); }
+                    if let Some(item) = front.admit(stream).and_then(read) { let _ = tx.send((item, ticket)); }
                 });
             }
             Err(e) => {
                 tracing::warn!("accept failed: {e}");
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(50));
             }
         }
     }
@@ -706,40 +984,12 @@ fn accept_each<'scope, T: Send + 'scope>(listener: &'scope TcpListener, scope: &
 
 /// A client gets this long to send its whole request, and each write to it this
 /// long to complete, so an idle or stalled connection cannot hold a thread forever.
-const SOCKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Read one request from a new connection, with its path (query string removed).
-/// Answers CORS preflight itself, and a request that cannot be parsed with 400;
-/// `None` for those and for a connection closed before a request.
-fn accept(mut stream: TcpStream) -> Option<(TcpStream, Request, String)> {
-    let _ = stream.set_write_timeout(Some(SOCKET_TIMEOUT));
-    let req = {
-        let mut reader = BufReader::new(Deadline { stream: &stream, until: Instant::now() + SOCKET_TIMEOUT });
-        match read_request(&mut reader) {
-            Ok(Some(r)) => r,
-            Ok(None) => return None,
-            Err(e) => {
-                send_err(&mut stream, "400 Bad Request", &format!("{e:#}"));
-                return None;
-            }
-        }
-    };
-    if req.method == "OPTIONS" {
-        let head = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n\
-                    Access-Control-Allow-Headers: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-                    Content-Length: 0\r\nConnection: close\r\n\r\n";
-        let _ = stream.write_all(head.as_bytes());
-        return None;
-    }
-    let _ = stream.set_read_timeout(Some(SOCKET_TIMEOUT));
-    let path = req.path.split('?').next().unwrap_or("").to_string();
-    Some((stream, req, path))
-}
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A connection read against one deadline for the whole request, so a client that
 /// sends a byte at a time cannot hold its thread past `SOCKET_TIMEOUT`.
 struct Deadline<'a> {
-    stream: &'a TcpStream,
+    conn: &'a mut Conn,
     until: Instant,
 }
 
@@ -749,8 +999,8 @@ impl Read for Deadline<'_> {
         if left.is_zero() {
             return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "the request did not arrive in time"));
         }
-        self.stream.set_read_timeout(Some(left))?;
-        (&*self.stream).read(buf)
+        self.conn.set_read_timeout(Some(left))?;
+        self.conn.read(buf)
     }
 }
 
@@ -762,6 +1012,7 @@ mod tests {
     fn error_bodies_name_the_class_of_their_status() {
         for (status, kind) in [("400 Bad Request", "invalid_request_error"), ("404 Not Found", "not_found_error"),
                                ("501 Not Implemented", "not_supported_error"), ("503 Service Unavailable", "unavailable_error"),
+                               ("429 Too Many Requests", "rate_limit_error"), ("504 Gateway Timeout", "timeout_error"),
                                ("500 Internal Server Error", "server_error")] {
             let body = error_body(status, "m");
             assert_eq!(body["error"]["type"], kind, "{status}");
@@ -792,10 +1043,28 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(400));
             let _ = s.write_all(b"\r\n");
         });
-        let (stream, _) = listener.accept().unwrap();
-        let mut reader = BufReader::new(Deadline { stream: &stream, until: Instant::now() + std::time::Duration::from_millis(100) });
+        let mut conn = Conn::plain(listener.accept().unwrap().0);
+        let mut reader = BufReader::new(Deadline { conn: &mut conn, until: Instant::now() + Duration::from_millis(100) });
         assert!(read_request(&mut reader).is_err(), "a request arriving after its deadline was read");
         client.join().unwrap();
+    }
+
+    #[test]
+    fn a_request_carries_its_bearer_token_and_a_printable_request_id() {
+        let head = "POST /x HTTP/1.1\r\nAuthorization: Bearer  abc \r\nX-Request-Id: r-1\r\nContent-Length: 2\r\n\r\nhi";
+        let req = read_request(&mut BufReader::new(head.as_bytes())).unwrap().unwrap();
+        assert_eq!((req.bearer.as_deref(), req.request_id.as_deref(), req.body.as_slice()), (Some("abc"), Some("r-1"), &b"hi"[..]));
+        let odd = "GET / HTTP/1.1\r\nX-Request-Id: a b\r\n\r\n";
+        assert!(read_request(&mut BufReader::new(odd.as_bytes())).unwrap().unwrap().request_id.is_none());
+    }
+
+    #[test]
+    fn a_come_back_later_status_says_when_and_no_origin_is_allowed_unasked() {
+        let full = String::from_utf8(response("429 Too Many Requests", "application/json", b"{}", "")).unwrap();
+        assert!(full.contains("Retry-After: 1\r\n"), "{full}");
+        let ok = String::from_utf8(response("200 OK", "application/json", b"{}", "X-Request-Id: r\r\n")).unwrap();
+        assert!(!ok.contains("Retry-After") && ok.contains("X-Request-Id: r\r\n"));
+        if HEADERS.get().is_none() { assert!(!ok.contains("Access-Control-Allow-Origin")); }
     }
 
     #[test]

@@ -29,6 +29,9 @@ tracing = { workspace = true }
 anyhow = "1"
 libc = "0.2"
 serde_json = { workspace = true }
+# `serve`: TLS on the listening socket, and the model file's hash for `/v1/models`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+sha2 = { workspace = true }
 # The CUDA decoders (`--device cuda`, and `auto` on an NVIDIA box): built with `--features cuda`.
 ojas-cuda = { path = "../ojas-cuda", optional = true }
 

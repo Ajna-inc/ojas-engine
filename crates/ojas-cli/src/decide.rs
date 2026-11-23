@@ -25,7 +25,7 @@
 
 use crate::backend::Device;
 use crate::flags::RunOpts;
-use crate::serve::{send, send_err, send_json, serve_http_batches};
+use crate::serve::{health, ready, send, send_err, send_json, serve_http_batches, set_shared_headers, Conn, Front, Identity, Loading};
 use anyhow::{Context, Result};
 use ojas_decision::json::Json;
 use ojas_decision::{Decision, DecisionGpu, DecisionModel, Image, InvalidRequest, QuestionKind, Request, Unsupported};
@@ -210,7 +210,7 @@ fn parse_body<G: DecisionGpu>(model: &DecisionModel<G>, body: &[u8]) -> Result<R
 }
 
 /// Write a reply on its own thread, so a client slow to read holds up no one.
-fn reply(mut stream: std::net::TcpStream, result: Result<String, Refusal>) {
+fn reply(mut stream: Conn, result: Result<String, Refusal>) {
     std::thread::spawn(move || match result {
         Ok(body) => send(&mut stream, "200 OK", "application/json", body.as_bytes()),
         Err((status, msg)) => send_err(&mut stream, status, &msg),
@@ -260,24 +260,32 @@ impl Metrics {
 /// `ojas serve` for a decision model. Requests that arrive while others are being
 /// answered wait, and are then answered together: an encoder model runs all of
 /// their questions in shared GPU passes.
-pub fn serve(path: &str, opts: &RunOpts) -> Result<()> {
+/// `front` is already listening and `loading` answers its probes until the model is in.
+pub(crate) fn serve(path: &str, opts: &RunOpts, front: Front, loading: Loading,
+                    hashing: std::thread::JoinHandle<Result<Identity>>) -> Result<()> {
     let t = std::time::Instant::now();
-    with_decision_model!(path, opts.device, |model| serve_model(&model, opts, t.elapsed().as_secs_f64()))
+    with_decision_model!(path, opts.device, |model| {
+        let identity = Identity::finish(hashing)?;
+        set_shared_headers(opts, &identity);
+        serve_model(&model, opts, t.elapsed().as_secs_f64(), &front, loading, &identity)
+    })
 }
 
-fn serve_model<G: DecisionGpu>(model: &DecisionModel<G>, opts: &RunOpts, load_s: f64) -> Result<()> {
-    let addr = format!("{}:{}", opts.host, opts.port);
-    let listener = std::net::TcpListener::bind(&addr).with_context(|| format!("binding {addr}"))?;
+fn serve_model<G: DecisionGpu>(model: &DecisionModel<G>, opts: &RunOpts, load_s: f64, front: &Front, loading: Loading,
+                               identity: &Identity) -> Result<()> {
     eprintln!("  {} | decision model | {} | loaded in {load_s:.1}s", model.name(), G::NAME);
-    eprintln!("  listening on http://{addr}  (up to {MAX_BATCH} requests answered together)");
-    eprintln!("  POST /v1/systemone  GET /health  GET /v1/models  GET /props  GET /metrics");
+    eprintln!("  {} sha256 {} | engine {}", identity.file, identity.sha256, crate::serve::REVISION);
+    eprintln!("  listening on {}  (up to {MAX_BATCH} requests answered together; {})", front.url(), front.auth.describe());
+    eprintln!("  POST /v1/systemone  GET /health  GET /ready  GET /v1/models  GET /props  GET /metrics");
     let props = serde_json::json!({
         "model": model.name(), "decision_type": model.kind(), "max_options": model.max_options(),
         "images": model.takes_images(), "max_images": ojas_decision::MAX_IMAGES, "max_batch": MAX_BATCH,
     });
     let mut metrics = Metrics::default();
-    serve_http_batches(&listener, MAX_BATCH, |batch| {
-        let mut pending: Vec<(std::net::TcpStream, Request)> = Vec::new();
+    loading.finish();
+    crate::serve::drain_on_sigterm(std::time::Duration::from_secs_f64(opts.drain_secs.max(0.0)));
+    serve_http_batches(front, MAX_BATCH, |batch| {
+        let mut pending: Vec<(Conn, Request)> = Vec::new();
         for (mut stream, req, route) in batch {
             match (req.method.as_str(), route.as_str()) {
                 ("POST", "/v1/systemone" | "/v1/decide" | "/decide") => match parse_body(model, &req.body) {
@@ -289,14 +297,13 @@ fn serve_model<G: DecisionGpu>(model: &DecisionModel<G>, opts: &RunOpts, load_s:
                 },
                 ("GET", "/metrics") => send(&mut stream, "200 OK", "text/plain; version=0.0.4", metrics.render().as_bytes()),
                 ("GET", "/props") => send_json(&mut stream, "200 OK", &props),
-                ("GET", "/health") => match ojas_core::device_fault::peek() {
-                    Some(err) => send_json(&mut stream, "503 Service Unavailable",
-                        &serde_json::json!({"status": "error", "error": err.to_string()})),
-                    None => send_json(&mut stream, "200 OK", &serde_json::json!({"status": "ok"})),
-                },
-                ("GET", "/v1/models") => send_json(&mut stream, "200 OK", &serde_json::json!({
-                    "object": "list", "data": [{"id": model.name(), "object": "model", "owned_by": "ojas"}]
-                })),
+                ("GET", "/health") => health(&mut stream),
+                ("GET", "/ready") => ready(&mut stream),
+                ("GET", "/v1/models") => {
+                    let mut entry = serde_json::json!({"id": model.name(), "object": "model", "owned_by": "ojas"});
+                    identity.describe(&mut entry);
+                    send_json(&mut stream, "200 OK", &serde_json::json!({"object": "list", "data": [entry]}))
+                }
                 _ => send_err(&mut stream, "404 Not Found", &format!("no route for {} {}", req.method, route)),
             }
         }

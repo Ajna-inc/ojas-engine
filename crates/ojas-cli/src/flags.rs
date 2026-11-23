@@ -38,6 +38,18 @@ pub struct RunOpts {
     pub port: u16,
     /// `serve`: most tokens one image of a request may take (`--image-max-tokens`).
     pub image_max_tokens: Option<usize>,
+    /// `serve`: a PEM certificate chain and its private key; with both the server
+    /// speaks TLS on its port.
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    /// `serve`: the origin browsers may call from (`--cors-origin`, or `*`); none by default.
+    pub cors_origin: Option<String>,
+    /// `serve`: keep no request data beyond the process's memory (`--keep-nothing`).
+    pub keep_nothing: bool,
+    /// `serve`: most seconds a request may take from its arrival (`--request-timeout`).
+    pub request_timeout: Option<f64>,
+    /// `serve`: seconds requests in progress get to finish after SIGTERM (`--drain-secs`).
+    pub drain_secs: f64,
     /// Repetitions for `bench`.
     pub reps: usize,
     /// Vision (`detect`): score threshold; None = the command's default.
@@ -64,11 +76,11 @@ pub struct RunOpts {
     pub ocr_norm: Option<String>,
     /// Vision (`plate --json`): classes kept per CTC timestep of each read; 0 = none.
     pub ctc_topk: usize,
-    /// `vision-serve`: bearer token, or the file holding one; callers from a
-    /// `--trust` range need neither.
+    /// `serve` and `vision-serve`: bearer token, or the file holding one; callers
+    /// from a `--trust` range need neither.
     pub token: Option<String>,
     pub token_file: Option<String>,
-    /// `vision-serve`: comma-separated IPs/CIDRs served without a token.
+    /// `serve` and `vision-serve`: comma-separated IPs/CIDRs served without a token.
     pub trust: Option<String>,
     /// `vision-serve`: which device runs the model — "cpu" (default),
     /// "cuda[:N]" or "vulkan[:N]". Separate from --device, which selects an
@@ -106,6 +118,12 @@ impl Default for RunOpts {
             host: "127.0.0.1".into(),
             port: 8080,
             image_max_tokens: None,
+            tls_cert: None,
+            tls_key: None,
+            cors_origin: None,
+            keep_nothing: false,
+            request_timeout: None,
+            drain_secs: 30.0,
             reps: 3,
             conf: None,
             iou: None,
@@ -376,6 +394,12 @@ pub fn take_run_flags(args: &mut Vec<String>) -> Result<RunOpts> {
                 o.port_set = true;
             }
             "--image-max-tokens" => o.image_max_tokens = Some(num!(&mut i)),
+            "--tls-cert" => o.tls_cert = Some(take(&mut i)?),
+            "--tls-key" => o.tls_key = Some(take(&mut i)?),
+            "--cors-origin" => o.cors_origin = Some(take(&mut i)?),
+            "--keep-nothing" => o.keep_nothing = true,
+            "--request-timeout" => o.request_timeout = Some(num!(&mut i)),
+            "--drain-secs" => o.drain_secs = num!(&mut i),
             "-r" | "--reps" => o.reps = num!(&mut i),
             "--conf" => o.conf = Some(num!(&mut i)),
             "--iou" => o.iou = Some(num!(&mut i)),
@@ -412,7 +436,9 @@ pub fn take_run_flags(args: &mut Vec<String>) -> Result<RunOpts> {
                      runtime: -n/--predict, -p/--prompt, -f/--file, -sys/--system, --raw,\n\
                      \x20        --temp, --top-p, --top-k, --repeat-penalty, --repeat-last-n, -s/--seed,\n\
                      \x20        --device, --precision, -ngl/--n-gpu-layers, --host, --port, -r/--reps,\n\
-                     \x20        --conf, --iou, --json, --ctc-topk (vision)"
+                     \x20        --conf, --iou, --json, --ctc-topk (vision)\n\
+                     serve:   --token, --token-file, --trust, --tls-cert, --tls-key, --cors-origin,\n\
+                     \x20        --keep-nothing, --request-timeout, --drain-secs, --image-max-tokens"
                 );
             }
             _ => rest.push(a),

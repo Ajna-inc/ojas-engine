@@ -8,6 +8,7 @@
 //! Engine flags may appear anywhere and are removed before the subcommand's
 //! positionals are read. They use llama.cpp's names where one exists.
 
+mod access;
 mod backend;
 mod cmds;
 mod constrain;

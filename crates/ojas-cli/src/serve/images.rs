@@ -453,8 +453,9 @@ mod tests {
         };
         let vocab = std::sync::Arc::new(ojas_grammar::TokenVocab::new(Vec::new(), Vec::new(), &[]));
         let none = Err("this server has no vision projector".to_string());
+        let identity = crate::serve::Identity { file: "m.gguf".into(), sha256: "00".into() };
         let ctx = Ctx { bpe: &bpe, info: &info, opts: &opts, vocab: &vocab, primary: None, secondary: None,
-                        prefix_cache: false, images: &none };
+                        prefix_cache: false, images: &none, identity: &identity, timeout: None };
         let ask = |content: Value| build(&ctx, &json!({"messages": [{"role": "user", "content": content}]}));
         let url = format!("data:image/png;base64,{PNG_2X1}");
         let refused = ask(json!([{"type": "image_url", "image_url": {"url": url}}])).err().expect("no projector");
