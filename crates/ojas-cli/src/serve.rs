@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 mod anthropic;
 mod completion;
 mod conn;
+mod embed;
 mod images;
 mod logprobs;
 mod metrics;
@@ -458,6 +459,9 @@ pub fn serve(model: &str, opts: &RunOpts, context: usize) -> Result<()> {
     let hashing = Identity::start(model);
     if crate::decide::is_decision_model(model) {
         return crate::decide::serve(model, opts, front, loading, hashing);
+    }
+    if embed::is_embedding_model(model) {
+        return embed::serve(model, opts, context, front, loading, hashing);
     }
     with_model(model, opts.device, context, opts.precision, |m, bpe, info| {
         let (primary, secondary) = stop_ids(bpe, info);
