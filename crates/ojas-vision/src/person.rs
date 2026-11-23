@@ -14,7 +14,7 @@ use anyhow::{ensure, Result};
 
 use crate::exec_gpu::{ArenaOf, GpuExecutor};
 use crate::gpu::GpuDev;
-use crate::gpu_pre::{DevFrame, Placement, Roi};
+use crate::gpu_pre::{frame_thumbs, DevFrame, Placement, Roi, Thumb, ThumbSpec};
 use crate::model::{head, head_outputs, Output, TensorHead, TensorSpec};
 use crate::pipeline::{run_stage, upload_rgb, BucketsOf, HostRgb, RgbFrame};
 use crate::pre::{window_geom, OcrNorm, Window};
@@ -247,6 +247,8 @@ pub struct PersonPipelineOf<G: GpuDev> {
     pose: Option<Lane<G>>,
     clip: Option<Lane<G>>,
     frames: Option<G::Buf>,
+    /// thumbnail download scratch
+    thumbs: Option<G::Buf>,
     pub cfg: PersonCfg,
     pub times: PersonTimes,
 }
@@ -272,7 +274,7 @@ impl<G: GpuDev> PersonPipelineOf<G> {
         let pose = p_plans.map(|pl| Lane::new(models.pose.unwrap(), rs, pl)).transpose()?;
         let clip = c_plans.map(|pl| Lane::new(models.clip.unwrap(), siglip_spec(), pl)).transpose()?;
         ensure!(detector.is_some() || reid.is_some() || pose.is_some() || clip.is_some(), "person pipeline: no models");
-        Ok(PersonPipelineOf { detector, reid, pose, clip, frames: None, cfg, times: PersonTimes::default() })
+        Ok(PersonPipelineOf { detector, reid, pose, clip, frames: None, thumbs: None, cfg, times: PersonTimes::default() })
     }
 
     /// Persons in each device frame (needs a detector).
@@ -291,6 +293,18 @@ impl<G: GpuDev> PersonPipelineOf<G> {
         self.times.detect = t.elapsed().as_secs_f64() * 1e3;
         self.times.detections = out.iter().map(Vec::len).sum();
         Ok(out)
+    }
+
+    /// `detect_device_in`, plus a small host copy of every frame of `dev` (one per frame,
+    /// whole frame; none when `thumb` is `None`): resized on the device and downloaded
+    /// once, for host consumers such as a tracker's colour signature. `Thumb::geom` maps
+    /// the returned boxes onto it.
+    pub fn detect_device_with(&mut self, dev: &[DevFrame], rois: &[Roi], thumb: Option<ThumbSpec>) -> Result<(Vec<Vec<Detection>>, Vec<Thumb>)> {
+        let dets = self.detect_device_in(dev, rois)?;
+        let mut scratch = self.thumbs.take();
+        let thumbs = frame_thumbs(self.gpu()?, dev, thumb, &mut scratch);
+        self.thumbs = scratch;
+        Ok((dets, thumbs?))
     }
 
     /// The lanes for each request, batched per lane across all requests; a lane a box is too

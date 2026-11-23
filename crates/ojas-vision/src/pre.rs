@@ -461,3 +461,241 @@ pub fn window_into(rgb: &[u8], w: usize, h: usize, g: &WindowGeom, width: usize,
         }
     }
 }
+
+/// Size of a small host copy (thumbnail) of a frame region: at most `width` × `height`
+/// pixels, never larger than the region itself. `keep_aspect`: the largest size of the
+/// region's aspect that fits (no bars); otherwise the region is stretched to the size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThumbSpec {
+    pub width: usize,
+    pub height: usize,
+    pub keep_aspect: bool,
+}
+
+/// Which frame pixels a thumbnail shows and at what scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ThumbGeom {
+    /// the region in frame pixels
+    pub x0: usize,
+    pub y0: usize,
+    pub src_w: usize,
+    pub src_h: usize,
+    /// thumbnail size
+    pub w: usize,
+    pub h: usize,
+    /// thumbnail pixels per frame pixel
+    pub sx: f32,
+    pub sy: f32,
+}
+
+impl ThumbGeom {
+    /// Frame pixels → thumbnail pixels (unclipped).
+    pub fn to_thumb(&self, x: f32, y: f32) -> (f32, f32) {
+        ((x - self.x0 as f32) * self.sx, (y - self.y0 as f32) * self.sy)
+    }
+
+    /// A box in frame pixels as whole thumbnail pixels `[x0, y0, x1, y1)`, clipped to the
+    /// thumbnail and at least one pixel — the patch a colour signature reads.
+    pub fn box_px(&self, d: &crate::yolo::Detection) -> [usize; 4] {
+        let (ax, ay) = self.to_thumb(d.x0, d.y0);
+        let (bx, by) = self.to_thumb(d.x1, d.y1);
+        let x0 = (ax.max(0.0).floor() as usize).min(self.w - 1);
+        let y0 = (ay.max(0.0).floor() as usize).min(self.h - 1);
+        let x1 = (bx.max(0.0).ceil() as usize).clamp(x0 + 1, self.w);
+        let y1 = (by.max(0.0).ceil() as usize).clamp(y0 + 1, self.h);
+        [x0, y0, x1, y1]
+    }
+}
+
+/// Thumbnail geometry of the `rw` × `rh` region at (`x0`, `y0`). Shared by the CPU path
+/// below and the device path (`gpu_pre::thumbs`) so both produce the same size.
+pub fn thumb_geom(x0: usize, y0: usize, rw: usize, rh: usize, spec: ThumbSpec) -> ThumbGeom {
+    let (mw, mh) = (spec.width.min(rw).max(1), spec.height.min(rh).max(1));
+    let (w, h) = if spec.keep_aspect {
+        let r = (mw as f32 / rw as f32).min(mh as f32 / rh as f32);
+        (((rw as f32 * r).round() as usize).clamp(1, mw), ((rh as f32 * r).round() as usize).clamp(1, mh))
+    } else {
+        (mw, mh)
+    };
+    ThumbGeom { x0, y0, src_w: rw, src_h: rh, w, h, sx: w as f32 / rw as f32, sy: h as f32 / rh as f32 }
+}
+
+/// A thumbnail on the host: packed RGB8, `geom.w * geom.h * 3` bytes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Thumb {
+    pub geom: ThumbGeom,
+    pub rgb: Vec<u8>,
+}
+
+/// CPU thumbnail of the region `[x0, y0, w, h]` of an interleaved RGB8 frame: the crop,
+/// cv2-linear resized to `thumb_geom`'s size — the bytes the device path downloads.
+pub fn thumb_rgb8(rgb: &[u8], w: usize, h: usize, region: [usize; 4], spec: ThumbSpec) -> Thumb {
+    let [x0, y0, rw, rh] = region;
+    assert_eq!(rgb.len(), w * h * 3);
+    assert!(rw > 0 && rh > 0 && x0 + rw <= w && y0 + rh <= h, "region {region:?} outside {w}x{h}");
+    let geom = thumb_geom(x0, y0, rw, rh, spec);
+    let mut sub = Vec::with_capacity(rw * rh * 3);
+    for y in y0..y0 + rh {
+        sub.extend_from_slice(&rgb[(y * w + x0) * 3..(y * w + x0 + rw) * 3]);
+    }
+    Thumb { geom, rgb: resize_bilinear_rgb8(&sub, rw, rh, geom.w, geom.h, 3) }
+}
+
+/// An f16 holding a whole number 0..=255 (what the crop kernel writes for a u8 with scale 1,
+/// shift 0) back to that u8; anything else saturates.
+fn f16_bits_to_u8(bits: u16) -> u8 {
+    let (exp, man) = ((bits >> 10) & 31, (bits & 1023) as u32 | 1024);
+    match (bits >> 15, exp) {
+        (0, 15..=22) => (man >> (25 - exp)) as u8,
+        (0, 23..) => 255,
+        _ => 0, // below 1, or negative
+    }
+}
+
+/// Unpack what the device path downloads: one `tw` × `th` canvas of interleaved RGB f16
+/// (little-endian) per thumbnail, each image in its canvas's top-left corner.
+pub fn thumbs_from_f16(bytes: &[u8], geoms: &[ThumbGeom], tw: usize, th: usize) -> Vec<Thumb> {
+    assert_eq!(bytes.len(), geoms.len() * tw * th * 6);
+    geoms
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let canvas = &bytes[i * tw * th * 6..(i + 1) * tw * th * 6];
+            let mut rgb = Vec::with_capacity(g.w * g.h * 3);
+            for y in 0..g.h {
+                let row = &canvas[y * tw * 6..(y * tw + g.w) * 6];
+                rgb.extend(row.chunks_exact(2).map(|b| f16_bits_to_u8(u16::from_le_bytes([b[0], b[1]]))));
+            }
+            Thumb { geom: *g, rgb }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod thumb_tests {
+    use super::*;
+    use crate::yolo::Detection;
+
+    #[test]
+    fn f16_canvases_unpack_to_the_thumbnail_bytes() {
+        for u in 0..=255u8 {
+            assert_eq!(f16_bits_to_u8(half::f16::from_f32(u as f32).to_bits()), u);
+        }
+        assert_eq!(f16_bits_to_u8(half::f16::from_f32(-3.0).to_bits()), 0);
+        assert_eq!(f16_bits_to_u8(half::f16::from_f32(300.0).to_bits()), 255);
+        assert_eq!(f16_bits_to_u8(half::f16::INFINITY.to_bits()), 255);
+        // two thumbnails of different sizes in 5x4 canvases; canvas pixels outside them are ignored
+        let (tw, th) = (5usize, 4usize);
+        let geoms = [thumb_geom(0, 0, 50, 40, ThumbSpec { width: 5, height: 4, keep_aspect: false }), thumb_geom(7, 9, 30, 30, ThumbSpec { width: 3, height: 2, keep_aspect: false })];
+        let mut bytes = vec![];
+        let mut want = vec![];
+        for (i, g) in geoms.iter().enumerate() {
+            let mut rgb = vec![];
+            for y in 0..th {
+                for x in 0..tw {
+                    for c in 0..3 {
+                        let v = (i * 100 + y * 20 + x * 3 + c) as u8;
+                        let inside = x < g.w && y < g.h;
+                        bytes.extend(half::f16::from_f32(if inside { v as f32 } else { 77.0 }).to_bits().to_le_bytes());
+                        if inside {
+                            rgb.push(v);
+                        }
+                    }
+                }
+            }
+            want.push(Thumb { geom: *g, rgb });
+        }
+        assert_eq!(thumbs_from_f16(&bytes, &geoms, tw, th), want);
+    }
+
+    /// A frame with smooth gradients and some texture, so resampling errors show.
+    fn synthetic(w: usize, h: usize) -> Vec<u8> {
+        let mut s = 12345u32;
+        (0..w * h * 3)
+            .map(|i| {
+                let (c, x, y) = (i % 3, (i / 3) % w, i / 3 / w);
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let base = match c {
+                    0 => x * 255 / w,
+                    1 => y * 255 / h,
+                    _ => (x + y) * 255 / (w + h),
+                };
+                (base as i32 + ((s >> 27) as i32 - 16)).clamp(0, 255) as u8
+            })
+            .collect()
+    }
+
+    /// Plain bilinear in f64: half-pixel centres, edges clamped, round to nearest.
+    fn reference(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Vec<u8> {
+        let mut out = vec![0u8; dw * dh * 3];
+        for dy in 0..dh {
+            let fy = ((dy as f64 + 0.5) * sh as f64 / dh as f64 - 0.5).clamp(0.0, (sh - 1) as f64);
+            let (y0, ty) = (fy.floor() as usize, fy - fy.floor());
+            let y1 = (y0 + 1).min(sh - 1);
+            for dx in 0..dw {
+                let fx = ((dx as f64 + 0.5) * sw as f64 / dw as f64 - 0.5).clamp(0.0, (sw - 1) as f64);
+                let (x0, tx) = (fx.floor() as usize, fx - fx.floor());
+                let x1 = (x0 + 1).min(sw - 1);
+                for c in 0..3 {
+                    let p = |x: usize, y: usize| src[(y * sw + x) * 3 + c] as f64;
+                    let v = (1.0 - ty) * ((1.0 - tx) * p(x0, y0) + tx * p(x1, y0)) + ty * ((1.0 - tx) * p(x0, y1) + tx * p(x1, y1));
+                    out[(dy * dw + dx) * 3 + c] = v.round() as u8;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn thumbnail_matches_reference_resize_within_rounding() {
+        let (w, h) = (97usize, 61usize);
+        let rgb = synthetic(w, h);
+        let cases = [
+            ([0, 0, w, h], ThumbSpec { width: 32, height: 20, keep_aspect: false }),
+            ([0, 0, w, h], ThumbSpec { width: 32, height: 32, keep_aspect: true }),
+            ([0, 0, w, h], ThumbSpec { width: 48, height: 7, keep_aspect: true }),
+            ([13, 5, 40, 51], ThumbSpec { width: 16, height: 16, keep_aspect: false }), // a crop
+            ([13, 5, 40, 51], ThumbSpec { width: 16, height: 16, keep_aspect: true }),
+            ([96, 0, 1, 61], ThumbSpec { width: 8, height: 8, keep_aspect: false }),    // one column
+        ];
+        for (region, spec) in cases {
+            let t = thumb_rgb8(&rgb, w, h, region, spec);
+            let [x0, y0, rw, rh] = region;
+            assert_eq!(t.rgb.len(), t.geom.w * t.geom.h * 3);
+            assert!(t.geom.w <= spec.width && t.geom.h <= spec.height, "{region:?} {spec:?}: {:?}", t.geom);
+            let crop: Vec<u8> = (y0..y0 + rh).flat_map(|y| rgb[(y * w + x0) * 3..(y * w + x0 + rw) * 3].iter().copied()).collect();
+            let want = reference(&crop, rw, rh, t.geom.w, t.geom.h);
+            let worst = t.rgb.iter().zip(&want).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+            assert!(worst <= 1, "{region:?} {spec:?}: off by {worst}");
+        }
+    }
+
+    #[test]
+    fn thumbnail_is_never_larger_than_the_region() {
+        let (w, h) = (20usize, 12usize);
+        let rgb = synthetic(w, h);
+        for keep_aspect in [false, true] {
+            let t = thumb_rgb8(&rgb, w, h, [0, 0, w, h], ThumbSpec { width: 64, height: 64, keep_aspect });
+            assert_eq!((t.geom.w, t.geom.h, t.geom.sx, t.geom.sy), (w, h, 1.0, 1.0));
+            assert_eq!(t.rgb, rgb);
+        }
+    }
+
+    #[test]
+    fn aspect_is_kept_and_boxes_map_onto_the_thumbnail() {
+        let g = thumb_geom(0, 0, 1920, 1080, ThumbSpec { width: 160, height: 160, keep_aspect: true });
+        assert_eq!((g.w, g.h), (160, 90));
+        assert_eq!(thumb_geom(0, 0, 1920, 1080, ThumbSpec { width: 160, height: 160, keep_aspect: false }).h, 160);
+        let d = Detection { class: 0, score: 0.9, x0: 960.0, y0: 540.0, x1: 1440.0, y1: 810.0, keypoints: None };
+        assert_eq!(g.to_thumb(d.x0, d.y0), (80.0, 45.0));
+        assert_eq!(g.box_px(&d), [80, 45, 120, 68]);
+        // a region's thumbnail: its origin is subtracted first
+        let g = thumb_geom(900, 500, 600, 400, ThumbSpec { width: 60, height: 40, keep_aspect: false });
+        assert_eq!(g.box_px(&d), [6, 4, 54, 31]);
+        // boxes outside the region clip to it, never empty
+        let far = Detection { x0: 0.0, y0: 0.0, x1: 10.0, y1: 10.0, ..d };
+        assert_eq!(g.box_px(&far), [0, 0, 1, 1]);
+        let past = Detection { x0: 3000.0, y0: 3000.0, x1: 3100.0, y1: 3100.0, ..d };
+        assert_eq!(g.box_px(&past), [59, 39, 60, 40]);
+    }
+}
