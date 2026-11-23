@@ -1,0 +1,41 @@
+# `ojas serve` on an NVIDIA GPU, one model per container.
+#
+#   docker build -f deploy/Dockerfile.serve --build-arg OJAS_REVISION=$(git rev-parse --short=12 HEAD) -t ojas-serve .
+#   docker run --gpus all -p 8080:8080 \
+#       -v /srv/models:/models:ro -v /srv/secrets/token:/run/secrets/token:ro \
+#       ojas-serve /models/model.gguf --token-file /run/secrets/token
+#
+# Nothing is downloaded when the container starts: the model is a mounted file,
+# and the image holds the engine at one pinned revision, which every response
+# reports (X-Ojas-Revision). The server refuses to start on 0.0.0.0 without a
+# token. /health is liveness and /ready is readiness; SIGTERM drains.
+
+ARG CUDA=12.4.1
+ARG UBUNTU=22.04
+
+FROM rust:1.98-bookworm AS build
+WORKDIR /src
+COPY . .
+# The build script asks git for the revision; a build context has no .git, so it is passed in.
+ARG OJAS_REVISION=unknown
+ENV OJAS_REVISION=${OJAS_REVISION}
+RUN cargo build --release --locked -p ojas-cli --features cuda
+
+FROM nvidia/cuda:${CUDA}-runtime-ubuntu${UBUNTU}
+# Kernels are compiled on the device when a model loads: the runtime image has the
+# compiler library, and the one header the kernels include comes from this package.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cuda-cudart-dev-12-4 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+# `video` exposes the hardware decoder to the vision commands; text serving needs only compute.
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+COPY --from=build /src/target/release/ojas /usr/local/bin/ojas
+RUN useradd --system --uid 10001 --no-create-home ojas
+USER 10001
+EXPOSE 8080
+# Liveness only: a container still loading its model is alive, and not yet ready.
+# Plain HTTP; with --tls-cert, replace this with the orchestrator's own HTTPS probe.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q ' 200 ' <&3"]
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["ojas", "serve", "--host", "0.0.0.0", "--port", "8080", "--device", "cuda"]
