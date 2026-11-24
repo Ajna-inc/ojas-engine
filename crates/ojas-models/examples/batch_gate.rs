@@ -39,6 +39,7 @@ fn run(model: &dyn Model, prompts: &[(Vec<u32>, Vec<usize>)], stop: &[u32]) -> (
         batch.submit(id as u64, Request {
             prompt: ids.clone(), max_tokens: 96, opts: None, processor: None, stop: stop.to_vec(),
             banned: Vec::new(), marks: marks.clone(), docs: Vec::new(), reuse: true, images: None,
+            background: false,
         });
     }
     let t0 = Instant::now();

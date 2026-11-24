@@ -9,7 +9,8 @@ use ojas_core::conv::Storage;
 
 use crate::gpu::GpuDev;
 
-use crate::pre::{letterbox_geom, ocr_affine, ocr_width, window_geom, ChanNorm, Letterbox, OcrNorm, Window};
+use crate::pre::{letterbox_geom, ocr_affine, ocr_width, thumb_geom, thumbs_from_f16, window_geom, ChanNorm, Letterbox, OcrNorm, Window};
+pub use crate::pre::{Thumb, ThumbGeom, ThumbSpec};
 use crate::yolo::Detection;
 
 /// Pixel layout of a device frame.
@@ -63,6 +64,38 @@ impl Roi {
                     p[0] += ox;
                     p[1] += oy;
                 }
+            }
+        }
+    }
+}
+
+/// A decoder-scaled surface (`DecoderOptions::output`): the frame has the surface's size,
+/// not the stream's, so everything here works in surface pixels until `decoded_to_source`.
+#[cfg(feature = "cuda")]
+impl DevFrame {
+    /// A decoded frame as a device frame (its own size, pitch and chroma offset).
+    pub fn of_decoded(f: &ojas_cuda::nvdec::DecodedFrame) -> DevFrame {
+        DevFrame { ptr: f.ptr, pitch: f.pitch, w: f.w, h: f.h, fmt: PixFmt::Nv12 { uv_off: f.uv_off } }
+    }
+}
+
+/// The picture inside decoded frame `frame` (all of it unless letterboxed): the ROI a
+/// detector should see, so letterbox bars never reach it.
+#[cfg(feature = "cuda")]
+pub fn decoded_content(frame: usize, g: &ojas_cuda::nvdec::OutputGeom) -> Roi {
+    let [x0, y0, x1, y1] = g.rect;
+    Roi { frame, x0, y0, w: x1 - x0, h: y1 - y0 }
+}
+
+/// Detections in decoded-surface pixels to the stream's own pixels.
+#[cfg(feature = "cuda")]
+pub fn decoded_to_source(g: &ojas_cuda::nvdec::OutputGeom, dets: &mut [Detection]) {
+    for d in dets.iter_mut() {
+        (d.x0, d.y0) = g.to_source(d.x0, d.y0);
+        (d.x1, d.y1) = g.to_source(d.x1, d.y1);
+        if let Some(kp) = &mut d.keypoints {
+            for p in kp.iter_mut() {
+                (p[0], p[1]) = g.to_source(p[0], p[1]);
             }
         }
     }
@@ -170,10 +203,65 @@ pub fn frame_to_rgb8<G: GpuDev>(g: &G, f: &DevFrame, step: usize, scratch: &mut 
     Ok((ow, oh))
 }
 
+/// Crop descriptors for thumbnails of `rois` (`pre::thumb_geom` sizes), each placed in the
+/// top-left corner of a shared canvas, and that canvas's (width, height).
+pub fn thumb_descriptors(frames: &[DevFrame], rois: &[Roi], spec: ThumbSpec) -> Result<(Vec<u32>, Vec<ThumbGeom>, (usize, usize))> {
+    ensure!(spec.width > 0 && spec.height > 0, "thumbnail {spec:?}");
+    let mut d = Vec::with_capacity(rois.len() * 14);
+    let mut geoms = Vec::with_capacity(rois.len());
+    for r in rois {
+        ensure!(r.frame < frames.len(), "roi {r:?}: {} frames", frames.len());
+        let f = frames[r.frame];
+        ensure!(r.w > 0 && r.h > 0 && r.x0 + r.w <= f.w && r.y0 + r.h <= f.h, "roi {r:?} outside frame {f:?}");
+        let g = thumb_geom(r.x0, r.y0, r.w, r.h, spec);
+        let (fmt, uv_off) = match f.fmt {
+            PixFmt::Rgb8 => (0u32, 0u32),
+            PixFmt::Nv12 { uv_off } => (1, uv_off as u32),
+        };
+        d.extend([f.ptr as u32, (f.ptr >> 32) as u32, f.pitch as u32, fmt, uv_off]);
+        d.extend([r.x0, r.y0, r.w, r.h, g.w, g.h, 0, 0, 0].map(|v| v as u32));
+        geoms.push(g);
+    }
+    let canvas = (geoms.iter().map(|g| g.w).max().unwrap_or(1), geoms.iter().map(|g| g.h).max().unwrap_or(1));
+    Ok((d, geoms, canvas))
+}
+
+/// Small host copies of `rois` (whole frames or crops): resized on the device by the crop
+/// kernel (cv2-linear, the bytes of `pre::thumb_rgb8` on the same region), all downloaded
+/// with one read. `scratch` is kept by the caller between calls.
+pub fn thumbs<G: GpuDev>(g: &G, frames: &[DevFrame], rois: &[Roi], spec: ThumbSpec, scratch: &mut Option<G::Buf>) -> Result<Vec<Thumb>> {
+    if rois.is_empty() {
+        return Ok(vec![]);
+    }
+    let (d, geoms, (tw, th)) = thumb_descriptors(frames, rois, spec)?;
+    // the kernel's output as whole numbers 0..=255 in f16 (exact), unpadded RGB
+    let st = Storage { c: 3, cs: 3, h: th, w: tw, pad: 0, spare: 0 };
+    let place = Placement::Norm { height: th, width: tw, norm: ChanNorm { scale: [1.0; 3], shift: [0.0; 3] }, window: Window::Stretch, fill_u8: 0, bgr: false };
+    let need = rois.len() * tw * th * 6;
+    if scratch.as_ref().is_none_or(|b| G::buf_len(b) < need) {
+        *scratch = Some(g.alloc_bytes(need)?);
+    }
+    let buf = scratch.as_ref().unwrap();
+    let dbuf = g.upload_bytes(&d.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+    let enc = g.begin();
+    launch(g, &enc, &dbuf, (buf, 0), &st, rois.len(), place)?;
+    g.submit(enc)?;
+    let mut bytes = vec![0u8; need];
+    g.read_bytes(buf, 0, &mut bytes)?;
+    Ok(thumbs_from_f16(&bytes, &geoms, tw, th))
+}
+
+/// One whole-frame thumbnail per frame, or none when `spec` is `None` (the default).
+pub fn frame_thumbs<G: GpuDev>(g: &G, frames: &[DevFrame], spec: Option<ThumbSpec>, scratch: &mut Option<G::Buf>) -> Result<Vec<Thumb>> {
+    let Some(spec) = spec else { return Ok(vec![]) };
+    let whole: Vec<Roi> = frames.iter().enumerate().map(|(i, f)| Roi::whole(i, f)).collect();
+    thumbs(g, frames, &whole, spec, scratch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pre::{letterbox_rgb8_into, nv12_to_rgb8};
+    use crate::pre::{letterbox_rgb8_into, nv12_to_rgb8, thumb_rgb8};
     use crate::yolo;
 
     fn noise(n: usize, mut s: u32) -> Vec<u8> {
@@ -207,6 +295,19 @@ mod tests {
     /// over the frame's bytes into planar CHW f32 (the kernel writes the same values as f16
     /// into the padded input).
     fn kernel_twin(mem: &[u8], d: &[u32], target: usize) -> Vec<f32> {
+        let u = twin_u8(mem, d, target, target, 114);
+        let plane = target * target;
+        let mut out = vec![0f32; 3 * plane];
+        for p in 0..plane {
+            for c in 0..3 {
+                out[c * plane + p] = u[p * 3 + c] as f32 / 255.0;
+            }
+        }
+        out
+    }
+
+    /// The kernel's u8 values before normalisation, interleaved RGB over a `tw` × `th` canvas.
+    fn twin_u8(mem: &[u8], d: &[u32], tw: usize, th: usize, fill: i32) -> Vec<u8> {
         let [rx0, ry0, rw, rh, nw, nh, left, top] = [5, 6, 7, 8, 9, 10, 11, 12].map(|i| d[i] as i32);
         let axis = |o: i32, r: i32, n: i32| -> (i32, i32, i32, i32) {
             let f = (o as f32 + 0.5) * (r as f32 / n as f32) - 0.5;
@@ -222,12 +323,11 @@ mod tests {
             let a1 = (f * 2048.0).round() as i32;
             (s, (s + 1).min(r - 1), 2048 - a1, a1)
         };
-        let plane = target * target;
-        let mut out = vec![0f32; 3 * plane];
-        for p in 0..plane {
-            let (ox, oy) = ((p % target) as i32 - left, (p / target) as i32 - top);
+        let mut out = vec![0u8; 3 * tw * th];
+        for p in 0..tw * th {
+            let (ox, oy) = ((p % tw) as i32 - left, (p / tw) as i32 - top);
             let u = if ox < 0 || ox >= nw || oy < 0 || oy >= nh {
-                [114; 3]
+                [fill; 3]
             } else if rw == nw && rh == nh {
                 tap(mem, d, (rx0 + ox) as usize, (ry0 + oy) as usize)
             } else {
@@ -242,10 +342,68 @@ mod tests {
                 })
             };
             for c in 0..3 {
-                out[c * plane + p] = u[c] as f32 / 255.0;
+                out[p * 3 + c] = u[c] as u8;
             }
         }
         out
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn decoder_scaled_detections_map_back_to_the_stream() {
+        use ojas_cuda::nvdec::{output_geom, DecodedFrame, Fit, OutputSize};
+        // 1920x1080 letterboxed by the decoder into 640x640: picture rows 140..500
+        let g = output_geom(1920, 1080, Some(OutputSize { width: 640, height: 640, fit: Fit::Letterbox }));
+        let f = DevFrame::of_decoded(&DecodedFrame { ptr: 64, pitch: 640, w: g.w, h: g.h, uv_off: 640 * 640, timestamp: 0 });
+        assert_eq!((f.w, f.h, f.pitch, f.fmt), (640, 640, 640, PixFmt::Nv12 { uv_off: 640 * 640 }));
+        let roi = decoded_content(0, &g);
+        assert_eq!((roi.x0, roi.y0, roi.w, roi.h), (0, 140, 640, 360));
+        assert!(descriptors(&[f], &[roi], Placement::Letterbox { target: 640 }).is_ok());
+        // a box the detector reports inside the ROI, moved to the surface, then to the stream
+        let kp = [[100.0, 30.0], [200.0, 30.0], [200.0, 90.0], [100.0, 90.0]];
+        let mut dets = vec![Detection { class: 0, score: 0.9, x0: 100.0, y0: 30.0, x1: 200.0, y1: 90.0, keypoints: Some(kp) }];
+        roi.to_frame(&mut dets);
+        decoded_to_source(&g, &mut dets);
+        let d = &dets[0];
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-2;
+        assert!(near(d.x0, 300.0) && near(d.y0, 90.0) && near(d.x1, 600.0) && near(d.y1, 270.0), "{d:?}");
+        let k = d.keypoints.unwrap();
+        assert!(near(k[2][0], 600.0) && near(k[2][1], 270.0), "{k:?}");
+    }
+
+    #[test]
+    fn thumbnails_match_the_cpu_thumbnail() {
+        // RGB8 with a wide pitch, and NV12 in the decoder layout
+        let (w, h, pitch) = (64usize, 36usize, 64 * 3 + 7);
+        let rgb = noise(w * h * 3, 3);
+        let mut mem = vec![0u8; pitch * h];
+        for y in 0..h {
+            mem[y * pitch..y * pitch + w * 3].copy_from_slice(&rgb[y * w * 3..(y + 1) * w * 3]);
+        }
+        let nv_pitch = 80usize;
+        let nv = noise(nv_pitch * h * 3 / 2, 5);
+        let uv_off = nv_pitch * h;
+        let nv_rgb = nv12_to_rgb8(&nv, w, h, nv_pitch, uv_off);
+        let frames = [
+            (DevFrame { ptr: 0, pitch, w, h, fmt: PixFmt::Rgb8 }, &mem, &rgb),
+            (DevFrame { ptr: 0, pitch: nv_pitch, w, h, fmt: PixFmt::Nv12 { uv_off } }, &nv, &nv_rgb),
+        ];
+        for (f, bytes, host) in frames {
+            // whole frame, an odd-origin crop, and a crop smaller than the thumbnail (copied 1:1)
+            let rois = [Roi::whole(0, &f), Roi { frame: 0, x0: 7, y0: 3, w: 41, h: 21 }, Roi { frame: 0, x0: 50, y0: 30, w: 9, h: 5 }];
+            for spec in [ThumbSpec { width: 16, height: 16, keep_aspect: true }, ThumbSpec { width: 24, height: 10, keep_aspect: false }] {
+                let (d, geoms, (tw, th)) = thumb_descriptors(&[f], &rois, spec).unwrap();
+                assert!(tw <= spec.width && th <= spec.height);
+                for (i, r) in rois.iter().enumerate() {
+                    let want = thumb_rgb8(host, w, h, [r.x0, r.y0, r.w, r.h], spec);
+                    assert_eq!(geoms[i], want.geom);
+                    let canvas = twin_u8(bytes, &d[i * 14..(i + 1) * 14], tw, th, 0);
+                    let got: Vec<u8> = (0..want.geom.h).flat_map(|y| canvas[y * tw * 3..(y * tw + want.geom.w) * 3].iter().copied()).collect();
+                    assert!(got == want.rgb, "{r:?} {spec:?} {:?}", f.fmt);
+                }
+            }
+        }
+        assert!(thumb_descriptors(&[frames[0].0], &[Roi { frame: 0, x0: 60, y0: 0, w: 5, h: 5 }], ThumbSpec { width: 8, height: 8, keep_aspect: true }).is_err());
     }
 
     fn crop_rgb(rgb: &[u8], w: usize, r: &Roi) -> Vec<u8> {

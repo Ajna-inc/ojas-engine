@@ -50,7 +50,7 @@ use ojas_formats::onnx::{OnnxDim, OnnxModel};
 
 pub use import::import;
 pub use plate_ocr::{CtcSteps, Dictionary, PlateRead, CTC_BLANK};
-pub use pre::{ChanNorm, Letterbox, OcrNorm, Window, WindowGeom};
+pub use pre::{ChanNorm, Letterbox, OcrNorm, Thumb, ThumbGeom, ThumbSpec, Window, WindowGeom};
 pub use yolo::{Detection, DecodeCfg};
 pub use model::{Model, ModelKind, Output, TensorHead, TensorModel, TensorSpec};
 

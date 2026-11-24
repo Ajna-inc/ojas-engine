@@ -35,3 +35,6 @@ ojas-tokenize = { path = "../ojas-tokenize" }
 # The cross-backend parity audit. ojas-metal's `kernels` module builds on every platform (its
 # device half is macOS-gated), so this is no longer target-scoped and the audit runs anywhere.
 ojas-metal = { path = "../ojas-metal" }
+# nvdec_gate's scaled mode: the host colour conversion and resize the decoder's scaler is
+# compared against (default features: no device code, so no cycle through this crate's lib)
+ojas-vision = { path = "../ojas-vision" }

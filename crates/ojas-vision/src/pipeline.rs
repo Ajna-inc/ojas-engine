@@ -15,7 +15,7 @@ use anyhow::{ensure, Result};
 
 use crate::exec_gpu::{ArenaOf, GpuExecutor};
 use crate::gpu::GpuDev;
-use crate::gpu_pre::{descriptors, launch, DevFrame, PixFmt, Placement, Roi};
+use crate::gpu_pre::{descriptors, frame_thumbs, launch, DevFrame, PixFmt, Placement, Roi, Thumb, ThumbSpec};
 use crate::plate_ocr::{ctc_greedy_topk, Dictionary, PlateRead};
 use crate::pre::OcrNorm;
 use crate::yolo::{self, DecodeCfg, Detection};
@@ -247,6 +247,8 @@ pub struct PlatePipelineOf<G: GpuDev> {
     dict: Dictionary,
     pub cfg: PipelineCfg,
     frames: Option<G::Buf>,
+    /// thumbnail download scratch
+    thumbs: Option<G::Buf>,
     pub times: StageTimes,
 }
 
@@ -269,6 +271,7 @@ impl<G: GpuDev> PlatePipelineOf<G> {
             dict,
             cfg,
             frames: None,
+            thumbs: None,
             times: StageTimes::default(),
         })
     }
@@ -329,6 +332,16 @@ impl<G: GpuDev> PlatePipelineOf<G> {
         self.times.vehicle = t.elapsed().as_secs_f64() * 1e3;
         self.times.vehicles = vehicles.iter().map(|v| v.len()).sum();
         Ok(vehicles)
+    }
+
+    /// `detect_vehicles_in`, plus a small host copy of every frame of `dev` (one per frame,
+    /// whole frame; none when `thumb` is `None`): resized on the device and downloaded
+    /// once, for host consumers such as a tracker's colour signature. `Thumb::geom` maps
+    /// the returned boxes onto it.
+    pub fn detect_vehicles_with(&mut self, dev: &[DevFrame], rois: &[Roi], thumb: Option<ThumbSpec>) -> Result<(Vec<Vec<Detection>>, Vec<Thumb>)> {
+        let vehicles = self.detect_vehicles_in(dev, rois)?;
+        let thumbs = frame_thumbs(self.vehicle.plans.largest().gpu(), dev, thumb, &mut self.thumbs)?;
+        Ok((vehicles, thumbs))
     }
 
     /// Stages 2-3 for chosen vehicles: plate detection inside each vehicle
