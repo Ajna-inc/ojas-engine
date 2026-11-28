@@ -105,6 +105,15 @@ can refuse a model whose sha256 is not listed (provenance).
 - **preprocessing** stretch to 640×640 (no letterbox), RGB, 0–1, no mean/std
 - **validated** `crates/ojas-vision/tests/detr_detector.rs`: engine `Detector` (CPU) == the survey's raw-executor decode on 3 Field gold frames (290 boxes at conf 0.25, exact); CUDA (f16, batch 3 through the 4-plan) vs CPU: every box ≥ 0.35 on either side has a twin within 1.6 px / 0.045 score (gate 3 px / 0.08)
 
+## ocr-jitter-ojas.onnx
+
+- **sha256** `c5a2882166f395e1a76b333b0f42024d1b04c07688691b51e271486f065e3678` (ONNX) / `1e55561d3dcb7966f92b8274122080daa25aecee6b5a71c7331837365dcf4846` (PyTorch checkpoint)
+- **source** Local `ocr-jitter.pt` checkpoint from the aligned OCR training project. Export requires that project's `ocr.py` and `ocr_aligned.py`. Obtain the checkpoint and training sources separately.
+- **export** `python scripts/release/export_fixed_text_ocr.py /path/to/ocr-jitter.pt models/ocr-jitter-ojas.onnx --source-dir /path/to/ocr_handlerr` (PyTorch ONNX opset 17)
+- **shape** `shifted_patches [9,16,12,50]` (f32) → `probabilities [1,6,62]` and `review_threshold [1]`. The example prepares nine position shifts, extracts 4 × 4 patches from the normalized red channel, and decodes six case-sensitive characters.
+- **run** `cargo run --locked --release -p ojas-vision --example read_fixed_text -- models/ocr-jitter-ojas.onnx /path/to/image.png`. Input PNGs must be 200 × 50 pixels.
+- **validated** Ojas CPU on Apple M2 Max matches PyTorch shift averaging on 19 reference and 100 synthetic overlap PNGs. Case-sensitive strings and review flags match on all 119 inputs. The largest difference between displayed scores is 0.00001.
+
 ## Planned (not yet exported — see the research notes in the vision plan)
 
 | Role | Candidate | License | Status |
